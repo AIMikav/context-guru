@@ -5,7 +5,6 @@ import (
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
-	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
 )
 
@@ -70,8 +69,8 @@ func (d *Dedup) Offload(req *schemas.BifrostChatRequest, rep *components.Report,
 		// Later duplicate: collapse to a pointer (stash+marker in full mode). The note
 		// names the earlier CALL where one is recoverable, never the earlier position.
 		note := dedupNote(pairs[first])
-		newText, key, eff, ok := tryMark(c, d.mode, content, " [full output: call "+expand.ToolName+"]",
-			func(tok string) string { return note + tok })
+		newText, key, eff, ok := tryMark(c, d.mode, content, "",
+			func(tok string) string { return note + tok + "]" })
 		if !ok {
 			rep.Gate("marker_no_win") // pointer+marker wouldn't shrink this duplicate
 			continue
@@ -101,14 +100,13 @@ func (d *Dedup) Offload(req *schemas.BifrostChatRequest, rep *components.Report,
 // equivalence claim is being relied on for signal rather than for token savings. It
 // spent extra turns re-reading from disk to establish what the marker already knew.
 //
-// Naming the command is the recoverable half of that. "identical to an earlier tool
-// output" asserts an equivalence the model cannot check; "identical to the output of
-// `python -c ...` earlier in this conversation" is a claim it can locate, compare
-// against its own expectations, and disbelieve — and disbelieving is the point, because
-// only the model can initiate recovery via the expand tool. The note therefore states
-// WHAT was removed and never why it was safe to remove, the rule coref.go arrived at
-// the hard way: wording that reassures talks the model out of the expand call that
-// would have repaired a mistake.
+// Naming the command is the recoverable half of that. "an earlier tool output" asserts an
+// equivalence the model cannot check; "repeat of earlier `python -c ...`" is a claim it can
+// locate, compare against its own expectations, and disbelieve — and disbelieving is the
+// point, because only the model can initiate recovery via the expand tool. The note
+// therefore states WHAT was removed and never why it was safe to remove, the rule coref.go
+// arrived at the hard way: wording that reassures talks the model out of the expand call
+// that would have repaired a mistake.
 //
 // WHY NOT THE TURN INDEX, which is what #281 actually suggested. "identical to the
 // output at step N" is position-dependent, and dedup's replacement bytes must be a pure
@@ -121,26 +119,58 @@ func (d *Dedup) Offload(req *schemas.BifrostChatRequest, rep *components.Report,
 // anyway (it sees no message indices). The producing command is derived from content
 // that is already in the prefix ahead of this message, so it is stable across turns.
 // state.go's note on the "xdedup index" reaches the same conclusion from the other side.
+//
+// The shape is one bracket that CLOSES around the marker — "[repeat of earlier `cmd`;
+// expand <<cg:HASH>>]" — so the pointer reads as a single clause and the expand cue costs
+// three tokens instead of the ten a separate "[full output: call context_guru_expand]"
+// trailer costs. The tool's full name is not repeated: expand.Inject puts its definition
+// in `tools` on every turn that carries a marker, with a description keyed to the
+// <<cg:HASH>> form, so the name is already in front of the model and the word "expand"
+// next to the marker is enough to point at it.
 func dedupNote(tc schema.ToolCall) string {
-	cmd := tc.Command()
-	if cmd == "" {
-		// No paired tool_use: say only what is true, which is still that this is a pointer.
-		return "[identical to an earlier tool output] "
+	if cmd := tc.Command(); cmd != "" {
+		return "[repeat of earlier " + quoteCmd(cmd) + "; expand "
 	}
-	return "[identical to the output of " + quoteCmd(cmd) + " earlier in this conversation] "
+	// No paired tool_use: say only what is true, which is still that this is a pointer.
+	return "[repeat of an earlier tool output; expand "
 }
 
 // quoteCmd renders a command for the note: backticked, single-line, and length-capped so
 // a pathological Write payload cannot turn the pointer into something bigger than the
 // output it replaces (tryMark would then gate it as marker_no_win and the duplicate would
 // stay verbatim, which is a silent loss of the saving rather than a bug).
+// The cap is in TOKENS, not bytes, because bytes are not what anything here is paid in
+// and the two diverge badly on exactly the input that needs bounding. A 60-BYTE cap let
+// `some/long/path/some/long/path/…` through at 44 tokens: dense punctuation tokenizes at
+// roughly one token every one or two bytes, while ordinary prose and paths run three to
+// four, so a byte cap is loosest precisely where the command is least informative. Capping
+// on schema.TextTokens — the same counter tryMark's never-worse guard uses — bounds the
+// thing the guard actually compares.
+//
+// It bounds the COMMAND; the backticks and ellipsis around it add two or three more, and
+// the note's fixed words add the rest. TestTheDedupPointerStaysWithinItsTokenBudget is
+// what holds the assembled pointer to a figure, which is the number that actually matters.
+const maxCmdTokens = 16
+
 func quoteCmd(cmd string) string {
-	const max = 80
 	cmd = strings.Join(strings.Fields(cmd), " ") // collapse newlines/runs; keep it one line
-	if len(cmd) > max {
-		// Rune-safe truncation: cutting mid-rune would emit invalid UTF-8 into the request.
-		trimmed := strings.ToValidUTF8(cmd[:max], "")
-		cmd = trimmed + "…"
+	// Byte-clamp BEFORE counting tokens. A Write payload's `content` arrives here as a
+	// single argument and can be megabytes; tokenizing that to discover it is over budget
+	// costs far more than the pointer saves, and doing it once per shrink step made a
+	// 100 KB command hang outright. No text survives the token cap past maxCmdTokens*4
+	// bytes (the tokenizer floors at ~1 token per byte on the densest input), so cutting
+	// there first is lossless with respect to the result and bounds the work.
+	if hard := maxCmdTokens * 4; len(cmd) > hard {
+		cmd = strings.ToValidUTF8(cmd[:hard], "")
+	}
+	truncated := false
+	// Rune-safe throughout: cutting mid-rune would emit invalid UTF-8 into the request.
+	for schema.TextTokens(cmd) > maxCmdTokens && len(cmd) > 1 {
+		cmd = strings.ToValidUTF8(cmd[:len(cmd)*3/4], "")
+		truncated = true
+	}
+	if truncated {
+		return "`" + cmd + "…`"
 	}
 	return "`" + cmd + "`"
 }

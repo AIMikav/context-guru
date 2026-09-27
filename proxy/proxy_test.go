@@ -197,7 +197,7 @@ func TestProxyReducesThenForwards(t *testing.T) {
 		t.Fatalf("non-message fields not preserved: %s", got)
 	}
 	third := gjson.GetBytes(got, "messages.2.content").String()
-	if !strings.Contains(third, "identical to an earlier") {
+	if !strings.Contains(third, "repeat of") {
 		t.Fatalf("dedup did not run through the proxy: %q", third)
 	}
 	if len(got) >= len(body) {
@@ -247,7 +247,7 @@ func TestAnthropicRouteReducesToolResult(t *testing.T) {
 	if gjson.GetBytes(got, "model").String() != "claude-sonnet-4-6" {
 		t.Fatalf("model not preserved: %s", got)
 	}
-	if !strings.Contains(gjson.GetBytes(got, "messages.2.content.0.content").String(), "identical to an earlier") {
+	if !strings.Contains(gjson.GetBytes(got, "messages.2.content.0.content").String(), "repeat of") {
 		t.Fatalf("dedup did not run on the anthropic tool_result via the proxy: %s", got)
 	}
 	if len(got) >= len(body) {
@@ -308,7 +308,7 @@ func TestBobGatewayReducesModelAndPassesControlPlane(t *testing.T) {
 	if model.path != "/inference/v1/chat/completions" {
 		t.Fatalf("model call forwarded to wrong path: %q", model.path)
 	}
-	if !strings.Contains(gjson.GetBytes(model.body, "messages.2.content").String(), "identical to an earlier") {
+	if !strings.Contains(gjson.GetBytes(model.body, "messages.2.content").String(), "repeat of") {
 		t.Fatalf("dedup did not run on the bob model call: %s", model.body)
 	}
 	if len(model.body) >= len(body) {

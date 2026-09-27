@@ -139,7 +139,7 @@ func TestAgentCompactionIsBypassed(t *testing.T) {
 			// And specifically compacted, not merely re-serialized: dedup collapsed the
 			// duplicate tool output.
 			second := gjson.GetBytes(got, "messages."+strconv.Itoa(len(msgs)-2)+".content").String()
-			if !strings.Contains(second, "identical to an earlier") {
+			if !strings.Contains(second, "repeat of") {
 				t.Fatalf("dedup did not run: %s", got)
 			}
 		})

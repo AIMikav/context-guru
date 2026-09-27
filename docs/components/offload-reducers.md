@@ -21,9 +21,15 @@ pointer + `<<cg:HASH>>` marker. Exact match only (near-duplicate is deferred).
 
 ```
 before:  <big config dump>  … (later, identical) <same big config dump>
-after:   <big config dump>  … [identical to the output of `cat /etc/app/config.yaml` earlier in
-                                this conversation] <<cg:1c8e…>> [full output: call context_guru_expand]
+after:   <big config dump>  … [repeat of earlier `cat /etc/app/config.yaml`; expand <<cg:1c8e…>>]
 ```
+
+The pointer is one bracket that closes around the marker, which is deliberate: the expand cue
+costs 3 tokens there instead of the 10 a separate `[full output: call context_guru_expand]`
+trailer costs, and the tool's full name is not repeated because `expand.Inject` puts its
+definition in `tools` on every turn that carries a marker. Against the pre-#281 note the whole
+pointer costs **+1 token** with no paired call, **+2** for a short command, and is capped at
+**+16** for a pathological one (`min_tokens` defaults to 100, so it still pays comfortably).
 
 The note names the **producing command**, recovered via `schema.ToolCalls`, rather than the earlier
 message's position. Two reasons, and both are load-bearing:
@@ -41,8 +47,8 @@ message's position. Two reasons, and both are load-bearing:
   equivalence was safe to assume.
 
 When a tool result has no paired `tool_use` block, the note degrades to the unqualified
-`[identical to an earlier tool output]` — still announcing itself as a pointer, without inventing a
-source.
+`[repeat of an earlier tool output; expand <<cg:…>>]` — still announcing itself as a pointer and
+still recoverable, without inventing a source.
 
 ### Lossiness
 

@@ -60,9 +60,9 @@ after (2nd copy):  [identical to an earlier tool output] <<cg:0abfad591bbe1c9a>>
 ```
 
 !!! note "Captured before #281"
-    The note now also names the producing command and the expand tool — e.g.
-    ``[identical to the output of `git diff` earlier in this conversation] <<cg:0abf…>> [full
-    output: call context_guru_expand]``. The capture above is left as it was recorded.
+    The note now names the producing command and carries an expand cue — e.g.
+    ``[repeat of earlier `git diff`; expand <<cg:0abf…>>]``. The capture above is left as it
+    was recorded.
 
 ### `failed_run` — superseded run → pointer, latest kept in full
 Captured with `CACHE_MODE=off` (on a cached agent `failed_run` auto-disables *new* collapses — a

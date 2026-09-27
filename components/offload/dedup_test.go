@@ -44,7 +44,9 @@ func runDedup(t *testing.T, d *Dedup, msgs []bschemas.ChatMessage) ([]string, *c
 // get the bytes it points at. The recovery instruction is the half that was missing —
 // dedup was the only offloader of eleven that passed an empty hint to tryMark, so its
 // duplicates went out as a bare <<cg:HASH>> with nothing saying the content was
-// retrievable, while every sibling said "[full output: call context_guru_expand]".
+// retrievable, while every sibling said "[full output: call context_guru_expand]". The
+// cue here is folded INSIDE the note's bracket ("; expand <<cg:HASH>>]") rather than
+// appended as a second trailer, which buys the same signal for three tokens instead of ten.
 func TestTheDedupMarkerSaysHowToGetTheOutputBack(t *testing.T) {
 	dump := strings.Repeat("verbose tool output line\n", 30)
 	msgs := []bschemas.ChatMessage{tool(dump), tool(dump)}
@@ -54,16 +56,25 @@ func TestTheDedupMarkerSaysHowToGetTheOutputBack(t *testing.T) {
 		t.Fatal("the first copy must be left verbatim; only later duplicates collapse")
 	}
 	dup := got[1]
-	if !strings.Contains(dup, expand.ToolName) {
-		t.Fatalf("the marker does not name the expand tool, so the model is told the output "+
-			"is a duplicate but not that it can recover it — the #281 trust gap: %q", dup)
+	// "expand" adjacent to the marker, rather than the tool's full name: expand.Inject puts
+	// the definition in `tools` on every turn that carries a marker, so repeating
+	// context_guru_expand in the note costs ten tokens to restate what is already in front
+	// of the model. The cue plus a resolvable marker is what has to survive.
+	if !strings.Contains(dup, "expand") {
+		t.Fatalf("the marker gives the model no cue that the output is retrievable, so it is "+
+			"told this is a duplicate but not that it can recover it — the #281 trust gap: %q", dup)
 	}
 	if !strings.Contains(dup, "<<cg:") {
 		t.Fatalf("no resolvable marker, so there is nothing to recover: %q", dup)
 	}
+	// The expand tool must actually be reachable under the name the note alludes to.
+	if expand.ToolName != "context_guru_expand" {
+		t.Fatalf("the expand tool was renamed to %q; the note's bare \"expand\" cue relies on "+
+			"the injected tool definition being the thing the model reaches for", expand.ToolName)
+	}
 }
 
-// The other half of #281: WHICH earlier output. "identical to an earlier tool output"
+// The other half of #281: WHICH earlier output. "an earlier tool output" on its own
 // asserts an equivalence the model cannot locate or check. Naming the producing command
 // makes it checkable — and disbelievable, which is the point, since only the model can
 // initiate recovery.
@@ -84,12 +95,12 @@ func TestTheDedupMarkerNamesTheCallTheOutputCameFrom(t *testing.T) {
 
 // A tool result with no paired tool_use still has to say it is a pointer. The note
 // degrades to the unqualified wording rather than inventing a source or emitting an
-// empty "identical to the output of “".
+// empty pair of backticks.
 func TestTheDedupMarkerStillIdentifiesItselfWithNoPairedCall(t *testing.T) {
 	dump := strings.Repeat("verbose tool output line\n", 30)
 	got, _ := runDedup(t, dedupFor(t), []bschemas.ChatMessage{tool(dump), tool(dump)})
 	dup := got[1]
-	if !strings.Contains(dup, "identical to an earlier tool output") {
+	if !strings.Contains(dup, "an earlier tool output") {
 		t.Fatalf("an unpaired duplicate must still announce itself as a pointer: %q", dup)
 	}
 	if strings.Contains(dup, "``") {
@@ -102,8 +113,16 @@ func TestTheDedupMarkerStillIdentifiesItselfWithNoPairedCall(t *testing.T) {
 func TestTheDedupNoteBoundsAndSanitizesTheCommand(t *testing.T) {
 	for _, tc := range []struct{ name, cmd string }{
 		{"long ascii", strings.Repeat("x", 4000)},
-		{"multibyte straddling the cut", strings.Repeat("a", 79) + strings.Repeat("日", 40)},
+		{"multibyte straddling the cut", strings.Repeat("a", 59) + strings.Repeat("日", 40)},
 		{"embedded newlines", "line one\nline two\nline three"},
+		// A Write payload's `content` reaches Command() as one argument, so megabyte inputs
+		// are reachable in normal operation, not a contrived case. Counting tokens on the
+		// whole thing before clamping bytes made this hang rather than truncate.
+		{"megabyte of punctuation", strings.Repeat("/.;:-_", 200000)},
+		{"megabyte of CJK", strings.Repeat("日本語", 300000)},
+		{"emoji run", strings.Repeat("🎉", 50000)},
+		{"mixed scripts", strings.Repeat("a/日🎉_", 100000)},
+		{"single multibyte rune", "日"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			note := dedupNote(schema.ToolCall{Name: "Bash", Args: `{"command":` + jsonQuote(tc.cmd) + `}`})
@@ -113,9 +132,56 @@ func TestTheDedupNoteBoundsAndSanitizesTheCommand(t *testing.T) {
 			if strings.ContainsAny(note, "\n\r") {
 				t.Fatalf("a multi-line note breaks the one-line pointer shape: %q", note)
 			}
-			if len(note) > 200 {
-				t.Fatalf("note is %d bytes; an unbounded pointer can cost more than the "+
-					"output it replaces", len(note))
+			// The binding cap is on tokens (see maxCmdTokens), so that is what is asserted
+			// here; the byte length is only loosely bounded, because a run of dense
+			// single-byte-per-token text legitimately fits more bytes into the same budget
+			// than prose does. TestTheDedupPointerStaysWithinItsTokenBudget covers the cost.
+			if got := schema.TextTokens(note); got > maxCmdTokens+12 {
+				t.Fatalf("note costs %d tokens: %q\nthe command cap stopped binding, so a "+
+					"pathological command can cost more than the output it replaces", got, note)
+			}
+			if len(note) > 400 {
+				t.Fatalf("note is %d bytes, which is past any plausible pointer even at "+
+					"one token per byte: %q", len(note), note)
+			}
+		})
+	}
+}
+
+// The pointer is only worth writing if it is small, and every word in it is paid for on
+// every deduped output in every request. The note therefore has a token budget, and this
+// is where it is enforced: the pre-#281 note was 10 tokens and said neither which output
+// it matched nor that it could be expanded, so the whole point is to buy both of those for
+// close to nothing. Measured with the same tokenizer tryMark's never-worse guard uses.
+//
+// The budget also protects the floor. tryMark compares marker-inclusive, so each extra
+// token raises the size at which a duplicate stops being worth collapsing and silently
+// pushes outputs just above min_tokens into marker_no_win.
+func TestTheDedupPointerStaysWithinItsTokenBudget(t *testing.T) {
+	const marker = "<<cg:6b8b51fac0c9be86>>" // a real 16-hex key, the shape on the wire
+	for _, tc := range []struct {
+		name, cmd string
+		budget    int
+	}{
+		// No paired call: must cost essentially nothing over the old wording, while
+		// gaining the expand cue the old note did not have.
+		{"unpaired", "", 26},
+		{"short command", "pytest -q", 27},
+		{"typical command", `python -c "import extract_team; print(extract_team.parse())"`, 39},
+		// The cap binds here; without it this case ran away with the request.
+		{"pathological command", strings.Repeat("some/long/path/", 40), 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var call schema.ToolCall
+			if tc.cmd != "" {
+				call = schema.ToolCall{Name: "Bash", Args: `{"command":` + jsonQuote(tc.cmd) + `}`}
+			}
+			got := schema.TextTokens(dedupNote(call) + marker + "]")
+			if got > tc.budget {
+				t.Fatalf("the pointer costs %d tokens, budget %d: %q\nevery token here is paid "+
+					"on every deduped output, and it raises the floor at which collapsing a "+
+					"duplicate stops paying (tryMark is marker-inclusive)",
+					got, tc.budget, dedupNote(call)+marker+"]")
 			}
 		})
 	}
