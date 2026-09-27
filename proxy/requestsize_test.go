@@ -187,7 +187,7 @@ func TestCompactEndpointAcceptsOversizedBody(t *testing.T) {
 	}
 	got := mustReadAll(t, resp.Body)
 	second := gjson.GetBytes([]byte(got), "messages.2.content").String()
-	if !strings.Contains(second, "identical to an earlier") {
+	if !strings.Contains(second, "repeat of") {
 		t.Fatalf("dedup did not run on the oversized body: %s", truncate(second, 200))
 	}
 }

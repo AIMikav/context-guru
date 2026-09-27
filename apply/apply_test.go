@@ -169,7 +169,7 @@ func TestAnthropicToolResultOffloaded(t *testing.T) {
 		t.Fatal("the first tool_result must be left untouched")
 	}
 	dup := gjson.GetBytes(out, "messages.2.content.0.content").String()
-	if !strings.Contains(dup, "identical to an earlier") || !strings.Contains(dup, "<<cg:") {
+	if !strings.Contains(dup, "repeat of") || !strings.Contains(dup, "<<cg:") {
 		t.Fatalf("the duplicate tool_result was not collapsed: %q", dup)
 	}
 	// Block siblings survive the rewrite (only the content string changed).

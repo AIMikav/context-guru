@@ -77,7 +77,7 @@ func TestPipelineReducesAndExpands(t *testing.T) {
 
 	// dedup should have collapsed the third message (second copy of dump).
 	third := schema.MessageText(req.Input[2])
-	if !strings.Contains(third, "identical to an earlier") {
+	if !strings.Contains(third, "repeat of") {
 		t.Fatalf("dedup did not collapse the duplicate: %q", third)
 	}
 	dupKeys := expand.ParseMarkers(third)

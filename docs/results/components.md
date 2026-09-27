@@ -47,6 +47,8 @@ pointer. Triggers on tool-role text ≥ 100 tok whose content-hash was seen earl
 pointer+marker must be strictly smaller.
 > **Real example** (git diff re-sent): `181 → 21 tok` →
 > `[identical to an earlier tool output] <<cg:3da56b20…>>`
+> (recorded before #281; the note now reads ``[repeat of earlier `git diff`; expand <<cg:3da…>>]``,
+> so the token figure is a token or two under today's pointer)
 Run: 7 acts, 1,120 cumulative / **160 unique** tok.
 
 ### 3. `failed_run` (Offload — auto-off on cached agents)

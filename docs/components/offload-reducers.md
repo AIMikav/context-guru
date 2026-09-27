@@ -21,8 +21,34 @@ pointer + `<<cg:HASH>>` marker. Exact match only (near-duplicate is deferred).
 
 ```
 before:  <big config dump>  … (later, identical) <same big config dump>
-after:   <big config dump>  … [identical to an earlier tool output] <<cg:1c8e…>>
+after:   <big config dump>  … [repeat of earlier `cat /etc/app/config.yaml`; expand <<cg:1c8e…>>]
 ```
+
+The pointer is one bracket that closes around the marker, which is deliberate: the expand cue
+costs 3 tokens there instead of the 10 a separate `[full output: call context_guru_expand]`
+trailer costs, and the tool's full name is not repeated because `expand.Inject` puts its
+definition in `tools` on every turn that carries a marker. Against the pre-#281 note the whole
+pointer costs **+1 token** with no paired call, **+2** for a short command, and is capped at
+**+16** for a pathological one (`min_tokens` defaults to 100, so it still pays comfortably).
+
+The note names the **producing command**, recovered via `schema.ToolCalls`, rather than the earlier
+message's position. Two reasons, and both are load-bearing:
+
+- A *position* ("identical to the output at step 12") is not something the model can resolve — it
+  sees no message indices — and it would make the replacement bytes position-dependent. `dedup` is
+  one of the offloaders `CacheAware` exempts from the cache-tail gate precisely because it is
+  byte-stable on the unchanged prefix; a marker carrying an index would rewrite itself as the
+  transcript grows and force a full-suffix cache write. The command is derived from content that
+  already sits ahead of this message, so it is stable across turns.
+- An equivalence claim the model can *locate* is one it can also **disbelieve**. That matters most
+  right after an edit, when "this output is unchanged" is being relied on for signal rather than for
+  token savings — see [#281](https://github.com/rossoctl/context-guru/issues/281). Only the model can
+  initiate recovery, so the note states what was removed and how to get it back, never that the
+  equivalence was safe to assume.
+
+When a tool result has no paired `tool_use` block, the note degrades to the unqualified
+`[repeat of an earlier tool output; expand <<cg:…>>]` — still announcing itself as a pointer and
+still recoverable, without inventing a source.
 
 ### Lossiness
 
@@ -49,10 +75,11 @@ Switching the hash to `extract.ContentKey` — the whitespace/marker-insensitive
 was considered and rejected on both halves of that. It would gain nothing measured, and it is not
 lossless in the way that matters: `ContentKey` collapses *every* whitespace run, so two outputs that
 differ only in indentation (the same Python file read before and after a re-indent, two diffs with
-different leading space) would hash equal, and the later one would be replaced by the words
-*"identical to an earlier tool output"*. The bytes are still recoverable through the marker, but the
-sentence the model reads would be false until it expands. Exact bytes is the right key for a claim
-of identity.
+different leading space) would hash equal, and the later one would be replaced by a note claiming it
+is *identical to* the earlier output. The bytes are still recoverable through the marker, but the
+sentence the model reads would be false until it expands — and naming the producing command makes a
+false claim more misleading, not less, because it reads as checkable. Exact bytes is the right key
+for a claim of identity.
 
 ### When it's inert
 
