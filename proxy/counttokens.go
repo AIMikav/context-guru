@@ -67,7 +67,10 @@ func (h *Handler) countTokens(static upstream) http.HandlerFunc {
 			// nothing a higher ceiling would buy.
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
-				http.Error(w, "count_tokens: request too large", http.StatusRequestEntityTooLarge)
+				// Same parseable envelope as the chat routes (refuseTooLarge, proxy.go):
+				// the caller on this route speaks the same dialect and classifies a
+				// refusal the same way, so an unparseable one is just as opaque here.
+				refuseTooLarge(w, maxRequestBytes)
 			} else {
 				http.Error(w, "count_tokens: unreadable request body", http.StatusBadRequest)
 			}

@@ -1332,14 +1332,42 @@ func readGatedBody(w http.ResponseWriter, r *http.Request, unconditionalOverride
 	}
 	body = append(body, rest...)
 	if int64(len(body)) > maxCompactionRequestBytes {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		refuseTooLarge(w, maxCompactionRequestBytes)
 		return nil, false
 	}
 	if !unconditionalOverride && !isAgentCompaction(body) {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		refuseTooLarge(w, maxRequestBytes)
 		return nil, false
 	}
 	return body, true
+}
+
+// refuseTooLarge writes the 413 for an oversized body in the shape an AGENT can act on.
+//
+// WHY THE SHAPE MATTERS, and it is the whole point of this function. Claude Code decides
+// what to tell the user by parsing the refusal for `error.type == "request_too_large"`
+// (2.1.x). A refusal it cannot parse is reported as a generic transport failure; a refusal
+// it CAN parse is classified against the transcript it just tried to send, and the user is
+// told whether to /compact, remove attachments, or start fresh. http.Error's plain text
+// `request too large` never matched, so a proxy-side refusal surfaced as an opaque error
+// naming a limit the deployment had not applied — the reported symptom in
+// rossoctl/context-guru#278 was exactly this, text about "accumulated images and
+// attachments" for a session that contained no images at all.
+//
+// The wire format is Anthropic's own error envelope, because that is the dialect the caller
+// is already speaking on this route and therefore the one it already parses. `limit_bytes`
+// is an addition, not a substitution: it says which of the two tiers refused (see
+// maxCompactionRequestBytes), which a caller cannot otherwise tell apart, and an unknown
+// field is ignored by a client that does not read it.
+//
+// Content-Type is set explicitly: http.Error's sniffed text/plain is what made this
+// unparseable in the first place.
+func refuseTooLarge(w http.ResponseWriter, limit int64) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	fmt.Fprintf(w,
+		`{"type":"error","error":{"type":"request_too_large","message":%q,"limit_bytes":%d}}`+"\n",
+		fmt.Sprintf("request body over the %d-byte limit for this route", limit), limit)
 }
 
 // The expand tool is advertised on the outgoing request by expand.Inject (called
