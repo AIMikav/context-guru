@@ -11962,3 +11962,73 @@ func TestTheHooksSkipTheDelegateWhenTheOptionPortAlreadyAgrees(t *testing.T) {
 		})
 	}
 }
+
+// TestEverySkillScriptIsExecutable asserts that every script a skill invokes BY PATH can actually be
+// run that way.
+//
+// `/context-guru:insights` shipped broken: `scripts/insights.py` was committed 100644 while its six
+// siblings were 100755, and all four insights skills invoke it as `"${CLAUDE_PLUGIN_ROOT}/scripts/
+// insights.py" <area>` with no interpreter. Every user got `permission denied` (exit 126) on a file
+// with a perfectly good `#!/usr/bin/env python3` line. Nothing caught it because the mode bit is
+// invisible in a diff, the tests that drive these scripts pass an interpreter or an absolute path
+// through `runIn`, and reading the skill tells you nothing about how the file was committed.
+//
+// So the invariant is taken from the skills themselves rather than from a hand-maintained list: the
+// set of scripts referenced as `${CLAUDE_PLUGIN_ROOT}/scripts/<name>` IS the set that has to be
+// executable, and it grows whenever somebody writes a new skill.
+//
+// The scripts are deliberately NOT run here. `install.sh` and `start-proxy.sh` are in this set, and a
+// test that execs them to see whether exec works would install something or start a proxy on a
+// developer's machine. The mode bit plus a shebang is the whole of what was missing.
+func TestEverySkillScriptIsExecutable(t *testing.T) {
+	entries, err := os.ReadDir("skills")
+	if err != nil {
+		t.Fatalf("reading skills: %v", err)
+	}
+	ref := regexp.MustCompile(`\$\{CLAUDE_PLUGIN_ROOT\}/scripts/([A-Za-z0-9._-]+)`)
+	// name -> the skills that invoke it, so a failure names the command a user would have run.
+	byScript := map[string][]string{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("skills", e.Name(), "SKILL.md"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatal(err)
+		}
+		for _, m := range ref.FindAllStringSubmatch(string(b), -1) {
+			if got := byScript[m[1]]; len(got) == 0 || got[len(got)-1] != e.Name() {
+				byScript[m[1]] = append(byScript[m[1]], e.Name())
+			}
+		}
+	}
+	if len(byScript) == 0 {
+		t.Fatal("no skill references ${CLAUDE_PLUGIN_ROOT}/scripts/<name>; either the skills moved " +
+			"or this test stopped looking where they are, and it would now pass vacuously")
+	}
+	for name, skills := range byScript {
+		p := filepath.Join("scripts", name)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("skill(s) %v invoke %s, which does not exist: %v", skills, p, err)
+			continue
+		}
+		if fi.Mode().Perm()&0o111 == 0 {
+			t.Errorf("skill(s) %v invoke %s by path, but it is committed mode %04o — running it that "+
+				"way is `permission denied` (exit 126) for every user. `git update-index --chmod=+x %s`",
+				skills, p, fi.Mode().Perm(), p)
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(string(b), "#!") {
+			t.Errorf("skill(s) %v invoke %s by path, but it has no shebang, so the kernel has no "+
+				"interpreter for it however the mode bits read", skills, p)
+		}
+	}
+	t.Logf("%d script(s) referenced by skills, all executable", len(byScript))
+}
