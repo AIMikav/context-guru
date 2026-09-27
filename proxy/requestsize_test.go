@@ -256,3 +256,98 @@ const ccCompactPromptForSizeTest = "CRITICAL: Respond with TEXT ONLY. Do NOT cal
 	"Your task is to create a detailed summary of the conversation so far, paying close " +
 	"attention to the user's explicit requests and your previous actions.\n" +
 	"3. Files and Code Sections: ... include full code snippets where applicable"
+
+// TestRefusalIsParseableByTheAgent pins the SHAPE of the 413, not just its status.
+//
+// This is the second half of rossoctl/context-guru#278, and the half that kept the symptom
+// alive after the ceiling itself was fixed. Claude Code (2.1.x) decides what to tell the
+// user by parsing the refusal body for `error.type == "request_too_large"`; only then does it
+// classify the transcript it tried to send and say whether /compact, removing attachments, or
+// starting fresh is the way out. `http.Error`'s plain-text "request too large" does not parse,
+// so a proxy refusal reached the user as an opaque failure quoting a 32MB limit the deployment
+// had never applied, with advice ("remove accumulated images and attachments") aimed at media
+// the session did not contain.
+//
+// Asserting on the parsed field rather than the whole string deliberately: the prose may be
+// reworded, but `error.type` is a wire contract with the client and changing it silently
+// re-breaks the diagnosis.
+func TestRefusalIsParseableByTheAgent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("an oversized, non-compaction request must never reach the upstream")
+	}))
+	defer upstream.Close()
+
+	h, _ := buildHandler(t, "pipeline: [dedup]\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/openai/v1/chat/completions", "application/json",
+		bytes.NewReader(oversizedBody(t, 1<<20, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json — a body the client cannot "+
+			"identify as JSON is not parsed at all", ct)
+	}
+	raw := mustReadAll(t, resp.Body)
+	if !json.Valid([]byte(raw)) {
+		t.Fatalf("refusal body is not valid JSON: %q", raw)
+	}
+	if got := gjson.Get(raw, "error.type").String(); got != "request_too_large" {
+		t.Errorf("error.type = %q, want %q — this exact value is what the agent matches "+
+			"to tell the user how to recover; body was %s", got, "request_too_large", raw)
+	}
+	if got := gjson.Get(raw, "error.limit_bytes").Int(); got != testMaxRequestBytes {
+		t.Errorf("error.limit_bytes = %d, want %d (the tier that actually refused)",
+			got, testMaxRequestBytes)
+	}
+}
+
+// TestRefusalOverHardCeilingNamesTheHigherTier: a body over the 128 MiB hard ceiling is
+// refused whatever it is, and must say so with the ceiling that actually applied. Reporting
+// the 32 MiB tier here would tell a caller its compaction request was refused by a limit it
+// was in fact allowed to exceed.
+func TestRefusalOverHardCeilingNamesTheHigherTier(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("a body over the hard ceiling must never reach the upstream")
+	}))
+	defer upstream.Close()
+
+	h, _ := buildHandler(t, "pipeline: [dedup]\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	// Over the HARD ceiling and a genuine compaction request: refused on size alone.
+	filler := repeatBannerToSize(testMaxCompactionRequestBytes + (1 << 20))
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-x",
+		"messages": []map[string]any{
+			{"role": "user", "content": filler},
+			{"role": "user", "content": "Your task is to create a detailed summary of the conversation"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.URL+"/openai/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	raw := mustReadAll(t, resp.Body)
+	if got := gjson.Get(raw, "error.type").String(); got != "request_too_large" {
+		t.Errorf("error.type = %q, want request_too_large; body %s", got, raw)
+	}
+	if got := gjson.Get(raw, "error.limit_bytes").Int(); got != testMaxCompactionRequestBytes {
+		t.Errorf("error.limit_bytes = %d, want %d (the hard ceiling, not the ordinary tier)",
+			got, testMaxCompactionRequestBytes)
+	}
+}

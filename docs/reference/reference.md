@@ -38,6 +38,26 @@ regardless of content. `/anthropic/v1/messages/count_tokens` is NOT exempt (no p
 would benefit from a higher ceiling — it forwards verbatim either way); it still refuses
 anything over 32 MiB, now with an honest `413` rather than a generic `400`.
 
+**The refusal body is JSON the agent can act on**, not plain text:
+
+```json
+{"type":"error","error":{"type":"request_too_large","message":"…","limit_bytes":33554432}}
+```
+
+`error.type` is a wire contract, not cosmetic. Claude Code (2.1.x) reads it to decide what to
+tell the user — whether to run `/compact`, remove attachments, or start a new session — and
+falls back to a generic transport error for a refusal it cannot parse. While this was
+`http.Error`'s `text/plain`, a proxy refusal reached the user as an opaque failure quoting a
+32MB limit the deployment had never applied, advising them to remove "accumulated images and
+attachments" from sessions that often contained no images at all. `limit_bytes` names which of
+the two tiers above actually refused, which the caller cannot otherwise distinguish.
+
+**A front end in front of this proxy must not cap bodies below 128 MiB.** nginx's
+`client_max_body_size` defaults to 1 MiB, which aborts the upload mid-stream and answers with
+its own HTML `413` — the proxy never sees the request, and none of the tiering above can apply.
+Set it to at least the compaction ceiling and let the proxy decide: only the proxy can tell a
+genuine compaction request from an ordinary oversized turn.
+
 #### `count_tokens` answers about the ORIGINAL body, and that is deliberate
 
 The route forwards the client's body unchanged, so the count it returns describes what the client
