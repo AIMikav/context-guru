@@ -490,6 +490,12 @@ follow this machine-wide route instead (their own proxies are stopped; whatever 
 before context-guru is put back and would still override, reported per project)" ;;
     esac
   fi
+  # The enablement route_enable_plugin writes (#318) is a machine-wide change in the same file, so it
+  # is part of what is agreed to here rather than something the report mentions afterwards.
+  if [ "$R_SCOPE" = user ]; then
+    q="$q, and enable the context-guru plugin in every project so its /context-guru:* commands work \
+everywhere, not only here (a machine-wide switch-off set in /plugin is left as it is)"
+  fi
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
   fi
@@ -1226,8 +1232,49 @@ any other project, since the machine-wide install has its own record and port."
   emit "reset_hatch=$(kv "$aout" reset_hatch)"
   emit "replaced=$(kv "$aout" replaced)"
   route_install_statusline
+  route_enable_plugin "$ares"
   route_ensure_gitignore
   route_report
+}
+
+# ---- enablement, machine-wide installs only (#318) -------------------------------------------
+# `/context-guru:install` can only run where the plugin is already ENABLED, which in practice is one
+# project: `/plugin` writes `enabledPlugins` into whichever scope it was asked for. `--scope user`
+# then carried routing, the port option and the status line everywhere and left enablement where it
+# started, so every other project was routed through the proxy, showed the status line (a plain
+# command path, which needs no enablement), and had no `/context-guru:*` commands at all — the state
+# that looks like a broken install, and that reloading plugins only confirms.
+#
+# So a machine-wide install completes what it promised, in the same file and under the same backup
+# and consent as the two writes above. `enable-plugin` writes only an ABSENT key and records it, so
+# uninstall takes back only what this added; an explicit `false` is the user's decision in `/plugin`
+# and is reported rather than flipped. Project and team scope write nothing here: a project install
+# runs where the plugin is already enabled, which is the project it routes.
+#
+# Never fatal, like the statusline: routing is written and health-checked by now.
+route_enable_plugin() {
+  [ "$R_SCOPE" = user ] || return 0
+  # --no-backup only when the routing write ($1, its result) took one this run. `unchanged` took
+  # none — the re-run a machine installed before this fix makes to get it — so this write backs up.
+  local eout nb=(--no-backup)
+  [ "${1:-}" = unchanged ] && nb=()
+  eout=$("$(route_here)/settings.py" enable-plugin --file "$R_FILE" --user-scope "${nb[@]}" 2>&1) \
+    || true
+  local found; found=$(kv "$eout" plugin_enabled)
+  local how="run: claude plugin enable context-guru@context-guru --scope user"
+  case "$found" in
+    added|already) emit "plugin_enabled=$found" ;;
+    explicitly_disabled)
+      emit "plugin_enabled=explicitly_disabled"
+      emit "plugin_enabled_note=context-guru is switched OFF machine-wide in $R_FILE (enabledPlugins), \
+which was left as it is: routing now covers every project, but its /context-guru:* commands appear only \
+in projects that enable it themselves. To have them everywhere, $how" ;;
+    *)
+      emit "plugin_enabled=skipped"
+      local why=${found:-$(kv "$eout" reason)}
+      emit "plugin_enabled_note=could not enable context-guru machine-wide (${why:-unknown}); its \
+/context-guru:* commands stay limited to projects that enable it. To have them everywhere, $how" ;;
+  esac
 }
 
 # ---- statusline, on by default -------------------------------------------------------------

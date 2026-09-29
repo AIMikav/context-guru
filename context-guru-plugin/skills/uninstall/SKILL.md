@@ -107,6 +107,13 @@ exactly as the loop above pairs the two** — and then do steps 2 and 3 a second
 (`port show --key "$KEY"`, with `$KEY` from `project-key --user-scope` as in step 2). The flag is the
 whole confirmation, so do not add it before they answer — and never to make the loop above quieter.
 
+`plugin_enabled_removed=true` on that run means the machine-wide install had also enabled the plugin
+for every project, and that enablement went with it: say that `/context-guru:*` commands now remain
+only in projects that enable it themselves. (`claude plugin list` may still show a disabled user-scope
+entry for it — Claude Code's own record, which `claude plugin uninstall context-guru@context-guru`
+clears.) `false` means it was not ours to remove (they enabled it
+machine-wide themselves, or switched it off since) — it stays as it is, and needs no mention.
+
 The `port unset` is not housekeeping on this path, it is the difference between an uninstall and a
 booby trap. The loop above never reaches this file (it is refused there, which is the point), so
 without it a confirmed machine-wide removal leaves `pluginConfigs` naming a `port` in the one file

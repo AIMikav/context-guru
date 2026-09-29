@@ -23,7 +23,8 @@ Usage:
   settings.py add           --file PATH --url URL [--force] [--upstream URL] [--bin PATH] [--statusline CMD]
   settings.py add           --file PATH --statusline CMD [--force]   # statusline only, no routing change
   settings.py remove        --file PATH [--url URL] [--user-scope]
-  settings.py show          --file PATH
+  settings.py enable-plugin --file PATH [--plugin ID] [--user-scope] [--no-backup]
+  settings.py show         --file PATH
   settings.py resolve-scope                                          # where THIS project's routing lives
 """
 
@@ -62,6 +63,17 @@ STATUSLINE_META = "installed_statusline"      # the command string we wrote, so 
                                                # recognises its own work even if it is about to
                                                # write a DIFFERENT command (the plugin moved).
 STATUSLINE_PREV_META = "previous_statusline"  # what we replaced, so uninstall can hand it back.
+
+# enabledPlugins is the THIRD surface, and the one that decides whether this plugin's commands, skills
+# and hooks exist in a session at all (#318). `/plugin` writes it, into whichever scope the user
+# picked — in practice the one project they were standing in. A machine-wide install run from there
+# routed every project and left enablement where it was, so `/context-guru:*` was missing everywhere
+# else while the status line (a plain command path, no enablement needed) kept rendering. Written only
+# by a machine-wide install, only where the key is ABSENT, and recorded so uninstall takes back
+# exactly what we added — the same shape as STATUSLINE_META above.
+ENABLED_KEY = "enabledPlugins"
+ENABLED_META = "installed_enabled_plugin"     # the plugin id we set to true; absent when we did not
+PLUGIN_ID = "context-guru@context-guru"
 
 # Where this script records what it did, so a later run can tell its own work from the user's.
 META = "$context-guru"
@@ -134,6 +146,64 @@ def remove_statusline_only(data: dict) -> tuple[bool, str]:
     if not meta:
         data.pop(META, None)
     return True, restored
+
+
+def apply_enabled_plugin(data: dict, plugin: str) -> str:
+    """Enable `plugin` in `data`, in place, if and only if nothing is there yet. Returns what it found:
+
+    * `added` — the key was absent; set to true and recorded as ours.
+    * `already` — already true. Not ours, so not recorded: uninstall must leave it.
+    * `explicitly_disabled` — false. A decision the user made in `/plugin`; never flipped.
+    * `present` — some other value we do not understand. Theirs, left alone.
+    * `not_an_object` — `enabledPlugins` is not a JSON object; refused rather than replaced.
+
+    A re-run over our own earlier `added` reports `already` and keeps the record, since the record is
+    what says whose the key is — and dropping it would make a later uninstall leave our key behind.
+    """
+    block = data.get(ENABLED_KEY)
+    if block is not None and not isinstance(block, dict):
+        return "not_an_object"
+    current = (block or {}).get(plugin)
+    if current is True:
+        return "already"
+    if current is not None:
+        # Theirs now, even if we once added it: they switched it off (or to something we do not
+        # understand) since. Drop our record, or a later re-enable of their own would be taken away
+        # by uninstall as if it were still ours. The caller saves when this changes the file.
+        meta = data.get(META)
+        if isinstance(meta, dict) and meta.get(ENABLED_META) == plugin:
+            del meta[ENABLED_META]
+            if not meta:
+                data.pop(META, None)
+        return "explicitly_disabled" if current is False else "present"
+    if block is None:
+        # Absent and `null` alike: `setdefault` would hand back the stored None.
+        block = data[ENABLED_KEY] = {}
+    block[plugin] = True
+    data.setdefault(META, {})[ENABLED_META] = plugin
+    return "added"
+
+
+def remove_enabled_plugin(data: dict) -> bool:
+    """Undo exactly what apply_enabled_plugin added: the key goes only if the record names it AND it is
+    still true. A false the user set after the install is theirs now and stays. The record goes either
+    way, since it describes a key that is either being removed or is no longer ours. Returns whether
+    the key was removed.
+    """
+    meta = data.get(META)
+    recorded = meta.get(ENABLED_META) if isinstance(meta, dict) else None
+    if not recorded:
+        return False
+    meta.pop(ENABLED_META, None)
+    block = data.get(ENABLED_KEY)
+    if not isinstance(block, dict) or block.get(recorded) is not True:
+        return False
+    del block[recorded]
+    # An empty object and an absent key mean the same thing to Claude Code, so an emptied block is
+    # litter rather than somebody's setting.
+    if not block:
+        data.pop(ENABLED_KEY, None)
+    return True
 
 
 # Values that are URLs get their credentials taken out before they are printed. S4 in review, and
@@ -2731,8 +2801,23 @@ def cmd_remove(args: argparse.Namespace) -> int:
         # No routing to remove here — but a STATUSLINE-ONLY install (the /context-guru:statusline
         # skill's `add --statusline` with no --url) never touches env at all, so it must not be
         # missed just because there is no base_url in this file to key off.
+        before = json.dumps(data, sort_keys=True)
         changed, restored_sl = remove_statusline_only(data)
-        if changed:
+        # Our enablement too: with the routing already gone some other way, this is the last call
+        # that can take it back, and leaving it enables the plugin everywhere after an uninstall.
+        # Machine-wide only with --user-scope, like routing below: a PROJECT uninstall walks this
+        # file too and relies on being refused here, and without the gate one project's uninstall
+        # switched the plugin's commands off in every project.
+        enabled_removed = False
+        if not is_user_scope(args.file) or getattr(args, "user_scope", False):
+            enabled_removed = remove_enabled_plugin(data)
+        if isinstance(data.get(META), dict) and not data[META]:
+            data.pop(META, None)
+        if not (changed or enabled_removed) and json.dumps(data, sort_keys=True) != before:
+            # Only a stale record of ours went (the user changed the value since): nothing to report
+            # as removed, but the record must not outlive the uninstall.
+            save(args.file, data)
+        if changed or enabled_removed:
             saved = backup(args.file)
             deleted = maybe_delete_if_empty(args.file, data)
             if not deleted:
@@ -2740,8 +2825,9 @@ def cmd_remove(args: argparse.Namespace) -> int:
                 forget_backups(args.file)
             saved = post_uninstall_backup_note(deleted)
             emit(result="removed", file=args.file, backup=saved, statusline_restored=restored_sl,
+                 plugin_enabled_removed=str(enabled_removed).lower(),
                  file_deleted=str(deleted).lower(),
-                 note="statusline-only removal; no routing was present to touch")
+                 note="no routing was present to touch; removed only the other keys we recorded")
             return 0
         emit(result="unchanged", file=args.file, note=f"no env.{KEY} here")
         return 0
@@ -2855,6 +2941,8 @@ def cmd_remove(args: argparse.Namespace) -> int:
         if isinstance(_meta, dict) and _meta.get(STATUSLINE_PREV_META):
             data[STATUSLINE_KEY] = _meta[STATUSLINE_PREV_META]
             restored_sl = json.dumps(_meta[STATUSLINE_PREV_META], sort_keys=True)
+    # enabledPlugins, same rule again: only what the record says we added (see apply_enabled_plugin).
+    enabled_removed = remove_enabled_plugin(data)
     # Put back whatever we took over at install time. Deleting the key was leaving a user who had
     # a gateway configured with nothing at all — a worse state than before they installed.
     restored = ""
@@ -2885,7 +2973,45 @@ def cmd_remove(args: argparse.Namespace) -> int:
         forget_backups(args.file)
     emit(result="removed", file=args.file, was=current, backup=post_uninstall_backup_note(deleted),
          restored=restored, env_block_left=str(bool(env)).lower(),
-         statusline_restored=restored_sl, file_deleted=str(deleted).lower())
+         statusline_restored=restored_sl, plugin_enabled_removed=str(enabled_removed).lower(),
+         file_deleted=str(deleted).lower())
+    return 0
+
+
+def cmd_enable_plugin(args: argparse.Namespace) -> int:
+    """Enable this plugin in `--file` — the machine-wide install's second half (#318). See
+    apply_enabled_plugin for what counts as ours; this is the scope gate, backup and report around it.
+
+    Its own subcommand rather than an `add` flag because it has no conflict case to share with routing:
+    every value it finds that is not absence is the user's and is left alone, reported, and exit 0 —
+    install.sh reports the outcome and carries on, since routing is already written and health-checked
+    by the time this runs.
+    """
+    # The same gate `add` applies: writing the machine-wide file is a machine-wide change and needs the
+    # flag that means the user was asked. install.sh passes it, under the same --scope user consent.
+    if is_user_scope(args.file) and not args.user_scope:
+        emit(result="error", reason="user_scope_needs_flag", file=args.file,
+             note="this file governs EVERY project on the machine, so it needs --user-scope as well")
+        return 2
+    data, existed = load(args.file)
+    before = json.dumps(data, sort_keys=True)
+    found = apply_enabled_plugin(data, args.plugin)
+    if found == "not_an_object":
+        emit(result="error", reason="enabledPlugins_not_an_object", file=args.file,
+             plugin=args.plugin, plugin_enabled=found)
+        return 3
+    if found != "added":
+        if json.dumps(data, sort_keys=True) != before:   # only a stale record of ours went
+            save(args.file, data)
+        emit(result="unchanged", file=args.file, plugin=args.plugin, plugin_enabled=found)
+        return 0
+    # --no-backup for the same reason `add --statusline` takes it from install.sh: the routing write
+    # moments earlier in the same install already backed up this file's pre-install state.
+    saved = "" if args.no_backup else (backup(args.file) if existed else "")
+    save(args.file, data)
+    emit(result="added", file=args.file, plugin=args.plugin, plugin_enabled="added",
+         backup=saved or ("(covered by the routing install's backup)" if args.no_backup
+                          else "(new file)"))
     return 0
 
 
@@ -3689,6 +3815,16 @@ def main() -> int:
              "should come back off")
     off.add_argument("--file", required=True)
 
+    en = sub.add_parser("enable-plugin",
+        help="set enabledPlugins[<plugin>] = true in --file when it is absent, recorded so `remove` "
+             "takes back only what this added; an explicit false is the user's and is left alone")
+    en.add_argument("--file", required=True)
+    en.add_argument("--plugin", default=PLUGIN_ID)
+    en.add_argument("--user-scope", action="store_true",
+                    help="permit writing the machine-wide settings file, as on `add`")
+    en.add_argument("--no-backup", action="store_true",
+                    help="skip the backup, for install.sh's follow-up call after the routing `add`")
+
     cfg = sub.add_parser("config")
     cfg.add_argument("--plugin", default="context-guru@context-guru")
 
@@ -3807,6 +3943,7 @@ def main() -> int:
     if args.cmd == "preset" and args.op == "set" and not args.name:
         ap.error("preset set needs --name; one of " + ", ".join(PRESETS))
     rc = {"add": cmd_add, "remove": cmd_remove, "off": cmd_off, "show": cmd_show,
+          "enable-plugin": cmd_enable_plugin,
           "config": cmd_config, "resolve-scope": cmd_resolve_scope,
           "project-key": cmd_project_key, "scopes": cmd_scopes,
           "strategy": cmd_strategy, "preset": cmd_preset, "port": cmd_port,
