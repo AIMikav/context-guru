@@ -53,6 +53,13 @@ answer; there's no migration step.
 This is a separate question from *routing scope*, which `/context-guru:install` asks next and which
 decides which sessions' traffic actually goes through the proxy (table below).
 
+The two meet in one place: a machine-wide routing install (`/context-guru:install --global`) also
+enables the plugin for every project, by adding `enabledPlugins["context-guru@context-guru"]: true` to
+`~/.claude/settings.json`. Without it, a plugin installed at local scope would route every project but
+have its `/context-guru:*` commands in one project only. It is added only if the key is absent, never
+over a `false` you set in `/plugin` (the install then says so), and `/context-guru:uninstall` takes it
+back only if the install was the one that added it.
+
 ### `/plugin configure` — five options, all with working defaults
 
 Open it, press **Save configuration**, and nothing changes. Only one of these usually needs
@@ -218,6 +225,10 @@ own settings and port, or fold it into the machine-wide one?**
 |---|---|
 | Keep both (`--on-existing-projects leave`) | two installs, two ports, two proxies. The project keeps its own settings file, port and preset; every *other* project gets the machine-wide one. The project's own settings are more specific, so they keep winning there — that is what "keep" means. |
 | Fold it in (`--on-existing-projects adopt`) | the project's routing and port option are removed (each file backed up first) and its proxy is stopped, so it falls back to the machine-wide route like everywhere else. |
+
+The install also enables the plugin machine-wide (see [Pick a plugin scope](#pick-a-plugin-scope)), so
+the `/context-guru:*` commands are there in every project, not only in the one you ran it from. The
+result reports it as `plugin_enabled=added`.
 
 You do not have to be in a particular directory, and you never have to edit a settings file by hand.
 
