@@ -109,7 +109,9 @@ whole confirmation, so do not add it before they answer — and never to make th
 
 `plugin_enabled_removed=true` on that run means the machine-wide install had also enabled the plugin
 for every project, and that enablement went with it: say that `/context-guru:*` commands now remain
-only in projects that enable it themselves. `false` means it was not ours to remove (they enabled it
+only in projects that enable it themselves. (`claude plugin list` may still show a disabled user-scope
+entry for it — Claude Code's own record, which `claude plugin uninstall context-guru@context-guru`
+clears.) `false` means it was not ours to remove (they enabled it
 machine-wide themselves, or switched it off since) — it stays as it is, and needs no mention.
 
 The `port unset` is not housekeeping on this path, it is the difference between an uninstall and a

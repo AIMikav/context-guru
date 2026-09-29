@@ -1226,7 +1226,7 @@ any other project, since the machine-wide install has its own record and port."
   emit "reset_hatch=$(kv "$aout" reset_hatch)"
   emit "replaced=$(kv "$aout" replaced)"
   route_install_statusline
-  route_enable_plugin
+  route_enable_plugin "$ares"
   route_ensure_gitignore
   route_report
 }
@@ -1248,23 +1248,26 @@ any other project, since the machine-wide install has its own record and port."
 # Never fatal, like the statusline: routing is written and health-checked by now.
 route_enable_plugin() {
   [ "$R_SCOPE" = user ] || return 0
-  local eout
-  eout=$("$(route_here)/settings.py" enable-plugin --file "$R_FILE" --user-scope --no-backup 2>&1) \
+  # --no-backup only when the routing write ($1, its result) took one this run. `unchanged` took
+  # none — the re-run a machine installed before this fix makes to get it — so this write backs up.
+  local eout nb=(--no-backup)
+  [ "${1:-}" = unchanged ] && nb=()
+  eout=$("$(route_here)/settings.py" enable-plugin --file "$R_FILE" --user-scope "${nb[@]}" 2>&1) \
     || true
   local found; found=$(kv "$eout" plugin_enabled)
+  local how="run: claude plugin enable context-guru@context-guru --scope user"
   case "$found" in
     added|already) emit "plugin_enabled=$found" ;;
     explicitly_disabled)
       emit "plugin_enabled=explicitly_disabled"
       emit "plugin_enabled_note=context-guru is switched OFF machine-wide in $R_FILE (enabledPlugins), \
 which was left as it is: routing now covers every project, but its /context-guru:* commands appear only \
-in projects that enable it themselves. To have them everywhere: /plugin, enable context-guru for all \
-projects." ;;
+in projects that enable it themselves. To have them everywhere, $how" ;;
     *)
       emit "plugin_enabled=skipped"
-      emit "plugin_enabled_note=could not enable context-guru machine-wide (${found:-$(kv "$eout" reason)}); \
-its /context-guru:* commands stay limited to projects that enable it. To have them everywhere: /plugin, \
-enable context-guru for all projects." ;;
+      local why=${found:-$(kv "$eout" reason)}
+      emit "plugin_enabled_note=could not enable context-guru machine-wide (${why:-unknown}); its \
+/context-guru:* commands stay limited to projects that enable it. To have them everywhere, $how" ;;
   esac
 }
 

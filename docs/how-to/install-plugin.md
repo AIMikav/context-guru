@@ -57,8 +57,10 @@ The two meet in one place: a machine-wide routing install (`/context-guru:instal
 enables the plugin for every project, by adding `enabledPlugins["context-guru@context-guru"]: true` to
 `~/.claude/settings.json`. Without it, a plugin installed at local scope would route every project but
 have its `/context-guru:*` commands in one project only. It is added only if the key is absent, never
-over a `false` you set in `/plugin` (the install then says so), and `/context-guru:uninstall` takes it
-back only if the install was the one that added it.
+over a `false` you set in `/plugin` (the install then says so, and names the command that changes it:
+`claude plugin enable context-guru@context-guru --scope user`), and `/context-guru:uninstall` takes it
+back only if the install was the one that added it. A project that switches the plugin off in its own
+settings still wins there: the more specific scope always does.
 
 ### `/plugin configure` — five options, all with working defaults
 
@@ -227,7 +229,8 @@ own settings and port, or fold it into the machine-wide one?**
 | Fold it in (`--on-existing-projects adopt`) | the project's routing and port option are removed (each file backed up first) and its proxy is stopped, so it falls back to the machine-wide route like everywhere else. |
 
 The install also enables the plugin machine-wide (see [Pick a plugin scope](#pick-a-plugin-scope)), so
-the `/context-guru:*` commands are there in every project, not only in the one you ran it from. The
+the `/context-guru:*` commands are there in every project (bar any that switched the plugin off itself),
+not only in the one you ran it from. The
 result reports it as `plugin_enabled=added`.
 
 You do not have to be in a particular directory, and you never have to edit a settings file by hand.

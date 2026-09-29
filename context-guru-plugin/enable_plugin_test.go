@@ -15,6 +15,8 @@ package plugin
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -241,5 +243,191 @@ func TestEnablePluginRefusesTheUserFileWithoutTheFlag(t *testing.T) {
 	}
 	if _, ok := enabledIn(t, userFile); ok {
 		t.Errorf("written despite the refusal")
+	}
+}
+
+// seedUserFile writes a machine-wide settings file holding only the port option and `enabledPlugins`
+// set to `ep` — any JSON value, since the malformed shapes are the point of some tests below.
+func seedUserFile(t *testing.T, ep any) (home, state, userFile string) {
+	t.Helper()
+	home, state = t.TempDir(), t.TempDir()
+	writePluginOptions(t, home, map[string]any{})
+	userFile = filepath.Join(home, ".claude", "settings.json")
+	data := readJSON(t, userFile)
+	data["enabledPlugins"] = ep
+	writeJSON(t, userFile, data)
+	return home, state, userFile
+}
+
+// An emptied block is litter in a file that had none.
+func TestUserScopeUninstallLeavesNoEmptyEnabledPluginsBlock(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	if out, code := settingsInDir(t, state, home, proj, "remove", "--file", userFile,
+		"--user-scope"); code != 0 || out["plugin_enabled_removed"] != "true" {
+		t.Fatalf("uninstall: exit %d %v", code, out)
+	}
+	if v, ok := readJSON(t, userFile)["enabledPlugins"]; ok {
+		t.Errorf("uninstall left enabledPlugins=%v behind in a file that had none", v)
+	}
+}
+
+func TestEnablePluginRefusesANonObjectEnabledPlugins(t *testing.T) {
+	home, state, userFile := seedUserFile(t, []any{"x"})
+	before, _ := os.ReadFile(userFile)
+	out, code := settingsInDir(t, state, home, "", "enable-plugin", "--file", userFile, "--user-scope")
+	if code != 3 || out["reason"] != "enabledPlugins_not_an_object" {
+		t.Errorf("exit %d %v, want exit 3 enabledPlugins_not_an_object", code, out)
+	}
+	if after, _ := os.ReadFile(userFile); string(after) != string(before) {
+		t.Errorf("file changed despite the refusal:\n%s", after)
+	}
+}
+
+// `null` is absence, not a malformed block — and it used to crash with a traceback, which install.sh
+// then reported as "could not enable ... ()".
+func TestEnablePluginTreatsANullBlockAsAbsent(t *testing.T) {
+	home, state, userFile := seedUserFile(t, nil)
+	out, code := settingsInDir(t, state, home, "", "enable-plugin", "--file", userFile, "--user-scope")
+	if code != 0 || out["plugin_enabled"] != "added" {
+		t.Fatalf("exit %d %v, want plugin_enabled=added", code, out)
+	}
+	if v, _ := enabledIn(t, userFile); v != true {
+		t.Errorf("not enabled: %v", v)
+	}
+}
+
+// install.sh's own `skipped` branch, and the note that must name a reason rather than "()".
+func TestUserScopeInstallReportsSkippedForANonObjectEnabledPlugins(t *testing.T) {
+	facts, home, _, _ := userScopeInstall(t, map[string]any{"enabledPlugins": []any{"x"}})
+	if facts["plugin_enabled"] != "skipped" || !strings.Contains(facts["plugin_enabled_note"], "(not_an_object)") {
+		t.Errorf("plugin_enabled=%q note=%q, want skipped with a reasoned note", facts["plugin_enabled"],
+			facts["plugin_enabled_note"])
+	}
+	if got := readJSON(t, filepath.Join(home, ".claude", "settings.json"))["enabledPlugins"]; !reflect.DeepEqual(got, []any{"x"}) {
+		t.Errorf("enabledPlugins replaced: %v", got)
+	}
+}
+
+func TestEnablePluginLeavesANonBooleanValueAlone(t *testing.T) {
+	home, state, userFile := seedUserFile(t, map[string]any{pluginID: "yes"})
+	out, code := settingsInDir(t, state, home, "", "enable-plugin", "--file", userFile, "--user-scope")
+	if code != 0 || out["plugin_enabled"] != "present" {
+		t.Errorf("exit %d %v, want plugin_enabled=present", code, out)
+	}
+	if v, _ := enabledIn(t, userFile); v != "yes" {
+		t.Errorf("value overwritten: %v", v)
+	}
+	if got := recordedEnable(t, userFile); got != nil {
+		t.Errorf("recorded ownership of a value we did not write: %v", got)
+	}
+}
+
+func TestEnablePluginBackupFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{{nil, 1}, {[]string{"--no-backup"}, 0}} {
+		home, state, userFile := seedUserFile(t, map[string]any{})
+		args := append([]string{"enable-plugin", "--file", userFile, "--user-scope"}, tc.args...)
+		out, code := settingsInDir(t, state, home, "", args...)
+		if code != 0 || out["plugin_enabled"] != "added" {
+			t.Fatalf("%v: exit %d %v", tc.args, code, out)
+		}
+		if got := len(backupsUnder(t, userFile)); got != tc.want {
+			t.Errorf("%v: %d backups, want %d", tc.args, got, tc.want)
+		}
+	}
+}
+
+// A first install is covered by the routing write's own backup, so the enable step adds none: every
+// backup left must predate routing.
+func TestUserScopeInstallEnableStepTakesNoPostRoutingBackup(t *testing.T) {
+	_, home, _, _ := userScopeInstall(t, nil)
+	for _, b := range backupsUnder(t, filepath.Join(home, ".claude", "settings.json")) {
+		raw, _ := os.ReadFile(b)
+		if strings.Contains(string(raw), "ANTHROPIC_BASE_URL") {
+			t.Errorf("%s is a post-routing checkpoint (enable-plugin ran without --no-backup)", b)
+		}
+	}
+}
+
+// ...but a re-run whose routing write was `unchanged` took no backup, so the enable step must take
+// one itself rather than claim it was covered.
+func TestUserScopeReinstallBacksUpBeforeEnablingWhenRoutingWasUnchanged(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	port := readJSON(t, userFile)["pluginConfigs"].(map[string]any)[pluginID].(map[string]any)["options"].(map[string]any)["port"].(string)
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+	rerun := func() map[string]string {
+		facts, code := runRoute(t, proj, env, "--scope", "user", "--i-understand-machine-wide",
+			"--i-consent-to-traffic-interception")
+		if code != 0 || facts["result"] != "routed" {
+			t.Fatalf("re-run: exit %d %v", code, facts)
+		}
+		return facts
+	}
+	// One settling re-run first, so any other write a re-run makes (the port option) has been made
+	// and backed up already, and the enable step below is the ONLY write left.
+	rerun()
+	data := readJSON(t, userFile)
+	delete(data, "enabledPlugins")
+	delete(data["$context-guru"].(map[string]any), "installed_enabled_plugin")
+	writeJSON(t, userFile, data)
+	n := len(backupsUnder(t, userFile))
+	facts := rerun()
+	if facts["settings_result"] != "unchanged" || facts["plugin_enabled"] != "added" {
+		t.Fatalf("want settings_result=unchanged plugin_enabled=added: %v", facts)
+	}
+	if got := len(backupsUnder(t, userFile)); got <= n {
+		t.Errorf("the enable write on an unchanged re-run took no backup (%d before, %d after)", n, got)
+	}
+}
+
+// Routing removed some other way first: uninstall is then the no-routing branch of `remove`, and it
+// must still take our enablement back, or the plugin stays enabled everywhere after a clean uninstall.
+func TestUninstallRemovesTheEnableEvenWhenRoutingIsAlreadyGone(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	data := readJSON(t, userFile)
+	delete(data["env"].(map[string]any), "ANTHROPIC_BASE_URL")
+	writeJSON(t, userFile, data)
+	out, code := settingsInDir(t, state, home, proj, "remove", "--file", userFile, "--user-scope")
+	if code != 0 || out["result"] != "removed" || out["plugin_enabled_removed"] != "true" {
+		t.Fatalf("exit %d %v, want removed with plugin_enabled_removed=true", code, out)
+	}
+	if _, ok := enabledIn(t, userFile); ok {
+		t.Errorf("our enablement survived the uninstall")
+	}
+	if got := recordedEnable(t, userFile); got != nil {
+		t.Errorf("record survived: %v", got)
+	}
+}
+
+// Added by us, switched off by the user, install re-run (reports explicitly_disabled), then switched
+// back on by the user: that last `true` is theirs, and uninstall must not take it.
+func TestAReEnableByTheUserAfterTheyDisabledItIsTheirs(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	setTo := func(v bool) {
+		data := readJSON(t, userFile)
+		data["enabledPlugins"].(map[string]any)[pluginID] = v
+		writeJSON(t, userFile, data)
+	}
+	setTo(false)
+	out, code := settingsInDir(t, state, home, proj, "enable-plugin", "--file", userFile, "--user-scope")
+	if code != 0 || out["plugin_enabled"] != "explicitly_disabled" {
+		t.Fatalf("exit %d %v", code, out)
+	}
+	if got := recordedEnable(t, userFile); got != nil {
+		t.Errorf("record kept over a false the user set: %v", got)
+	}
+	setTo(true)
+	if out, code := settingsInDir(t, state, home, proj, "remove", "--file", userFile,
+		"--user-scope"); code != 0 || out["plugin_enabled_removed"] != "false" {
+		t.Errorf("exit %d %v, want plugin_enabled_removed=false", code, out)
+	}
+	if v, _ := enabledIn(t, userFile); v != true {
+		t.Errorf("uninstall took the user's own re-enable: %v", v)
 	}
 }

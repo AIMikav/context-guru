@@ -197,9 +197,9 @@ write routing while no proxy answers.
   is why the proxy starts first. What is true: this session began before the proxy existed, so
   `/context-guru:status` may have nothing to show yet; a new session is the clean way to look.
 - Name the **cache strategy** from the result, and what it costs.
-- **`plugin_enabled=`** (machine-wide only). `added`: say this install also enabled the plugin for every
-  project, so `/context-guru:*` works everywhere, not only here — uninstall takes it back. `already`: skip.
-  Otherwise relay `plugin_enabled_note=` verbatim: the commands do NOT follow the routing. Never flip it.
+- **`plugin_enabled=`** (machine-wide only). `added`: say it also enabled the plugin machine-wide, so
+  `/context-guru:*` works in every project, not only here (bar any that switched it off itself); uninstall
+  takes it back. `already`: skip. Else relay `plugin_enabled_note=` verbatim: commands do NOT follow routing.
 - Dashboard: `http://127.0.0.1:<port>/dashboard/` — the four billed token tiers are where the cache
   effect shows.
 - **Name the port**, and whose it is: `port_source=scanned` means allocated just now, `recorded` a
