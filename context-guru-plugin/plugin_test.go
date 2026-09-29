@@ -7261,9 +7261,12 @@ func TestInstallSkillDelegatesRatherThanReimplementing(t *testing.T) {
 	// the `port_recorded_by_another_project` refusal, and the two per-adopted-project facts
 	// (`adopted_project_still_overriding`, `adopted_proxy_left_running`) that a machine-wide install
 	// must not fold into "adopted". Relaying, not mechanism — same distinction as above.
-	if n := strings.Count(body, "\n"); n > 235 {
+	//
+	// Raised 235 -> 238 for `plugin_enabled=` (#318): a machine-wide install's outcome for the plugin's
+	// own enablement, which the skill relays and never decides.
+	if n := strings.Count(body, "\n"); n > 238 {
 		t.Errorf("the install skill is %d lines; it delegates the mechanism now, so it should be "+
-			"well under 235", n)
+			"well under 238", n)
 	}
 }
 
