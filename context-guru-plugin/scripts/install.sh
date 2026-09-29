@@ -490,6 +490,12 @@ follow this machine-wide route instead (their own proxies are stopped; whatever 
 before context-guru is put back and would still override, reported per project)" ;;
     esac
   fi
+  # The enablement route_enable_plugin writes (#318) is a machine-wide change in the same file, so it
+  # is part of what is agreed to here rather than something the report mentions afterwards.
+  if [ "$R_SCOPE" = user ]; then
+    q="$q, and enable the context-guru plugin in every project so its /context-guru:* commands work \
+everywhere, not only here (a machine-wide switch-off set in /plugin is left as it is)"
+  fi
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
   fi
