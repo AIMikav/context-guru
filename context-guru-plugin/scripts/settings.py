@@ -2801,12 +2801,22 @@ def cmd_remove(args: argparse.Namespace) -> int:
         # No routing to remove here — but a STATUSLINE-ONLY install (the /context-guru:statusline
         # skill's `add --statusline` with no --url) never touches env at all, so it must not be
         # missed just because there is no base_url in this file to key off.
+        before = json.dumps(data, sort_keys=True)
         changed, restored_sl = remove_statusline_only(data)
         # Our enablement too: with the routing already gone some other way, this is the last call
         # that can take it back, and leaving it enables the plugin everywhere after an uninstall.
-        enabled_removed = remove_enabled_plugin(data)
+        # Machine-wide only with --user-scope, like routing below: a PROJECT uninstall walks this
+        # file too and relies on being refused here, and without the gate one project's uninstall
+        # switched the plugin's commands off in every project.
+        enabled_removed = False
+        if not is_user_scope(args.file) or getattr(args, "user_scope", False):
+            enabled_removed = remove_enabled_plugin(data)
         if isinstance(data.get(META), dict) and not data[META]:
             data.pop(META, None)
+        if not (changed or enabled_removed) and json.dumps(data, sort_keys=True) != before:
+            # Only a stale record of ours went (the user changed the value since): nothing to report
+            # as removed, but the record must not outlive the uninstall.
+            save(args.file, data)
         if changed or enabled_removed:
             saved = backup(args.file)
             deleted = maybe_delete_if_empty(args.file, data)

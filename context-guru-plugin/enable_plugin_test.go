@@ -431,3 +431,78 @@ func TestAReEnableByTheUserAfterTheyDisabledItIsTheirs(t *testing.T) {
 		t.Errorf("uninstall took the user's own re-enable: %v", v)
 	}
 }
+
+// The enablement is a machine-wide write in the same file as the routing, so the sentence the user
+// agrees to has to name it — consent to "route every project" is not consent to a second key. And a
+// project install writes no enablement, so its question must not promise one.
+func TestConsentQuestionNamesTheMachineWideEnable(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := routeEnv(t, home, state, "")
+	const clause = "enable the context-guru plugin in every project"
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user", "--i-understand-machine-wide")
+	if code != 0 || facts["result"] != "planned" {
+		t.Fatalf("plan: exit %d result=%q: %v", code, facts["result"], facts)
+	}
+	if !strings.Contains(facts["consent_question"], clause) {
+		t.Errorf("machine-wide consent_question does not mention the enablement it will write: %q",
+			facts["consent_question"])
+	}
+	facts, code = runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 || facts["result"] != "planned" {
+		t.Fatalf("project plan: exit %d result=%q: %v", code, facts["result"], facts)
+	}
+	if strings.Contains(facts["consent_question"], clause) {
+		t.Errorf("project consent_question promises a machine-wide enablement it never writes: %q",
+			facts["consent_question"])
+	}
+}
+
+// A PROJECT uninstall walks ~/.claude/settings.json too, without --user-scope, and relies on `remove`
+// refusing it. With the routing already gone from that file (a reset, a hand edit), the no-routing
+// branch used to take our enablement anyway — one project's uninstall switching the plugin's commands
+// off in every project, with no question asked. The machine-wide enablement goes only with the flag.
+func TestAProjectUninstallNeverTakesTheMachineWideEnable(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	data := readJSON(t, userFile)
+	delete(data["env"].(map[string]any), "ANTHROPIC_BASE_URL")
+	writeJSON(t, userFile, data)
+	out, code := settingsInDir(t, state, home, proj, "remove", "--file", userFile)
+	if code != 0 || out["plugin_enabled_removed"] == "true" {
+		t.Fatalf("exit %d %v: removing the machine-wide enablement needs --user-scope", code, out)
+	}
+	if v, _ := enabledIn(t, userFile); v != true {
+		t.Errorf("a project uninstall disabled the plugin machine-wide: %v", v)
+	}
+	if got := recordedEnable(t, userFile); got != pluginID {
+		t.Errorf("record dropped (%v), so the real machine-wide uninstall could no longer take it back", got)
+	}
+	// And the deliberate machine-wide uninstall still does.
+	out, code = settingsInDir(t, state, home, proj, "remove", "--file", userFile, "--user-scope")
+	if code != 0 || out["plugin_enabled_removed"] != "true" {
+		t.Errorf("exit %d %v, want plugin_enabled_removed=true with --user-scope", code, out)
+	}
+}
+
+// A record of ours over a value the user changed since is stale; `remove` drops it, and the drop has
+// to reach the disk even when nothing else in the file changed, or it outlives the uninstall.
+func TestUninstallDropsAStaleRecordEvenWhenNothingElseChanged(t *testing.T) {
+	_, home, state, proj := userScopeInstall(t, nil)
+	userFile := filepath.Join(home, ".claude", "settings.json")
+	data := readJSON(t, userFile)
+	delete(data["env"].(map[string]any), "ANTHROPIC_BASE_URL")
+	delete(data, "statusLine")
+	delete(data["$context-guru"].(map[string]any), "installed_statusline")
+	data["enabledPlugins"].(map[string]any)[pluginID] = false
+	writeJSON(t, userFile, data)
+	if _, code := settingsInDir(t, state, home, proj, "remove", "--file", userFile,
+		"--user-scope"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if v, _ := enabledIn(t, userFile); v != false {
+		t.Errorf("the user's false was touched: %v", v)
+	}
+	if got := recordedEnable(t, userFile); got != nil {
+		t.Errorf("stale record survived on disk: %v", got)
+	}
+}
