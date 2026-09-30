@@ -566,7 +566,7 @@ route_stop_adopted_proxy() {
     return 0
   fi
   rm -f "$apidfile" "${astate}/proxy-${aport}.owner" "${astate}/proxy-${aport}.fingerprint" \
-    2>/dev/null || true
+    "${astate}/keepalive-${aport}.yaml" 2>/dev/null || true
   emit "adopted_proxy_stopped=$aproj port=$aport"
 }
 

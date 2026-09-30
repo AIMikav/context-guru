@@ -203,7 +203,8 @@ Once it is confirmed stopped, release the port — and only then:
 
 ```bash
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/context-guru"
-rm -f "${STATE}/proxy-${PORT}.owner" "${STATE}/proxy-${PORT}.fingerprint"
+rm -f "${STATE}/proxy-${PORT}.owner" "${STATE}/proxy-${PORT}.fingerprint" \
+  "${STATE}/keepalive-${PORT}.yaml"
 "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" port release
 
 # A MACHINE-WIDE install is not filed under any project — it has its own record, so that a project
@@ -223,10 +224,14 @@ loses a port per uninstall, silently, until installs start landing further and f
 no visible reason. The `.owner` file is what makes a *future* install on that port refuse with
 `port_owned_by_another_project`: it names the project that owned the proxy you just stopped, so
 leaving it behind gets the next install here refused over a proxy that no longer exists. The
-`.fingerprint` describes the same dead proxy and goes with it.
+`.fingerprint` describes the same dead proxy and goes with it, and so does `keepalive-<port>.yaml`:
+left behind, it is read by whichever install lands on this port next
+(`start-proxy.sh`'s `PRESET_NOTE=…"(from keepalive-${PORT}.yaml)"`), which inherits a dead
+project's cache strategy — pings, idle window, per-ping spend cap — and reports it as if it were
+that install's own config.
 
 **Only do this if the proxy is actually stopped.** If the kill reported **NOT OURS**, or the health
-check still answers, leave all three alone — they describe something that is still running, and a
+check still answers, leave all four alone — they describe something that is still running, and a
 released record plus a live proxy is the one state nothing else in the plugin expects. Neither
 command is allowed to be load-bearing either: `port release` fails open by design, so report a
 `result=skipped` and finish the uninstall rather than stopping on it.
