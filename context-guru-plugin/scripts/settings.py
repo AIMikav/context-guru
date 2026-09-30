@@ -3118,8 +3118,11 @@ DEFAULT_STRATEGY = "5-min-ping"
 # keep-alive, and the pipeline default should not be quietly editing anybody's requests to add 18%
 # to what their client already caches for free.
 #
-# `cache` remains selectable. Only the default changed. Choosing a preset such as `housellm` IS
-# opting into context editing, which is fine - it is a deliberate step rather than a default.
+# `cache` remains a valid preset in config/config.go, reachable via /plugin configure's raw form —
+# only the default changed, and the picker no longer offers `cache` as one of its named options
+# (it isn't part of the "carry less" ladder; it doesn't drop or trim anything). Choosing a preset
+# such as `medium`/`high`/`xhigh` IS opting into context editing, which is fine - it is a
+# deliberate step rather than a default.
 #
 # FIVE files encoded this default before it moved here (plugin.json, install.sh, start-proxy.sh,
 # check-proxy.sh, and the empty-preset note below). A drift test now fails if they disagree.
@@ -3519,8 +3522,6 @@ def cmd_strategy(args) -> int:
 # made nameable and explainable, the same reason `strategy` exists for cache_strategy above.
 PRESETS: dict[str, str] = {
     "off": "nothing runs; requests are forwarded exactly as they arrived",
-    "cache": "keeps the prompt cache warm by splitting off the volatile part of the system "
-             "prompt; drops nothing",
     "conservative": "trims obvious waste from tool output (repeats, dead runs) — deterministic, "
                      "no model calls, the safe first step into carrying less",
     "medium": "conservative plus a cheap model that keeps only what looks relevant in recent "

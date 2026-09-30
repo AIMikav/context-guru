@@ -92,8 +92,8 @@ can reconcile.
 When it appears, the dollar figure is **measured, not simulated**: it is the exact set of qualified
 declarations the component would have withheld, priced at the tier the requests that carried them
 were really billed. It is the only component-level "would have saved" figure in this whole surface
-that is not an inference, and it is worth saying so. `toolfilter` is in the `house` and `housellm`
-presets and in neither `off` nor `codesmart`.
+that is not an inference, and it is worth saying so. `toolfilter` is in every tier of the plugin
+picker's ladder except `off` (`conservative`, `medium`, `high`, `xhigh`).
 
 ## Never
 

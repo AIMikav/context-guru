@@ -119,8 +119,9 @@ spends your own quota; `/context-guru:cache-strategy-picker` names it or turns i
 A fresh session has no idle gap to keep warm yet, so its first request reads zero savings — that's
 expected, not broken.
 
-Other presets (`cache`, `house`, `codesmart`, `housellm`) add components that edit the request body
-too — see [docs/reference/presets.md](../reference/presets.md).
+Other presets (`conservative`, `medium`, `high`, `xhigh` — `/context-guru:preset-picker`'s
+effort ladder) add components that edit the request body too — see
+[docs/reference/presets.md](../reference/presets.md).
 
 ## Then
 
