@@ -24,7 +24,7 @@ the box, before you opt into anything that trims content.
 Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/context-guru/)**.
 
 <p align="center">
-<img src="docs/img/context-guru-savings.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
+<img src="docs/img/context_guru_stats_sqaure.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
 </p>
 
 ## Install (Claude Code plugin)
