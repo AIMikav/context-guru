@@ -31,7 +31,42 @@ jobs:
           echo "### Test coverage: ${total} (cross-package, statement-weighted)" >> "$GITHUB_STEP_SUMMARY"
           echo "Total coverage: ${total}"
       - name: Per-package coverage (log)
-        run: go test -cover ./... | sed 's/[[:space:]]\+/ /g'
+        # Derived from the coverage.out that `make cover` above already wrote, not a second
+        # test run: this used to be `go test -cover ./...`, re-running the entire suite a
+        # second time (without -race) purely to print these numbers — 5m29s of pure
+        # duplication on a green run (#366).
+        #
+        # Not a byte-for-byte match for the old numbers, and that's a real semantic
+        # difference, not a bug: `make cover` runs with -coverpkg=./..., so coverage.out
+        # already has one entry per source block PER PACKAGE TESTED (~30x duplication for
+        # a block in a widely-imported package), each recording whether THAT package's own
+        # test run hit it. Deduping by block and summing hits across those duplicates gives
+        # "was this line hit by anything in the whole suite" — cross-package coverage, not
+        # each package's isolated self-coverage. For a package nothing else imports (e.g.
+        # dash) the two are close (measured: 85.3% here vs 84.6% self-coverage). For one
+        # widely imported (store, schema) this one is a few points higher, because other
+        # packages' tests genuinely do exercise some of its code too — which is a more
+        # honest "is this code covered" number, not a less accurate one.
+        run: |
+          awk 'NR==1{next} {
+            n=split($1,a,":")
+            key=$1
+            cnt[key]+=$3
+            nstmt[key]=$2
+            path[key]=a[1]
+          }
+          END {
+            for (k in cnt) {
+              p=path[k]
+              sub(/\/[^\/]*$/, "", p)
+              total[p]+=nstmt[k]
+              if (cnt[k]>0) covered[p]+=nstmt[k]
+            }
+            for (p in total) {
+              pct = (total[p]>0) ? covered[p]/total[p]*100 : 0
+              printf "%s\t%.1f%% of statements\n", p, pct
+            }
+          }' coverage.out | sort
       - name: Build
         run: make build
 
