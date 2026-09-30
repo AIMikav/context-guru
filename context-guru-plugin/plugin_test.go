@@ -5797,7 +5797,7 @@ func TestPresetFallbackInheritsRoutingScope(t *testing.T) {
 		}
 
 		py := requireTool(t, "python3")
-		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "preset", "set", "--name", "house")
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "preset", "set", "--name", "conservative")
 		cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_STATE="+state, "HOME="+home)
 		cmd.Dir = proj
 		out, err := cmd.CombinedOutput()
@@ -5809,7 +5809,7 @@ func TestPresetFallbackInheritsRoutingScope(t *testing.T) {
 		}
 		got := readJSON(t, projLocal)
 		opts, _ := ((got["pluginConfigs"].(map[string]any))["context-guru@context-guru"].(map[string]any))["options"].(map[string]any)
-		if opts["preset"] != "house" {
+		if opts["preset"] != "conservative" {
 			t.Errorf("preset not written to the project's own routing file: %v", got)
 		}
 		if _, err := os.Stat(filepath.Join(home, ".claude", "settings.json")); !os.IsNotExist(err) {
@@ -5829,7 +5829,7 @@ func TestPresetFallbackInheritsRoutingScope(t *testing.T) {
 		}
 
 		py := requireTool(t, "python3")
-		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "preset", "set", "--name", "house")
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "preset", "set", "--name", "conservative")
 		cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_STATE="+state, "HOME="+home)
 		cmd.Dir = proj
 		out, err := cmd.CombinedOutput()
@@ -5838,7 +5838,7 @@ func TestPresetFallbackInheritsRoutingScope(t *testing.T) {
 		}
 		got := readJSON(t, userScope)
 		opts, _ := ((got["pluginConfigs"].(map[string]any))["context-guru@context-guru"].(map[string]any))["options"].(map[string]any)
-		if opts["preset"] != "house" {
+		if opts["preset"] != "conservative" {
 			t.Errorf("preset did not inherit the recorded user scope: %v\n%s", got, out)
 		}
 	})
@@ -11172,7 +11172,7 @@ func TestTheUninstallCleansUpForSomeoneWhoPickedAPreset(t *testing.T) {
 	}
 	// Exactly as the picker runs it: no --file, so it lands in whichever file already holds our
 	// options — which is the file this uninstall is about to reset.
-	if f, c := settingsInDir(t, sd, home, proj, "preset", "set", "--name", "house"); c != 0 ||
+	if f, c := settingsInDir(t, sd, home, proj, "preset", "set", "--name", "conservative"); c != 0 ||
 		f["result"] != "set" {
 		t.Fatalf("preset set exit %d %v", c, f)
 	}
@@ -11198,7 +11198,7 @@ func TestTheUninstallCleansUpForSomeoneWhoPickedAPreset(t *testing.T) {
 	// and the reason the backups go is not "the file is empty of us" but "no install of ours is left".
 	data := readJSON(t, file)
 	opts, _ := (((data["pluginConfigs"].(map[string]any))["context-guru@context-guru"]).(map[string]any))["options"].(map[string]any)
-	if opts["preset"] != "house" {
+	if opts["preset"] != "conservative" {
 		t.Errorf("the uninstall took the user's configured preset with it: %v", data)
 	}
 	if opts["port"] != nil {

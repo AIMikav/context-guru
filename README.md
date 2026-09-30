@@ -54,7 +54,7 @@ them? `/context-guru:status --stats` prints the `/stats` endpoint verbatim.
 If you want to also carry less, not just pay less, opt into content trimming:
 
 ```
-/context-guru:preset-picker   # → house, the safe first step into trimming
+/context-guru:preset-picker   # → conservative, the safe first step into trimming
 ```
 
 ### Status line
@@ -65,6 +65,30 @@ A terminal status line is installed **on by default** alongside the plugin. Run 
 ```
 More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md), or ask
 `/context-guru:statusline` to enable an extra segment or turn it back on.
+
+## Presets
+
+Change what gets trimmed with:
+
+```
+/context-guru:preset-picker
+```
+
+It's an effort ladder — each tier is everything in the one before it, plus more:
+
+| Preset | What it adds | Spends on its own |
+|---|---|---|
+| `off` | nothing — requests forwarded untouched (the default; only keep-alive spends, if that's on) | no |
+| `cache` | splits the volatile tail off the system prompt so the rest stays cacheable; drops nothing | no |
+| `conservative` | deterministic trimming of tool output (repeats, dead runs) — no model calls | no |
+| `medium` | `conservative` plus a cheap model that keeps only what looks relevant in recent tool output | yes |
+| `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full | yes |
+| `xhigh` | `high` plus a periodic deep-adjudication sweep over turns whose prompt cache has gone cold — the deepest cut | yes |
+
+Run the picker above any time to switch tiers — it explains each one before asking which to set.
+A restart is required — it takes effect at the next proxy start, not the current session; run
+`/context-guru:status` afterward to confirm it stuck. Full pipelines:
+[docs/reference/presets.md](docs/reference/presets.md).
 
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
 config reference — is in **[docs/design.md](docs/design.md)** and

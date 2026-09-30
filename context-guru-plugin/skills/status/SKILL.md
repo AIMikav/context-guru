@@ -190,5 +190,5 @@ cached record — instead of re-explaining any of this here.
   these totals cover all of them.
 
 If the numbers are genuinely flat after real use, say that and offer the next step — usually
-`codesmart`, which adds the offloaders — rather than reaching for a favourable reading of a
-flat graph.
+`/context-guru:preset-picker`'s `conservative` tier, which adds the offloaders — rather than
+reaching for a favourable reading of a flat graph.

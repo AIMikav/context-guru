@@ -91,12 +91,15 @@ DAYS_PER_MONTH = 30.0
 # whose money is equal or, more often, both unpriced.
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3, "ok": 4}
 
-# The five presets this plugin offers, each with the component pipeline it actually builds. This
-# table is DUPLICATED from config/config.go's presetPipelines on purpose — the plugin ships as a
-# directory of scripts with no Go in it — and TestPluginPresetPipelinesAgreeWithConfig pins every
-# entry against config.PresetPipeline so the duplicate cannot drift. Without that test this table
-# would be a second, quietly wrong idea of what a preset does, which is exactly what it is here to
-# report on.
+# The presets this plugin offers (plus house/codesmart/housellm, still explainable for anyone who
+# set one of those directly through /plugin configure's raw form before or instead of the picker),
+# each with the component pipeline it actually builds. This table is DUPLICATED from
+# config/config.go's presetPipelines on purpose — the plugin ships as a directory of scripts with
+# no Go in it — and TestPluginPresetPipelinesAgreeWithConfig pins every entry against
+# config.PresetPipeline so the duplicate cannot drift. Without that test this table would be a
+# second, quietly wrong idea of what a preset does, which is exactly what it is here to report on.
+# TestEveryPresetOfferedIsOneInsightsCanExplain pins the other direction: every name settings.py's
+# PRESETS offers through the picker must have an entry here too.
 PRESET_PIPELINES: dict[str, tuple[str, ...]] = {
     "off": (),
     "cache": ("cachesplit",),
@@ -106,6 +109,14 @@ PRESET_PIPELINES: dict[str, tuple[str, ...]] = {
                   "extract_llm", "extract", "linecap", "cachesplit"),
     "housellm": ("format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm",
                  "extract_llm_sweep", "extract", "cachesplit", "toolfilter"),
+    "conservative": ("format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract",
+                      "cachesplit", "toolfilter"),
+    "medium": ("format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm",
+               "extract", "cachesplit", "toolfilter"),
+    "high": ("summarize", "format", "dedup", "toon", "cmdfilter", "searchfold", "textclean",
+              "extract_llm", "extract", "cachesplit", "toolfilter"),
+    "xhigh": ("summarize", "format", "dedup", "toon", "cmdfilter", "searchfold", "textclean",
+              "extract_llm", "extract_llm_sweep", "extract", "cachesplit", "toolfilter"),
 }
 
 # What each component this plugin can turn on actually does, in one line a developer can act on,
@@ -1342,9 +1353,10 @@ def collect_components(f: Fetcher, rep: Report, window: Window, preset: str) -> 
               "problem, and no honest figure exists for what these components would have removed "
               "from traffic they never saw. Simulating them means replaying every request, which "
               "is a benchmark, not a report.",
-            "/plugin configure context-guru -> preset: house adds `extract` deterministically; "
-            "`codesmart` adds a cheap-model relevance pass; `housellm` spends on its own. "
-            "/context-guru:preset-picker explains the trade in each.",
+            "/plugin configure context-guru -> preset: conservative adds `extract` "
+            "deterministically; `medium` adds a cheap-model relevance pass; `high`/`xhigh` add a "
+            "summarizer and spend on their own. /context-guru:preset-picker explains the trade "
+            "in each.",
             "measured size of the problem, NOT a projected saving"))
     elif related:
         rep.fact("offloaders_note",

@@ -98,14 +98,15 @@ Only where a finding argues for it, and name what the change actually adds:
 |---|---|---|
 | `off` | nothing runs; requests forwarded untouched | no |
 | `cache` | `cachesplit` only | no |
-| `house` | deterministic trimming, `extract`, and `toolfilter` | no |
-| `codesmart` | the study's winning pipeline; a cheap-model relevance pass. **No `toolfilter`** | yes, a little |
-| `housellm` | `house` plus a compaction-model pass over the conversation | yes, the most |
+| `conservative` | deterministic trimming, `extract`, and `toolfilter` | no |
+| `medium` | `conservative` plus `extract_llm`, a cheap-model relevance pass | yes, a little |
+| `high` | `medium` plus `summarize`, compacting older turns once the context is nearly full | yes |
+| `xhigh` | `high` plus `extract_llm_sweep`, a cold-cache deep-adjudication pass — the deepest cut | yes, the most |
 
 `/context-guru:preset-picker` explains the trade in each and is the better thing to hand somebody who
-is undecided. **Say it out loud when a recommended preset spends**, and if a `toolfilter-off` finding
-is what motivated the change, note that `codesmart` does not carry it — moving there to fix that
-finding does not fix it.
+is undecided. **Say it out loud when a recommended preset spends** — every tier from `medium` up
+does. Every tier from `conservative` up carries `toolfilter`; a `toolfilter-off` finding is fixed by
+any of them.
 
 ## Never
 
