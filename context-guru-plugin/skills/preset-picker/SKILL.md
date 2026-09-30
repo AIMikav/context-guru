@@ -37,7 +37,7 @@ a fault, just unset.
 | `cache` | keeps the cache warm, drops nothing |
 | `conservative` | trims obvious waste — the safe first step into "carry less" |
 | `medium` | `conservative` plus a cheap model that keeps only what looks relevant in recent tool output |
-| `high` | `medium` plus a cache-aware summarizer that compacts older turns near cache expiry |
+| `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full |
 | `xhigh` | `high` plus a deep-adjudication sweep over turns whose cache has already gone cold — the deepest cut |
 
 Recommend `conservative` to someone who wants to carry less context but hasn't said they want an
