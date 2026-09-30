@@ -1784,6 +1784,20 @@ def cmd_port(args: argparse.Namespace) -> int:
                  note="the record could not be removed, but this must never block uninstall")
             return 0
         released_port = removed.get("port", "(none)") if isinstance(removed, dict) else "(none)"
+        # The `.owner`/`.fingerprint` half of this release, done HERE rather than left to whichever
+        # skill called us. install.sh's port-ownership gate (`port_owned_by_another_project`) reads
+        # `proxy-<port>.owner` straight off disk and never consults install-scope.json, so a record
+        # popped above with these two files left behind is a port that looks free to `alloc` but
+        # still refuses at that gate on the next install that lands on it — the exact shape of "a
+        # skill's prose step got skipped" this project's own history keeps finding. Best-effort and
+        # unconditional, matching `release`'s fail-open contract: a leftover file is the failure mode
+        # being fixed, not one this can regress into.
+        if isinstance(released_port, int):
+            for suffix in ("owner", "fingerprint"):
+                try:
+                    os.remove(os.path.join(state_dir(), f"proxy-{released_port}.{suffix}"))
+                except OSError:
+                    pass
         emit(result="released", port=released_port)
         return 0
 
