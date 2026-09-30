@@ -5402,6 +5402,64 @@ func TestPortReleaseFreesTheProjectsPortForReuse(t *testing.T) {
 	}
 }
 
+// TestPortReleaseRemovesOwnerAndFingerprintFiles: `release` pops the install-scope.json row, but
+// install.sh's port_owned_by_another_project gate reads proxy-<port>.owner straight off disk and
+// never consults that row at all. A release that leaves the .owner file behind hands the port back
+// to the pool while it still refuses at that gate the moment anything allocates it again — observed
+// on a real machine as a --scope user reinstall, after an earlier uninstall, refusing with
+// "port N is serving another project" for a port nothing was listening on. `release` has the port
+// number in hand right where it pops the row, so it is the one caller that can close this for good
+// instead of leaving it to whichever skill happens to call it next.
+func TestPortReleaseRemovesOwnerAndFingerprintFiles(t *testing.T) {
+	portScanBase(t)
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	facts, code := settingsInDir(t, state, home, proj, "port", "alloc")
+	if code != 0 {
+		t.Fatalf("alloc failed: exit %d %v", code, facts)
+	}
+	port := facts["port"]
+
+	ownerPath := filepath.Join(state, "proxy-"+port+".owner")
+	fingerprintPath := filepath.Join(state, "proxy-"+port+".fingerprint")
+	if err := os.WriteFile(ownerPath, []byte(proj), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fingerprintPath, []byte("preset=off"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rel, code := settingsInDir(t, state, home, proj, "port", "release")
+	if code != 0 || rel["result"] != "released" || rel["port"] != port {
+		t.Fatalf("release: exit %d %v (want released port=%s)", code, rel, port)
+	}
+
+	if _, err := os.Stat(ownerPath); !os.IsNotExist(err) {
+		t.Errorf("release left %s behind: %v", ownerPath, err)
+	}
+	if _, err := os.Stat(fingerprintPath); !os.IsNotExist(err) {
+		t.Errorf("release left %s behind: %v", fingerprintPath, err)
+	}
+
+	// No owner/fingerprint files at all must be a harmless no-op, not an error — release runs on
+	// the vast majority of projects that were never routed and never started a proxy.
+	proj2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj2, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	facts2, code := settingsInDir(t, state, home, proj2, "port", "alloc")
+	if code != 0 {
+		t.Fatalf("alloc 2 failed: exit %d %v", code, facts2)
+	}
+	rel2, code := settingsInDir(t, state, home, proj2, "port", "release")
+	if code != 0 || rel2["result"] != "released" {
+		t.Fatalf("release with no owner/fingerprint files present: exit %d %v", code, rel2)
+	}
+}
+
 // TestPortReleaseWorksWithoutGitBinary: `release` must be reachable, and must free the RIGHT
 // project's slot, even with no `git` on PATH at all — project_key() fails open to realpath(dir)
 // in that case, and release must key off exactly the same identity `alloc` used, or it would free
