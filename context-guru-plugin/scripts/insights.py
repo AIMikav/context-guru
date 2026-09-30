@@ -961,8 +961,8 @@ def collect_capabilities(f: Fetcher, rep: Report, window: Window) -> None:
                 f"{_usd(total_projected)} over the window would have been withheld by "
                 f"`toolfilter`. It removes nothing you invoke — the qualification rule above is "
                 f"what it acts on — and it needs no per-item decision from you.",
-                "/plugin configure context-guru -> preset: house (or housellm). `toolfilter` is "
-                "in both; it is in neither `off` nor `codesmart`.",
+                "/plugin configure context-guru -> preset: conservative (or medium/high/xhigh). "
+                "`toolfilter` is in every tier of the picker's ladder except `off`.",
                 "measured over the window",
                 usd_window=total_projected, usd_month=window.monthly(total_projected)))
 
@@ -1267,7 +1267,7 @@ def collect_components(f: Fetcher, rep: Report, window: Window, preset: str) -> 
                    f"understates it — but this window is what there is."
                    if _num(row.get("replay_multiple")) > 1 else ""),
                 f"Switch to a preset without `{name}`: /plugin configure context-guru -> preset. "
-                f"`house` has no model-spending component; `off` runs nothing.",
+                f"`conservative` has no model-spending component; `off` runs nothing.",
                 "measured over the window", usd_window=net))
         elif net > 0:
             rep.findings.append(Finding(

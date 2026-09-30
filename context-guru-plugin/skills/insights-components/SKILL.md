@@ -97,7 +97,6 @@ Only where a finding argues for it, and name what the change actually adds:
 | Preset | Adds | Spends on its own |
 |---|---|---|
 | `off` | nothing runs; requests forwarded untouched | no |
-| `cache` | `cachesplit` only | no |
 | `conservative` | deterministic trimming, `extract`, and `toolfilter` | no |
 | `medium` | `conservative` plus `extract_llm`, a cheap-model relevance pass | yes, a little |
 | `high` | `medium` plus `summarize`, compacting older turns once the context is nearly full | yes |

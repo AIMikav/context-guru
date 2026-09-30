@@ -1,6 +1,6 @@
 ---
 name: preset-picker
-description: Show which preset is running and switch between them - `off`, `cache`, `conservative` (the recommended default for "carry less"), `medium`, `high`, `xhigh`. Use when the user asks which preset is set, to change what context-guru trims, to carry less context, or says /plugin configure is awkward for this.
+description: Show which preset is running and switch between them - `off`, `conservative` (the recommended default for "carry less"), `medium`, `high`, `xhigh`. Use when the user asks which preset is set, to change what context-guru trims, to carry less context, or says /plugin configure is awkward for this.
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/settings.py)
 ---
 
@@ -34,7 +34,6 @@ a fault, just unset.
 | Name | ELI5 |
 |---|---|
 | `off` | nothing runs, requests go through untouched |
-| `cache` | keeps the cache warm, drops nothing |
 | `conservative` | trims obvious waste — the safe first step into "carry less" |
 | `medium` | `conservative` plus a cheap model that keeps only what looks relevant in recent tool output |
 | `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full |

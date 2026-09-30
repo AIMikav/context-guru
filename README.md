@@ -79,7 +79,6 @@ It's an effort ladder — each tier is everything in the one before it, plus mor
 | Preset | What it adds | Spends on its own |
 |---|---|---|
 | `off` | nothing — requests forwarded untouched (the default; only keep-alive spends, if that's on) | no |
-| `cache` | splits the volatile tail off the system prompt so the rest stays cacheable; drops nothing | no |
 | `conservative` | deterministic trimming of tool output (repeats, dead runs) — no model calls | no |
 | `medium` | `conservative` plus a cheap model that keeps only what looks relevant in recent tool output | yes |
 | `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full | yes |
