@@ -9372,11 +9372,24 @@ func TestUserScopeAdoptUnroutesTheProjectsItAdopts(t *testing.T) {
 	if err := os.WriteFile(otherOwner, []byte(otherReal0+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The strategy config a running keepalive install leaves behind on ITS port — issue #317: this
+	// survived adopt's teardown while .owner/.fingerprint were correctly removed, so the next
+	// project handed this port silently inherited a dead install's cache strategy.
+	otherKeepalive := filepath.Join(state, "context-guru", "keepalive-"+otherPort+".yaml")
+	if err := os.WriteFile(otherKeepalive, []byte("strategy=5-min-ping\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	port := freePort(t)
 	writePluginOptions(t, home, map[string]any{"port": port})
 	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
 	t.Cleanup(func() { stopFakeProxy(t, state, port) })
+	// The machine-wide install's OWN strategy config, on its OWN port — must survive: adopt's
+	// teardown only ever removes the ADOPTED project's port's files.
+	ownKeepalive := filepath.Join(state, "context-guru", "keepalive-"+port+".yaml")
+	if err := os.WriteFile(ownKeepalive, []byte("strategy=1-hour-head\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	facts, code := runRoute(t, proj, env, "--scope", "user", "--i-consent-to-traffic-interception",
 		"--i-understand-machine-wide", "--on-existing-projects", "adopt")
@@ -9444,6 +9457,18 @@ func TestUserScopeAdoptUnroutesTheProjectsItAdopts(t *testing.T) {
 	if _, err := os.Stat(otherOwner); err == nil {
 		t.Errorf("the adopted project's owner file (%s) survived, so a later install that configures "+
 			"that port is refused over a project that no longer routes itself", otherOwner)
+	}
+	// #317: the adopted port's cache-strategy config must go with .owner/.fingerprint, or the next
+	// project handed this port inherits a dead install's keepalive settings — real spend decisions —
+	// and is told they came from its own config.
+	if _, err := os.Stat(otherKeepalive); err == nil {
+		t.Errorf("the adopted project's keepalive config (%s) survived adopt's teardown, so the next "+
+			"project on port %s inherits a dead install's cache strategy", otherKeepalive, otherPort)
+	}
+	// And the machine-wide install's own strategy config, on its own port, must be untouched.
+	if _, err := os.Stat(ownKeepalive); err != nil {
+		t.Errorf("the machine-wide install's own keepalive config (%s) did not survive adopt: %v",
+			ownKeepalive, err)
 	}
 }
 
