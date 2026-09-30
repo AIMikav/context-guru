@@ -464,6 +464,25 @@ var presets = map[string][]string{
 	// deterministic lever", which is what the gross number reads as.
 	"house":    {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract", "cachesplit", "toolfilter"},
 	"housellm": {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract_llm_sweep", "extract", "cachesplit", "toolfilter"},
+
+	// conservative/medium/high/xhigh: the effort ladder the Claude Code plugin's preset picker
+	// offers (context-guru-plugin/skills/preset-picker), replacing the old off/cache/house/
+	// codesmart/housellm chooser. Each tier is a strict superset of the one below it:
+	//   conservative = house, verbatim.
+	//   medium       = housellm minus extract_llm_sweep — the cheap-model pass, no cold-cache sweep.
+	//   high         = medium + summarize, at its own default trigger (min_request_frac 0.9,
+	//                  cache_state any — see the note beside its presetConfigs entry below for
+	//                  why cache_state is NOT overridden to pre_expiry despite the name "high").
+	//   xhigh        = high + extract_llm_sweep back in — i.e. housellm + that same summarizer.
+	// Unmeasured: nobody has benchmarked summarize ahead of the housellm offloaders (or in
+	// combination with them at all) for savings, only for wire-shape correctness
+	// (apply/shape_validate_test.go). It is placed first on that test's precedent, not on
+	// evidence that the order matters — keep_last (default 3) leaves the tail summarize would
+	// interact with untouched regardless of order.
+	"conservative": {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract", "cachesplit", "toolfilter"},
+	"medium":       {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract", "cachesplit", "toolfilter"},
+	"high":         {"summarize", "format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract", "cachesplit", "toolfilter"},
+	"xhigh":        {"summarize", "format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract_llm_sweep", "extract", "cachesplit", "toolfilter"},
 }
 
 // presetConfigs carries FULL config docs for presets whose behavior depends on tuned
@@ -638,6 +657,90 @@ components:
 	// yield/cost trade nothing has measured. See extract_llm_sweep's own comment.
 	"housellm": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, cachesplit, toolfilter]
 components:
+  extract:
+    min_tokens: 400
+  extract_llm:
+    aggressiveness: medium
+    context: recent
+    context_messages: 2
+    economic_gate: true
+    fire_on: pressure
+    llm_every_n_requests: 1
+    llm_max_per_request: 8
+    llm_max_per_session: 0
+    min_tokens: 3000
+    model:
+      model: claude-haiku-4-5
+      source: incoming
+    strategy: code
+    trigger:
+      min_request_tokens: 3000
+  extract_llm_sweep:
+    min_tokens: 1000`,
+	// conservative/medium/high/xhigh — the plugin picker's effort ladder. See the comment beside
+	// their entries in the `presets` map above for what distinguishes each tier; the per-component
+	// blocks below are `house`'s and `housellm`'s, copied verbatim rather than re-derived, so a
+	// future retune of either source preset does not silently drift these out of sync.
+	"conservative": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract, cachesplit, toolfilter]
+components:
+  extract:
+    min_tokens: 400`,
+	"medium": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract, cachesplit, toolfilter]
+components:
+  extract:
+    min_tokens: 400
+  extract_llm:
+    aggressiveness: medium
+    context: recent
+    context_messages: 2
+    economic_gate: true
+    fire_on: pressure
+    llm_every_n_requests: 1
+    llm_max_per_request: 8
+    llm_max_per_session: 0
+    min_tokens: 3000
+    model:
+      model: claude-haiku-4-5
+      source: incoming
+    strategy: code
+    trigger:
+      min_request_tokens: 3000`,
+	// high's summarize block sets only model.source: incoming (reuse the request's own model and
+	// key). trigger.cache_state is left at its component default (`any`) ON PURPOSE: an earlier
+	// revision pinned `cache_state: pre_expiry` here on the theory that it made this a
+	// "cache-aware" summarizer, which components/offload/summarize.go's own docstring (above
+	// summarizeDefaultCacheState) retracts for exactly this component — `summarize` flattens its
+	// prompt into a single string and reuses no live prefix, so `pre_expiry` is honoured as a
+	// gate but "buys nothing but a lower firing rate" here. That is `cache_aware_summarizer`'s
+	// job, not this one's. Caught in review of #358.
+	"high": `pipeline: [summarize, format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract, cachesplit, toolfilter]
+components:
+  summarize:
+    model:
+      source: incoming
+  extract:
+    min_tokens: 400
+  extract_llm:
+    aggressiveness: medium
+    context: recent
+    context_messages: 2
+    economic_gate: true
+    fire_on: pressure
+    llm_every_n_requests: 1
+    llm_max_per_request: 8
+    llm_max_per_session: 0
+    min_tokens: 3000
+    model:
+      model: claude-haiku-4-5
+      source: incoming
+    strategy: code
+    trigger:
+      min_request_tokens: 3000`,
+	"xhigh": `pipeline: [summarize, format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, cachesplit, toolfilter]
+components:
+  summarize:
+    model:
+      source: incoming
   extract:
     min_tokens: 400
   extract_llm:

@@ -1,13 +1,13 @@
 ---
 name: preset-picker
-description: Show which preset is running and switch between them - `off`, `cache`, `house` (the recommended default for "carry less"), `codesmart`, `housellm`. Use when the user asks which preset is set, to change what context-guru trims, to carry less context, or says /plugin configure is awkward for this.
+description: Show which preset is running and switch between them - `off`, `cache`, `conservative` (the recommended default for "carry less"), `medium`, `high`, `xhigh`. Use when the user asks which preset is set, to change what context-guru trims, to carry less context, or says /plugin configure is awkward for this.
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/settings.py)
 ---
 
 # Pick a preset
 
 `/plugin configure` can set this too, but it is a blank options form: five fields, no
-explanation, no sense of what `house` actually does before you pick it. This skill is that same
+explanation, no sense of what `conservative` actually does before you pick it. This skill is that same
 write — `settings.py preset` — made nameable and explainable, same reason
 [`/context-guru:cache-strategy-picker`](../cache-strategy-picker/SKILL.md) exists for
 `cache_strategy` rather than leaving it to the generic form too.
@@ -35,12 +35,16 @@ a fault, just unset.
 |---|---|
 | `off` | nothing runs, requests go through untouched |
 | `cache` | keeps the cache warm, drops nothing |
-| `house` | trims obvious waste — the safe first step into "carry less" |
-| `codesmart` | `house` plus a cheap model that keeps only what looks relevant |
-| `housellm` | the deepest cut — a compaction model rewrites the conversation, and spends on its own |
+| `conservative` | trims obvious waste — the safe first step into "carry less" |
+| `medium` | `conservative` plus a cheap model that keeps only what looks relevant in recent tool output |
+| `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full |
+| `xhigh` | `high` plus a deep-adjudication sweep over turns whose cache has already gone cold — the deepest cut |
 
-Recommend `house` to someone who wants to carry less context but hasn't said they want an LLM
-pass: it is deterministic, so nothing about the request path depends on a model call succeeding.
+Recommend `conservative` to someone who wants to carry less context but hasn't said they want an
+LLM pass: it is deterministic, so nothing about the request path depends on a model call
+succeeding. `medium`, `high` and `xhigh` are an escalating ladder — each is a strict superset of
+the one below it — so "somewhere in between" usually means one tier up from wherever they are now,
+not a custom mix.
 
 ## 3. Switch
 
@@ -67,5 +71,6 @@ restart is the way to confirm it stuck.
 
 - Do not invent a preset name. `settings.py preset list` is the authoritative set; anything else
   exits 2 with `reason=unknown_preset`.
-- Do not push someone toward `housellm` by default. It is the only preset here that makes its own
-  model calls and spends on its own; offer it, don't default to it.
+- Do not push someone toward `high` or `xhigh` by default. `medium` is already the first tier that
+  makes its own model calls and spends on its own; `high`/`xhigh` add a compaction-model summarizer
+  on top. Offer them, don't default to them.

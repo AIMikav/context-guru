@@ -3507,11 +3507,14 @@ PRESETS: dict[str, str] = {
     "off": "nothing runs; requests are forwarded exactly as they arrived",
     "cache": "keeps the prompt cache warm by splitting off the volatile part of the system "
              "prompt; drops nothing",
-    "house": "trims obvious waste from tool output (repeats, dead runs) — the safe first step "
-             "into carrying less",
-    "codesmart": "house's trimming plus a cheap model that keeps only what looks relevant",
-    "housellm": "the deepest cut: a compaction model periodically rewrites the whole "
-                "conversation — the only preset that spends on its own",
+    "conservative": "trims obvious waste from tool output (repeats, dead runs) — deterministic, "
+                     "no model calls, the safe first step into carrying less",
+    "medium": "conservative plus a cheap model that keeps only what looks relevant in recent "
+              "tool output — the first tier that can spend on its own",
+    "high": "medium plus a summarizer that compacts older turns once the context window is "
+            "nearly full",
+    "xhigh": "high plus a periodic deep-adjudication sweep over turns whose prompt cache has "
+             "already gone cold — the deepest cut this picker offers",
 }
 DEFAULT_PRESET = "off"
 
