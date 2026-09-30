@@ -12035,3 +12035,42 @@ func TestEverySkillScriptIsExecutable(t *testing.T) {
 	}
 	t.Logf("%d script(s) referenced by skills, all executable", len(byScript))
 }
+
+// TestUpdateCheckSkipAndAlwaysAnswersCoexist pins the composability the update skill's step 3
+// depends on (issue #316): "update automatically from now on" and "not this specific release" are
+// two independent answers the user can give about the SAME tag, and recording one must not
+// clobber the other. A failed download that mutes the broken tag with `skip` must not erase an
+// `always` the user already gave, and vice versa.
+func TestUpdateCheckSkipAndAlwaysAnswersCoexist(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+
+	facts, code := settingsIn(t, state, home, "update-check", "answer", "--answer", "always")
+	if code != 0 || facts["result"] != "recorded" || facts["answer"] != "auto" {
+		t.Fatalf("recording `always` failed: exit %d, %v", code, facts)
+	}
+
+	facts, code = settingsIn(t, state, home, "update-check", "answer",
+		"--answer", "skip", "--version", "v0.3.1-testupdate1")
+	if code != 0 || facts["result"] != "recorded" {
+		t.Fatalf("recording `skip` for the broken tag failed: exit %d, %v", code, facts)
+	}
+	if facts["answer"] != "auto" {
+		t.Errorf("recording skip for one tag erased the standing `always` preference: got answer=%q, "+
+			"want auto — this is the exact shape of issue #316, a failed release silently dropping "+
+			"the user's auto-upgrade answer", facts["answer"])
+	}
+	if facts["skipped"] != "v0.3.1-testupdate1" {
+		t.Errorf("skipped=%q, want v0.3.1-testupdate1", facts["skipped"])
+	}
+
+	// Read back from disk, not just the write's own echo: `update-check show` is what the skill is
+	// told to trust over its own intent.
+	facts, code = settingsIn(t, state, home, "update-check", "show")
+	if code != 0 {
+		t.Fatalf("update-check show: exit %d, %v", code, facts)
+	}
+	if facts["answer"] != "auto" || facts["skipped"] != "v0.3.1-testupdate1" {
+		t.Errorf("update-check show reports answer=%q skipped=%q, want auto / v0.3.1-testupdate1 — "+
+			"both preferences must survive on disk together", facts["answer"], facts["skipped"])
+	}
+}
