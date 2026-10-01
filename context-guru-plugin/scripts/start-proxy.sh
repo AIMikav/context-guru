@@ -940,6 +940,17 @@ liveness check on pid %s, which cannot tell a proxy that bound from one that is 
       note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
       return 0
     fi
+    # The process we just launched already exited, so nothing is ever going to answer $HEALTH —
+    # waiting out the rest of BUDGET before saying so only delays the report, and section (3b)'s
+    # retry with it. This is the ordinary case for exactly the failure that retry exists to
+    # recover from: a config the binary could not parse exits within milliseconds, not within
+    # BUDGET, and spinning the full wait on the FIRST (failing) attempt doubled the latency of
+    # every preset-rejection recovery for no reason — the second launch still had to run its own
+    # wait regardless. `kill -0` here is the plain liveness check, not the socket-ownership one a
+    # few lines up: a proxy that is merely slow to bind is still alive and must keep waiting.
+    if ! kill -0 "$started" 2>/dev/null; then
+      return 1
+    fi
     sleep 0.25
   done
 
@@ -992,9 +1003,23 @@ if [ -n "$rejected_preset" ] && [ "$PRESET" != off ]; then
   # ignored outright: --config REPLACES --preset, exactly the divergence compute_preset_and_
   # strategy_notes's own comment already describes. `strategy sync` is the one function that
   # writes this file, so this is not a second encoding of that rule.
+  #
+  # The exit status is CHECKED, not discarded: a failed rewrite (an unwritable STATE dir,
+  # settings.py briefly unexecutable) leaves the file naming the SAME rejected preset, so the
+  # retry below resubmits the identical configuration and fails for the identical reason — this
+  # fallback's whole point, silently defeated. Reported distinctly so that outcome never reads
+  # as an unexplained second failure of the fallback itself.
+  sync_failed=0
   if [ -n "$HERE" ] && [ -x "${HERE}/settings.py" ]; then
-    CONTEXT_GURU_STATE="$STATE" "${HERE}/settings.py" strategy sync \
-      --port "$PORT" --preset "$PRESET" >/dev/null 2>&1 || true
+    if ! CONTEXT_GURU_STATE="$STATE" "${HERE}/settings.py" strategy sync \
+           --port "$PORT" --preset "$PRESET" >/dev/null 2>&1; then
+      sync_failed=1
+      note "could not rewrite keepalive-${PORT}.yaml to preset \`off\` (strategy sync failed);"
+      note "the retry below is likely to hit the same rejection, since --config still names"
+      note "whatever preset the file held before."
+    fi
+  else
+    sync_failed=1
   fi
   # Recompute the success note's PRESET_NOTE/STRATEGY_NOTE from the file `strategy sync` just
   # rewrote — otherwise a successful fallback would report the REJECTED preset as if it had run.
@@ -1002,17 +1027,36 @@ if [ -n "$rejected_preset" ] && [ "$PRESET" != off ]; then
   if attempt_launch; then
     exit 0
   fi
-  # Fell through: even `off` did not come up, so whatever is wrong is not the preset name. Let
-  # section (5) below report it with the (now updated) log.
-elif [ -z "$rejected_preset" ] && [ -s "$LOG" ] \
-     && sed 's/\\//g' "$LOG" 2>/dev/null | grep -qE 'unknown (strategy|baseline strategy|upstream) "'; then
-  # Sibling config errors this plugin cannot fall back from — a strategy or upstream name has no
-  # safe universal substitute the way `off` is for a preset — but a NAMED cause is still strictly
-  # better than the generic note alone, which is section (5)'s whole shortfall: today this reads
-  # from the log only as an opaque tail, never translated into "here is specifically what broke".
-  bad=$(sed 's/\\//g' "$LOG" 2>/dev/null \
-          | grep -oE 'unknown (strategy|baseline strategy|upstream) "[^"]*"' | tail -1)
-  note "the installed proxy (${HAVE}) rejected the configuration: config: ${bad}."
+  # Fell through: even the fallback did not come up. If the rewrite above failed, say so again
+  # here where the failure actually lands, rather than leave the retry's failure looking like a
+  # second, unrelated mystery.
+  if [ "$sync_failed" = 1 ]; then
+    note "the \`off\` fallback did not take effect because the keep-alive config could not be"
+    note "rewritten; see the note above."
+  fi
+  # Whatever is wrong now is not necessarily the preset name any more — let the sibling-error
+  # check below inspect the (now updated) log unconditionally, rather than being skipped just
+  # because A preset rejection fired earlier in this same run.
+fi
+
+# Named diagnostics for config errors $LOG now holds, checked UNCONDITIONALLY rather than gated
+# on `rejected_preset` being empty: the retry section above can itself fail for an unrelated
+# reason — the same keep-alive file can name an unknown strategy or upstream alongside the
+# preset that was just fixed — and that failure is in the log too, equally namable. Gating this
+# on "no preset was rejected" made it unreachable in exactly the case where the log holds the
+# most information: after a preset fallback whose own retry failed differently.
+if [ -s "$LOG" ]; then
+  unescaped=$(sed 's/\\//g' "$LOG" 2>/dev/null)
+  if printf '%s\n' "$unescaped" | grep -qE 'unknown (strategy|baseline strategy|upstream) "'; then
+    # Sibling config errors this plugin cannot fall back from — a strategy or upstream name has
+    # no safe universal substitute the way `off` is for a preset — but a NAMED cause is still
+    # strictly better than the generic note alone, which is section (5)'s whole shortfall: today
+    # this reads from the log only as an opaque tail, never translated into "here is specifically
+    # what broke".
+    bad=$(printf '%s\n' "$unescaped" \
+            | grep -oE 'unknown (strategy|baseline strategy|upstream) "[^"]*"' | tail -1)
+    note "the installed proxy (${HAVE}) rejected the configuration: config: ${bad}."
+  fi
 fi
 
 # --- (5) failed, and the session still has to work ---------------------------------------

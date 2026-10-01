@@ -1602,22 +1602,34 @@ def owner_token(port: str | None = None) -> tuple[str, str]:
     """
     if port:
         want = str(port)
+        # `os.path.isdir(key)` excludes a record whose project directory is gone, the same guard
+        # `_recorded_ports` already applies for the same reason: a deleted checkout's old record
+        # can still carry a `port` field, and without this a dead project's directory path gets
+        # stamped into `proxy-<port>.owner` as if it were a live claim — which every later
+        # `owner_verdict` then compares against a token nothing can ever match again.
         rows = [(key, rec) for key, rec in _read_install_scopes().items()
-                if isinstance(rec, dict) and str(rec.get("port") or "") == want]
+                if isinstance(rec, dict) and str(rec.get("port") or "") == want
+                and os.path.isdir(key)]
         # Prefer the machine-wide row on a tie: a user-scope install and a project-scope install
         # cannot legitimately share one port (port_alloc's whole point), so a collision here means
         # stale bookkeeping rather than a real ambiguity — and the machine-wide route is the one
-        # whose traffic this port is actually serving if nothing else contradicts it. Same
-        # recognition `_machine_wide_row` uses: by `scope`, or by `file` for a row written before
-        # `scope` was recorded.
-        wide = next((rec for _key, rec in rows
-                     if rec.get("scope") == "user"
-                     or (rec.get("file") and is_user_scope(rec["file"]))), None)
+        # whose traffic this port is actually serving if nothing else contradicts it.
+        # `_is_machine_wide_row` is the one recognizer, reused rather than reimplemented here — a
+        # fourth inline copy of its predicate is exactly how this file's readers drift apart again.
+        wide = next((rec for _key, rec in rows if _is_machine_wide_row(rec)), None)
         if wide is not None:
             file = wide.get("file") or ""
             return "user:" + (os.path.realpath(file) if file else user_scope_files()[0]), "user"
         if rows:
-            key, rec = rows[0]
+            # More than one non-wide row can genuinely match: this is precisely the stale-port-
+            # claim shape this function exists to fix (two projects' records both naming the same
+            # port, left over from the pre-fix cwd-based bug), so it is not a hypothetical tie.
+            # `rows[0]` was dict-iteration order, which is insertion order but not a decision
+            # anyone chose — reading it back after any unrelated edit to install-scope.json can
+            # silently change which project owner-token reports. Break it on `recorded_at`
+            # instead, newest first, so the answer tracks whichever record was written most
+            # recently rather than whichever happens to sort first in the file.
+            key, rec = max(rows, key=lambda kv: kv[1].get("recorded_at") or "")
             return key, rec.get("scope") or "project"
         # Nobody's install-scope record claims this port — fall through to the cwd-based answer,
         # which is this function's pre-existing behaviour and the right one when there is nothing
