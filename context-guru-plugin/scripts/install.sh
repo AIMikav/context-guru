@@ -841,7 +841,7 @@ get the conflict question with its own paired commands. Do not compose --on-conf
   # bare project key, which names a stranger only if that project still routes itself. settings.py
   # answers both, so this gate and start-proxy.sh's veto cannot drift apart.
   local owner_verdict
-  owner_verdict=$("$(route_here)/settings.py" owner-token --observed "$owner_key" 2>/dev/null \
+  owner_verdict=$("$(route_here)/settings.py" owner-token --port "$R_PORT" --observed "$owner_key" 2>/dev/null \
                     | sed -n 's/^verdict=//p' | head -1)
   if [ -n "$owner_key" ] && [ "$owner_verdict" = theirs ]; then
     emit "owner_project=$owner_key"
