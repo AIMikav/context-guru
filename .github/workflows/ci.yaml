@@ -3,7 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: &non-go-paths
+      # Markdown and the hand-written docs site. NOT examples/** — unlike docs.yaml's own
+      # filter, this workflow's `go test ./...` genuinely exercises that directory
+      # (github.com/rossoctl/context-guru/examples/llm-d-service/client shows up in its own
+      # coverage output), so excluding it here would skip real Go code (#369).
+      - "**/*.md"
+      - docs/**
+      - theme/**
+      - mkdocs.yml
+      - requirements-docs.txt
+      - context-guru-plugin/skills/**/*.md
+      - LICENSE
   pull_request:
+    paths-ignore: *non-go-paths
 
 permissions:
   contents: read
