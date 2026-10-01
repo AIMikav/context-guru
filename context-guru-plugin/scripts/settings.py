@@ -1568,8 +1568,8 @@ def _recorded_ports(exclude_key: str) -> set[int]:
     return used, orphans
 
 
-def owner_token() -> tuple[str, str]:
-    """Who owns the proxy on this project's port, as `start-proxy.sh` must compare it.
+def owner_token(port: str | None = None) -> tuple[str, str]:
+    """Who owns the proxy on `port`, as `start-proxy.sh` must compare it.
 
     Returns (token, scope).
 
@@ -1587,7 +1587,53 @@ def owner_token() -> tuple[str, str]:
     So the token is keyed on the ROUTING SCOPE, which is the thing that actually decides whether
     the port is shared: a machine-wide route yields one token for every project that shares it; a
     project-scoped route yields this project's key, because only that project routes to it.
+
+    `resolve_install_scope()` answers that from CWD — right for "what is MY port", wrong for "who
+    owns PORT", which is the question an owner file is actually about. A machine-wide install run
+    from inside a project that has its OWN project-local route (the ordinary case: the user has to
+    stand somewhere to run the install command) resolved to that project's scope, because its
+    settings.local.json legitimately outranks the user-scope file for THAT project's own traffic —
+    and the resulting token got stamped onto the MACHINE-WIDE port, not the project's own. Every
+    later machine-wide session then read a stranger's name off its own port's owner file and
+    deferred forever, unable to ever restart its own proxy. `port`, when given, resolves the token
+    from whichever install actually claims that port in `install-scope.json`, sidestepping cwd
+    entirely; omitted, this falls back to the cwd-based answer above for a caller that only knows
+    "my own port" (nothing records it yet, or no caller has threaded one through this far).
     """
+    if port:
+        want = str(port)
+        # `os.path.isdir(key)` excludes a record whose project directory is gone, the same guard
+        # `_recorded_ports` already applies for the same reason: a deleted checkout's old record
+        # can still carry a `port` field, and without this a dead project's directory path gets
+        # stamped into `proxy-<port>.owner` as if it were a live claim — which every later
+        # `owner_verdict` then compares against a token nothing can ever match again.
+        rows = [(key, rec) for key, rec in _read_install_scopes().items()
+                if isinstance(rec, dict) and str(rec.get("port") or "") == want
+                and os.path.isdir(key)]
+        # Prefer the machine-wide row on a tie: a user-scope install and a project-scope install
+        # cannot legitimately share one port (port_alloc's whole point), so a collision here means
+        # stale bookkeeping rather than a real ambiguity — and the machine-wide route is the one
+        # whose traffic this port is actually serving if nothing else contradicts it.
+        # `_is_machine_wide_row` is the one recognizer, reused rather than reimplemented here — a
+        # fourth inline copy of its predicate is exactly how this file's readers drift apart again.
+        wide = next((rec for _key, rec in rows if _is_machine_wide_row(rec)), None)
+        if wide is not None:
+            file = wide.get("file") or ""
+            return "user:" + (os.path.realpath(file) if file else user_scope_files()[0]), "user"
+        if rows:
+            # More than one non-wide row can genuinely match: this is precisely the stale-port-
+            # claim shape this function exists to fix (two projects' records both naming the same
+            # port, left over from the pre-fix cwd-based bug), so it is not a hypothetical tie.
+            # `rows[0]` was dict-iteration order, which is insertion order but not a decision
+            # anyone chose — reading it back after any unrelated edit to install-scope.json can
+            # silently change which project owner-token reports. Break it on `recorded_at`
+            # instead, newest first, so the answer tracks whichever record was written most
+            # recently rather than whichever happens to sort first in the file.
+            key, rec = max(rows, key=lambda kv: kv[1].get("recorded_at") or "")
+            return key, rec.get("scope") or "project"
+        # Nobody's install-scope record claims this port — fall through to the cwd-based answer,
+        # which is this function's pre-existing behaviour and the right one when there is nothing
+        # recorded to resolve from instead.
     scope, file, _source = resolve_install_scope()
     if scope == "user":
         # The user settings file, not the bare word: two HOMEs on one machine (a test harness, a
@@ -1598,7 +1644,8 @@ def owner_token() -> tuple[str, str]:
 
 
 def cmd_owner_token(args: argparse.Namespace) -> int:
-    token, scope = owner_token()
+    port = (getattr(args, "port", "") or "").strip() or None
+    token, scope = owner_token(port)
     scope = scope or "(none)"   # nothing routed yet; a literal "None" in the output would be noise
     if not args.observed:
         emit(result="ok", owner=token, scope=scope)
@@ -1610,8 +1657,8 @@ def cmd_owner_token(args: argparse.Namespace) -> int:
         return 0
 
     if scope == "user" and not observed.startswith("user:"):
-        # A bare path under a MACHINE-WIDE route. Two ways to get here, and they need opposite
-        # answers, so the file alone cannot decide — the install records can:
+        # A bare path under a MACHINE-WIDE route. Three ways to get here, and the first two need
+        # opposite answers, so the file alone cannot decide — the install records can:
         #
         #  - a proxy started before this token existed, by whichever project happened to go first.
         #    Ours: the port is shared by every project this route covers, and deferring to a claim
@@ -1627,10 +1674,37 @@ def cmd_owner_token(args: argparse.Namespace) -> int:
         # `--on-existing-projects` gate asks about. Note `adopt` makes the answer "no" for the
         # projects it folds in, which is right: they are covered by this route afterwards.
         rec = _read_install_scopes().get(observed)
-        if not (isinstance(rec, dict)
+        is_project_record = (isinstance(rec, dict)
                 and rec.get("scope") in ("project", "project-local", "custom")
-                and bool(rec.get("file")) and os.path.isdir(observed)):
+                and bool(rec.get("file")) and os.path.isdir(observed))
+        if not is_project_record:
             emit(result="ok", owner=token, scope=scope, verdict="ours", reason="legacy_unscoped",
+                 observed=observed)
+            return 0
+
+        #  - the third way: a project that DOES still route itself, genuinely and currently, but to
+        #    a DIFFERENT port than the one this call is adjudicating. Its claim on THIS port is
+        #    stale by construction — written by an old owner_token() that resolved from cwd instead
+        #    of from the port (the bug `port` exists to fix) — and the file-presence/isdir check
+        #    above cannot tell that from the second case, because both have a perfectly real,
+        #    perfectly current project-local record; the only difference is which port it names.
+        #    Ours, same as legacy_unscoped and for the same reason: refusing to self-heal this
+        #    would veto the machine-wide route's own restart forever, on exactly the same stuck
+        #    state legacy_unscoped was already written to clear.
+        #
+        #    Requires `rec["port"]` to be PRESENT, not merely absent-and-therefore-unequal: a
+        #    project recorded by scope/file alone, with no port ever written for it (every record
+        #    `record_install_scope` writes by hand rather than through `port_alloc` — the ordinary
+        #    case for a project that installed itself before ports were tracked, or whose record a
+        #    caller constructed directly) must not be read as "claims a different port" merely
+        #    because it does not name one. Absence of evidence that the port matches is not
+        #    evidence that it does not; treating it as the latter made a project that
+        #    `is_project_record` already proved is genuinely, currently self-routing lose that
+        #    protection the instant its record happened not to carry a `port` field — the exact
+        #    regression TestStartProxyRestartsTheSharedProxyForANonOwningProject's
+        #    "still owns its proxy" subtest exists to catch.
+        if port and rec.get("port") and str(rec.get("port")) != str(port):
+            emit(result="ok", owner=token, scope=scope, verdict="ours", reason="stale_port_claim",
                  observed=observed)
             return 0
 
@@ -3938,6 +4012,11 @@ def main() -> int:
                     help="the contents of proxy-<port>.owner as read from disk. Given, the answer "
                          "carries verdict=ours|theirs; omitted, it is just this project's token, "
                          "for writing that file.")
+    ot.add_argument("--port", default="",
+                    help="the port the owner file belongs to. Given, the token is resolved from "
+                         "whichever install's recorded port matches it, rather than from cwd — "
+                         "see owner_token(). Omitted, cwd decides, which is wrong for a port that "
+                         "is not the caller's own (see the cwd-vs-port docstring note).")
 
     # The proxy-binary release-notice surface: separate from `strategy`/`preset` because it is
     # machine-wide (one binary on PATH) rather than per-port or per-project.
