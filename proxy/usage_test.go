@@ -19,15 +19,15 @@ func TestParseUsageAnthropic(t *testing.T) {
 }
 
 func TestResponsesUsageJSONAndSSE(t *testing.T) {
-	body := []byte(`{"usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":80},"output_tokens":7}}`)
+	body := []byte(`{"usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":30},"output_tokens":7}}`)
 	u, ok := parseUsage(body)
-	if !ok || u.FreshInput != 40 || u.CacheRead != 80 || u.Output != 7 {
+	if !ok || u.FreshInput != 10 || u.CacheRead != 80 || u.CacheWrite != 30 || u.Output != 7 {
 		t.Fatalf("JSON usage = %+v, ok=%v", u, ok)
 	}
 	stream := []byte("event: response.completed\n" +
-		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80},\"output_tokens\":7}}}\n\n")
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":30},\"output_tokens\":7}}}\n\n")
 	u, ok = parseSSEUsage(stream)
-	if !ok || u.FreshInput != 40 || u.CacheRead != 80 || u.Output != 7 {
+	if !ok || u.FreshInput != 10 || u.CacheRead != 80 || u.CacheWrite != 30 || u.Output != 7 {
 		t.Fatalf("SSE usage = %+v, ok=%v", u, ok)
 	}
 }

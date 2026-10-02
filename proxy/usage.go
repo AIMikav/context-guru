@@ -216,10 +216,11 @@ func parseUsageWhy(body []byte) (Usage, usageMiss) {
 	case u.Get("input_tokens").Exists(): // Anthropic or OpenAI Responses
 		input := u.Get("input_tokens").Int()
 		out.Output = u.Get("output_tokens").Int()
-		if u.Get("input_tokens_details.cached_tokens").Exists() {
-			// Responses includes cached tokens in input_tokens, like Chat Completions.
+		if u.Get("input_tokens_details.cached_tokens").Exists() || u.Get("input_tokens_details.cache_write_tokens").Exists() {
+			// Responses includes both cache tiers in input_tokens.
 			out.CacheRead = u.Get("input_tokens_details.cached_tokens").Int()
-			out.FreshInput = input - out.CacheRead
+			out.CacheWrite = u.Get("input_tokens_details.cache_write_tokens").Int()
+			out.FreshInput = input - out.CacheRead - out.CacheWrite
 			if out.FreshInput < 0 {
 				out.FreshInput = 0
 			}
@@ -227,8 +228,8 @@ func parseUsageWhy(body []byte) (Usage, usageMiss) {
 			// Anthropic reports fresh and cache-read input as separate tiers.
 			out.CacheRead = u.Get("cache_read_input_tokens").Int()
 			out.FreshInput = input
+			out.CacheWrite = u.Get("cache_creation_input_tokens").Int()
 		}
-		out.CacheWrite = u.Get("cache_creation_input_tokens").Int()
 		// The per-TTL split, when the provider reports one. `cache_creation_input_tokens`
 		// is the total across both tiers, so this is a SUBSET of CacheWrite and never an
 		// addition to it.
