@@ -357,6 +357,9 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			res = Result{Body: body}
 		}
 	}()
+	if o.API == "responses" {
+		return bodyResponsesOpts(ctx, pipe, st, o)
+	}
 	mode := o.Mode
 	if mode == "" {
 		mode = components.ModeSync
