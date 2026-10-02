@@ -12,6 +12,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/session"
 	"github.com/rossoctl/context-guru/store"
@@ -113,6 +114,27 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	}
 	sys, first := schema.SessionHead(norm)
 	res.Session = session.Scoped(o.Tenant, explicitSession(o.Session, o.Body), sys, first)
+	cacheAware := resolveCacheAware(o.CacheMode, bschemas.OpenAI, o.Body)
+	maxCachedIdx, idleMs := -1, int64(-1)
+	nowMs := o.nowMs()
+	if cacheAware {
+		if o.Tracker != nil {
+			var prevAt int64
+			maxCachedIdx, prevAt = o.Tracker.TurnAt(res.Session, len(norm), nowMs)
+			maxCachedIdx--
+			alias := session.Scoped(o.Tenant, "", sys, first)
+			if at := aliasSeen(st, alias, nowMs); at > prevAt {
+				prevAt = at
+			}
+			if prevAt > 0 && nowMs >= prevAt {
+				idleMs = nowMs - prevAt
+			}
+		} else {
+			maxCachedIdx = modes.Boundary(prevLen(st, res.Session), len(norm)) - 1
+			defer putLen(st, res.Session, len(norm))
+		}
+	}
+	res.CacheAware, res.MaxCachedIdx = cacheAware, maxCachedIdx
 	if o.Bypass || pipe == nil {
 		return res
 	}
@@ -120,13 +142,24 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	if mode == "" {
 		mode = components.ModeSync
 	}
+	ttl, ttlKind := CacheLifetime(bschemas.OpenAI, gjson.GetBytes(o.Body, "model").String(), o.Body)
+	if !cacheAware {
+		ttl, ttlKind = 0, CacheLifetimeUnknown
+	}
 	chat := &bschemas.BifrostChatRequest{Provider: bschemas.OpenAI, Input: append([]bschemas.ChatMessage(nil), norm...)}
 	c := &components.Ctx{Ctx: ctx, Session: res.Session, Store: st, Model: o.Models,
 		CtxWindow: o.Window, CtxWindowExact: o.WindowExact, CompactionPoint: o.CompactionPoint,
 		CompactionPointSource: o.CompactionPointSource, ModelName: gjson.GetBytes(o.Body, "model").String(),
-		Mode: mode, MaxCachedIdx: -1, SelfRates: o.SelfRates, RatesFor: o.RatesFor}
+		Mode: mode, CacheAware: cacheAware, MaxCachedIdx: maxCachedIdx, IdleMs: idleMs,
+		CacheTTLMs: ttl.Milliseconds(), CacheTTLMinimum: ttlKind == CacheLifetimeMinimum,
+		PrevBilledInput: prevBilledInput(st, res.Session), SelfRates: o.SelfRates, RatesFor: o.RatesFor}
 	res.Run = pipe.Run(chat, c)
-	res.AttemptedTokens = schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: norm})
+	start := 0
+	if cacheAware && maxCachedIdx >= 0 {
+		start = min(maxCachedIdx+1, len(norm))
+	}
+	res.AttemptedTokens = schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: norm[start:]})
+	res.FrozenTokens = schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: norm[:start]})
 	// A component such as summarize may change transcript structure. Responses input
 	// contains opaque state items, so there is no safe positional rebuild; fail open.
 	if len(chat.Input) != len(norm) {

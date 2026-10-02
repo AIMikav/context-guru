@@ -4,16 +4,27 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
 )
 
 type responseReducer struct{}
+
+type cachePhaseProbe struct{ seen components.Ctx }
+
+func (*cachePhaseProbe) Name() string                 { return "cache-phase-probe" }
+func (*cachePhaseProbe) Enabled(*components.Ctx) bool { return true }
+func (p *cachePhaseProbe) Reformat(_ *bschemas.BifrostChatRequest, _ *components.Report, c *components.Ctx) error {
+	p.seen = *c
+	return nil
+}
 
 func (responseReducer) Name() string                 { return "responses-test" }
 func (responseReducer) Enabled(*components.Ctx) bool { return true }
@@ -27,7 +38,7 @@ func (responseReducer) Reformat(req *bschemas.BifrostChatRequest, _ *components.
 }
 
 func TestResponsesRewritesToolOutputWithoutChangingEnvelope(t *testing.T) {
-	body := []byte(` { "model":"gpt-5", "instructions":"keep me", "prompt_cache_options":{"ttl":"30m"}, "input":[` +
+	body := []byte(` { "model":"gpt-5.6", "instructions":"keep me", "prompt_cache_options":{"ttl":"30m"}, "input":[` +
 		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},` +
 		`{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"},` +
 		`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},` +
@@ -85,5 +96,49 @@ func TestResponsesUnsupportedInputPassesThroughByteForByte(t *testing.T) {
 	})
 	if res.Changed || string(res.Body) != string(body) {
 		t.Fatalf("passthrough changed bytes:\nwant %q\n got %q", body, res.Body)
+	}
+}
+
+func TestOpenAIAutoCachePhaseUsesThirtyMinuteMinimum(t *testing.T) {
+	for _, api := range []string{"", "responses"} {
+		t.Run(api, func(t *testing.T) {
+			probe := &cachePhaseProbe{}
+			p := components.NewPipeline([]components.Component{probe}, nil)
+			st, tr := store.NewMemory(store.Options{}), modes.NewTracker(0)
+			base := time.Unix(1_700_000_000, 0)
+			var first, second, third []byte
+			if api == "responses" {
+				first = []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"}]}`)
+				second = []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"},{"type":"message","role":"user","content":"two"}]}`)
+				third = []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"},{"type":"message","role":"user","content":"two"},{"type":"message","role":"user","content":"three"}]}`)
+			} else {
+				first = []byte(`{"model":"gpt-5.6","messages":[{"role":"user","content":"one"}]}`)
+				second = []byte(`{"model":"gpt-5.6","messages":[{"role":"user","content":"one"},{"role":"user","content":"two"}]}`)
+				third = []byte(`{"model":"gpt-5.6","messages":[{"role":"user","content":"one"},{"role":"user","content":"two"},{"role":"user","content":"three"}]}`)
+			}
+			for i, turn := range []struct {
+				body []byte
+				at   time.Time
+				want components.CachePhase
+			}{
+				{first, base, components.CachePhaseUnknown},
+				{second, base.Add(29*time.Minute + 30*time.Second), components.CachePhaseWarm},
+				{third, base.Add(60*time.Minute + 30*time.Second), components.CachePhaseUnknown},
+			} {
+				res := apply.BodyOpts(context.Background(), p, st, apply.Opts{
+					Provider: bschemas.OpenAI, API: api, Body: turn.body,
+					Session: "cache-test", Tracker: tr, Now: turn.at,
+				})
+				if !res.CacheAware || !probe.seen.CacheTTLMinimum || probe.seen.CacheTTLMs != (30*time.Minute).Milliseconds() {
+					t.Fatalf("turn %d: cache facts = aware=%v minimum=%v ttl=%d", i, res.CacheAware, probe.seen.CacheTTLMinimum, probe.seen.CacheTTLMs)
+				}
+				if got := probe.seen.CachePhase(time.Minute); got != turn.want {
+					t.Errorf("turn %d: phase = %s, want %s", i, got, turn.want)
+				}
+				if i > 0 && res.MaxCachedIdx < 0 {
+					t.Errorf("turn %d: cached prefix was not tracked", i)
+				}
+			}
+		})
 	}
 }
