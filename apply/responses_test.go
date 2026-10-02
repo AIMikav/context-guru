@@ -27,7 +27,7 @@ func (responseReducer) Reformat(req *bschemas.BifrostChatRequest, _ *components.
 }
 
 func TestResponsesRewritesToolOutputWithoutChangingEnvelope(t *testing.T) {
-	body := []byte(` { "model":"gpt-5", "instructions":"keep me", "input":[` +
+	body := []byte(` { "model":"gpt-5", "instructions":"keep me", "prompt_cache_options":{"ttl":"30m"}, "input":[` +
 		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},` +
 		`{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"},` +
 		`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"},` +
@@ -43,7 +43,7 @@ func TestResponsesRewritesToolOutputWithoutChangingEnvelope(t *testing.T) {
 	if got := gjson.GetBytes(res.Body, "input.3.output").String(); got != "reduced" {
 		t.Fatalf("output = %q", got)
 	}
-	for _, path := range []string{"model", "instructions", "input.0", "input.1", "input.2", "stream"} {
+	for _, path := range []string{"model", "instructions", "prompt_cache_options", "input.0", "input.1", "input.2", "stream"} {
 		if a, b := gjson.GetBytes(res.Body, path).Raw, gjson.GetBytes(body, path).Raw; a != b {
 			t.Errorf("untouched %s changed:\nwant %s\n got %s", path, b, a)
 		}
