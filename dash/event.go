@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/internal/tokens"
@@ -844,7 +845,7 @@ func (e *Event) keepaliveSavedUSD(p modelinfo.Price) float64 {
 	if e.KeepAlive || e.KeepAlivePings <= 0 || e.CacheRead <= 0 {
 		return 0 // a ping never credits itself
 	}
-	if e.SinceLastMs <= providerCacheTTLMs {
+	if e.SinceLastMs <= keepaliveCreditFloorMs(e.Provider, e.Model) {
 		return 0
 	}
 	if e.CacheWrite >= e.CacheRead {
@@ -863,6 +864,16 @@ func (e *Event) keepaliveSavedUSD(p modelinfo.Price) float64 {
 		return 0
 	}
 	return float64(n) * delta
+}
+
+func keepaliveCreditFloorMs(provider, model string) int64 {
+	if provider == string(bschemas.OpenAI) {
+		if !modelinfo.GPT56OrLater(model) {
+			return 1<<63 - 1 // no known lifetime means no defensible credit
+		}
+		return apply.OpenAIMinimumCacheTTL.Milliseconds()
+	}
+	return providerCacheTTLMs
 }
 
 // providerCacheTTLMs is the Anthropic default used by the Anthropic-only

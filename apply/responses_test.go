@@ -142,3 +142,30 @@ func TestOpenAIAutoCachePhaseUsesThirtyMinuteMinimum(t *testing.T) {
 		})
 	}
 }
+
+func TestResponsesKeepAliveTouchRefreshesTheCacheClock(t *testing.T) {
+	probe := &cachePhaseProbe{}
+	p := components.NewPipeline([]components.Component{probe}, nil)
+	st, tr := store.NewMemory(store.Options{}), modes.NewTracker(0)
+	base := time.Unix(1_700_000_000, 0)
+	first := []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"}]}`)
+	second := []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"},{"type":"message","role":"user","content":"two"}]}`)
+	third := []byte(`{"model":"gpt-5.6","input":[{"type":"message","role":"user","content":"one"},{"type":"message","role":"user","content":"two"},{"type":"message","role":"user","content":"three"}]}`)
+	for _, turn := range []struct {
+		body []byte
+		at   time.Time
+	}{{first, base}, {second, base.Add(time.Minute)}} {
+		apply.BodyOpts(context.Background(), p, st, apply.Opts{
+			Provider: bschemas.OpenAI, API: "responses", Body: turn.body,
+			Session: "cache-touch", Tracker: tr, Now: turn.at,
+		})
+	}
+	apply.RecordCacheTouch(st, "", second, bschemas.OpenAI, base.Add(28*time.Minute).UnixMilli())
+	apply.BodyOpts(context.Background(), p, st, apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Body: third,
+		Session: "cache-touch", Tracker: tr, Now: base.Add(40 * time.Minute),
+	})
+	if got := probe.seen.CachePhase(time.Minute); got != components.CachePhaseWarm {
+		t.Fatalf("phase after a confirmed keep-alive read = %s, want warm", got)
+	}
+}

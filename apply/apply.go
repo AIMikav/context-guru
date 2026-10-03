@@ -1037,10 +1037,15 @@ func RecordCacheTouch(st store.Store, tenant string, body []byte, provider bsche
 		return
 	}
 	msgsRaw := messagesArray(body)
-	if !msgsRaw.Exists() {
-		return
+	var norm []bschemas.ChatMessage
+	if msgsRaw.Exists() {
+		norm, _ = normalize(provider, msgsRaw.Array())
+	} else if provider == bschemas.OpenAI {
+		// A Responses keep-alive reads the same implicit prefix but has no
+		// Chat Completions messages array. Use the same normalized session head
+		// that bodyResponsesOpts uses for its content-derived alias.
+		norm, _ = normalizeResponses(body)
 	}
-	norm, _ := normalize(provider, msgsRaw.Array())
 	if len(norm) == 0 {
 		return
 	}

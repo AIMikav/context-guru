@@ -16,8 +16,9 @@ entry is classified **warm** throughout that guarantee: its actual expiry
 cannot be inferred, so `pre_expiry` is not claimed. Past 30 minutes the cache
 phase is **unknown**, not cold. Earlier
 OpenAI models have different retention rules, so their phase remains unknown
-unless a reliable lifetime can be established. OpenAI keep-alive pings are not
-implemented by the Anthropic-only keep-alive mechanism.
+unless a reliable lifetime can be established. GPT-5.6+ Responses sessions
+can opt into a separate 28-minute keep-alive schedule; earlier OpenAI models
+are not pinged.
 
 See the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
 for the model-specific retention rules.
