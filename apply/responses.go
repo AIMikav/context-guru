@@ -24,9 +24,10 @@ import (
 )
 
 type responseSlot struct {
-	path string
-	text string
-	pre  []byte
+	path   string
+	text   string
+	pre    []byte
+	opaque bool // normalized placeholder; never write its text onto the wire
 }
 
 // The shared envelope transforms ask this adapter only where Responses keeps
@@ -163,15 +164,12 @@ func responsesSummarySpanSafe(body []byte, slots []responseSlot, start, end int)
 			return false // normalized order diverged from wire order
 		}
 	}
-	textBlocks := func(blocks []gjson.Result) int {
+	representedBlocks := func(blocks []gjson.Result) int {
 		if len(blocks) == 0 {
 			return -1
 		}
 		for _, block := range blocks {
-			if kind := block.Get("type").String(); kind != "input_text" && kind != "output_text" {
-				return -1
-			}
-			if block.Get("text").Type != gjson.String {
+			if !block.IsObject() {
 				return -1
 			}
 		}
@@ -193,7 +191,7 @@ func responsesSummarySpanSafe(body []byte, slots []responseSlot, start, end int)
 			if output.Type == gjson.String && covered[i] == 1 {
 				continue
 			}
-			if !output.IsArray() || textBlocks(output.Array()) != covered[i] {
+			if !output.IsArray() || representedBlocks(output.Array()) != covered[i] {
 				return false
 			}
 			continue
@@ -211,7 +209,7 @@ func responsesSummarySpanSafe(body []byte, slots []responseSlot, start, end int)
 			}
 			continue
 		}
-		if !content.IsArray() || textBlocks(content.Array()) != covered[i] {
+		if !content.IsArray() || representedBlocks(content.Array()) != covered[i] {
 			return false
 		}
 	}
@@ -317,6 +315,9 @@ func rebuildResponsesCountChanged(body []byte, norm []bschemas.ChatMessage, slot
 			return false
 		}
 		if now := schema.MessageText(out[outIdx]); now != slots[origIdx].text {
+			if slots[origIdx].opaque {
+				return false
+			}
 			pathParts := strings.SplitN(slots[origIdx].path, ".", 3)
 			if len(pathParts) != 3 {
 				return false
@@ -397,13 +398,13 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 	if v := gjson.GetBytes(body, "instructions"); v.Type == gjson.String {
 		m := responseMessage("system", v.String())
 		pre, _ := json.Marshal(m)
-		out, slots = append(out, m), append(slots, responseSlot{"instructions", v.String(), pre})
+		out, slots = append(out, m), append(slots, responseSlot{"instructions", v.String(), pre, false})
 	}
 	in := gjson.GetBytes(body, "input")
 	if in.Type == gjson.String {
 		m := responseMessage("user", in.String())
 		pre, _ := json.Marshal(m)
-		return append(out, m), append(slots, responseSlot{"input", in.String(), pre})
+		return append(out, m), append(slots, responseSlot{"input", in.String(), pre, false})
 	}
 	if !in.IsArray() {
 		return out, slots
@@ -414,7 +415,7 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 		if typ == "reasoning" {
 			m := responseMessage("assistant", "")
 			pre, _ := json.Marshal(m)
-			out, slots = append(out, m), append(slots, responseSlot{base, "", pre})
+			out, slots = append(out, m), append(slots, responseSlot{base, "", pre, true})
 			continue
 		}
 		if typ == "function_call" || typ == "custom_tool_call" {
@@ -433,7 +434,7 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 			m := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleAssistant,
 				ChatAssistantMessage: &bschemas.ChatAssistantMessage{ToolCalls: []bschemas.ChatAssistantMessageToolCall{call}}}
 			pre, _ := json.Marshal(m)
-			out, slots = append(out, m), append(slots, responseSlot{base, "", pre})
+			out, slots = append(out, m), append(slots, responseSlot{base, "", pre, true})
 			continue
 		}
 		if typ == "function_call_output" || typ == "custom_tool_call_output" {
@@ -441,14 +442,20 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 			add := func(text, path string) {
 				m := toolMessage(text, item.Get("call_id").String())
 				pre, _ := json.Marshal(m)
-				out, slots = append(out, m), append(slots, responseSlot{path, text, pre})
+				out, slots = append(out, m), append(slots, responseSlot{path, text, pre, false})
 			}
 			if output.Type == gjson.String {
 				add(output.String(), base+".output")
 			} else if output.IsArray() {
 				for j, block := range output.Array() {
+					path := base + ".output." + strconv.Itoa(j)
 					if (block.Get("type").String() == "input_text" || block.Get("type").String() == "output_text") && block.Get("text").Type == gjson.String {
 						add(block.Get("text").String(), base+".output."+strconv.Itoa(j)+".text")
+					} else {
+						text := "[non-text tool output block " + block.Get("type").String() + " preserved for expansion]"
+						m := toolMessage(text, item.Get("call_id").String())
+						pre, _ := json.Marshal(m)
+						out, slots = append(out, m), append(slots, responseSlot{path: path, text: text, pre: pre, opaque: true})
 					}
 				}
 			}
@@ -462,7 +469,7 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 		if content.Type == gjson.String {
 			m := responseMessage(role, content.String())
 			pre, _ := json.Marshal(m)
-			out, slots = append(out, m), append(slots, responseSlot{base + ".content", content.String(), pre})
+			out, slots = append(out, m), append(slots, responseSlot{base + ".content", content.String(), pre, false})
 			continue
 		}
 		if !content.IsArray() {
@@ -470,12 +477,17 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 		}
 		for j, block := range content.Array() {
 			kind := block.Get("type").String()
+			path := base + ".content." + strconv.Itoa(j)
 			if (kind != "input_text" && kind != "output_text") || block.Get("text").Type != gjson.String {
+				text := "[non-text " + kind + " block preserved for expansion]"
+				m := responseMessage(role, text)
+				pre, _ := json.Marshal(m)
+				out, slots = append(out, m), append(slots, responseSlot{path: path, text: text, pre: pre, opaque: true})
 				continue
 			}
 			m := responseMessage(role, block.Get("text").String())
 			pre, _ := json.Marshal(m)
-			out, slots = append(out, m), append(slots, responseSlot{base + ".content." + strconv.Itoa(j) + ".text", block.Get("text").String(), pre})
+			out, slots = append(out, m), append(slots, responseSlot{path + ".text", block.Get("text").String(), pre, false})
 		}
 	}
 	return out, slots
@@ -534,7 +546,10 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: bschemas.OpenAI, Input: append([]bschemas.ChatMessage(nil), norm...)}
 	c := &components.Ctx{Ctx: ctx, Session: res.Session, Store: st, Model: o.Models,
-		DisallowCountChange: !gjson.GetBytes(o.Body, "input").IsArray(),
+		// A previous_response_id points to upstream-held history that this
+		// request cannot inspect or replace. Summarizing only the visible tail
+		// would claim to compact a history that remains in the provider's state.
+		DisallowCountChange: !gjson.GetBytes(o.Body, "input").IsArray() || gjson.GetBytes(o.Body, "previous_response_id").String() != "",
 		AllowSummarySpan: func(start, end int) bool {
 			return responsesSummarySpanSafe(o.Body, slots, start, end)
 		},
@@ -545,6 +560,7 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		CtxWindow: o.Window, CtxWindowExact: o.WindowExact, CompactionPoint: o.CompactionPoint,
 		CompactionPointSource: o.CompactionPointSource, ModelName: gjson.GetBytes(o.Body, "model").String(),
 		Mode: mode, CacheAware: cacheAware, MaxCachedIdx: maxCachedIdx, IdleMs: idleMs,
+		PrefixAsk:  o.PrefixAsk,
 		CacheTTLMs: ttl.Milliseconds(), CacheTTLMinimum: ttlKind == CacheLifetimeMinimum,
 		PrevBilledInput: prevBilledInput(st, res.Session), SelfRates: o.SelfRates, RatesFor: o.RatesFor}
 	res.Run = pipe.Run(chat, c)
@@ -568,6 +584,9 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		}
 		text := schema.MessageText(chat.Input[i])
 		if text == slots[i].text {
+			continue
+		}
+		if slots[i].opaque {
 			continue
 		}
 		if _, ok := responseInputIndex(slots[i].path); ok && strings.Count(slots[i].path, ".") == 1 {

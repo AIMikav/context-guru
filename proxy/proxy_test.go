@@ -459,6 +459,95 @@ func TestExpandToolLoop(t *testing.T) {
 	}
 }
 
+func TestResponsesExpandLoopJSONAndSSE(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", streaming), func(t *testing.T) {
+			var up upstreamCapture
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				round := up.record(r)
+				if round == 1 {
+					response := `{"id":"resp_1","output":[{"type":"reasoning","encrypted_content":"opaque"},` +
+						`{"type":"function_call","call_id":"call_1","name":"context_guru_expand","arguments":"{\"id\":\"HASH\"}"}]}`
+					if streaming {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":%s}\n\n", response)
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(response))
+					}
+					return
+				}
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n"))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`))
+			}))
+			defer upstream.Close()
+			h, st := buildHandler(t, offloadCapablePipeline, upstream.URL)
+			st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+			srv := httptest.NewServer(h.Mux())
+			defer srv.Close()
+			body := fmt.Sprintf(`{"model":"gpt-5.6","stream":%t,"input":[{"role":"user","content":"find <<cg:HASH>>"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}`, streaming)
+			resp, err := http.Post(srv.URL+"/openai/v1/responses", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			final, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if up.hits() != 2 || !strings.Contains(string(final), "done") {
+				t.Fatalf("Responses expansion did not complete: rounds=%d final=%s", up.hits(), final)
+			}
+			first, second := up.body(1), up.body(2)
+			if gjson.GetBytes(first, "tools.1.name").String() != "context_guru_expand" ||
+				gjson.GetBytes(second, "input.2.type").String() != "function_call" ||
+				gjson.GetBytes(second, "input.3.type").String() != "function_call_output" ||
+				gjson.GetBytes(second, "input.3.output").String() != "THE ORIGINAL CONTENT" ||
+				gjson.GetBytes(second, "input.1.encrypted_content").String() != "opaque" {
+				t.Fatalf("Responses continuation was not lossless: %s", second)
+			}
+		})
+	}
+}
+
+func TestResponsesExpandLoopRestoresStashedImage(t *testing.T) {
+	var up upstreamCapture
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if up.record(r) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"output":[{"type":"function_call","call_id":"call_1","name":"context_guru_expand","arguments":"{\"id\":\"HASH\"}"}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`))
+	}))
+	defer upstream.Close()
+	h, st := buildHandler(t, offloadCapablePipeline, upstream.URL)
+	st.Put("HASH", []byte(`[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]},`+
+		`{"role":"assistant","content":"I saw a diagram"}]`))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+	body := `{"model":"gpt-5.6","input":[{"role":"user","content":"=== History Summary === old image <<cg:HASH>>"},` +
+		`{"role":"user","content":"what was in it?"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}`
+	resp, err := http.Post(srv.URL+"/openai/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if up.hits() != 2 {
+		t.Fatalf("expected an in-band continuation, got %d rounds", up.hits())
+	}
+	second := up.body(2)
+	if gjson.GetBytes(second, "input.0.content.0.type").String() != "input_image" ||
+		gjson.GetBytes(second, "input.1.content").String() != "I saw a diagram" ||
+		gjson.GetBytes(second, "input.2.content").String() != "what was in it?" ||
+		gjson.GetBytes(second, "input.4.output").String() != "[expand: original history restored in place above]" {
+		t.Fatalf("native image was not restored in the proxy continuation: %s", second)
+	}
+}
+
 // TestExpandSSELoop proves restoration now works on the STREAMING path (the real
 // claude-code case). The first upstream reply is an Anthropic event-stream whose only
 // tool_use is context_guru_expand; the request carries a <<cg:HASH>> marker so the

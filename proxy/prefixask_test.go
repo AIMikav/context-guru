@@ -314,3 +314,15 @@ func TestPrefixAskerIsAnthropicOnlyAndNeedsTheIncomingClient(t *testing.T) {
 		t.Error("an asker was built with no incoming client, so it would read another namespace")
 	}
 }
+
+func TestResponsesPrefixAskerUsesIncomingOpenAIClient(t *testing.T) {
+	h := &Handler{sent: newSentStash()}
+	models := components.ModelSpec{Incoming: cheapmodel.OpenAI{Model: "gpt-5.6"}}
+	if h.prefixAskerForAPI(bschemas.OpenAI, "responses", models) == nil {
+		t.Fatal("Responses did not get a cached-prefix asker")
+	}
+	if h.prefixAskerForAPI(bschemas.OpenAI, "", models) != nil ||
+		h.prefixAskerForAPI(bschemas.OpenAI, "responses", components.ModelSpec{}) != nil {
+		t.Fatal("prefix asker escaped Responses or was built without incoming credentials")
+	}
+}

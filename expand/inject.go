@@ -106,7 +106,7 @@ func Inject(provider, mode string, body []byte, storePersists bool) (out []byte,
 // such tool) or pays to inspect responses that cannot contain one.
 func HasTool(provider string, body []byte) bool {
 	nameField := "function.name"
-	if provider == "anthropic" {
+	if provider == "anthropic" || provider == "responses" {
 		nameField = "name"
 	}
 	for _, t := range gjson.GetBytes(body, "tools").Array() {

@@ -64,7 +64,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 		// The asker a component may use to put a question to the request's own model over its
 		// cached transcript. nil on a non-Anthropic route or without an incoming client; a
 		// component decides for itself what nil means. See prefixask.go.
-		PrefixAsk: h.prefixAskerFor(r.provider, r.models),
+		PrefixAsk: h.prefixAskerForAPI(r.provider, r.api, r.models),
 	})
 	added := time.Since(start)
 	if res.Body == nil {

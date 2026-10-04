@@ -103,6 +103,20 @@ type prefixAsker struct {
 	cli   cheapmodel.Anthropic
 }
 
+type responsesPrefixAsker struct {
+	stash *sentStash
+	cli   cheapmodel.OpenAI
+}
+
+func (p responsesPrefixAsker) Ask(ctx context.Context, session, ask string) (string, components.PrefixUsage, error) {
+	body := p.stash.get(session)
+	if len(body) == 0 {
+		return "", components.PrefixUsage{}, components.ErrNoPrefix
+	}
+	reply, u, err := p.cli.CompletePrefixedResponses(ctx, body, ask)
+	return reply, components.PrefixUsage(u), err
+}
+
 // Ask appends the question to this session's last forwarded body and returns the model's text plus
 // what it actually cost. A missing stash is an ERROR rather than a silent empty answer, so the caller
 // can tell "there was no prefix to read" from "the model declined to act" — the distinction the
@@ -142,4 +156,18 @@ func (h *Handler) prefixAskerFor(provider bschemas.ModelProvider, models compone
 	// indistinguishable from a model that declined to act. See PrefixAskMaxTokens.
 	cli.MaxTokens = cheapmodel.PrefixAskMaxTokens
 	return prefixAsker{stash: h.sent, cli: cli}
+}
+
+// Responses differs only in the request/response wire shape: the sweep's
+// selection, read-verification and fallback decisions remain in the component.
+func (h *Handler) prefixAskerForAPI(provider bschemas.ModelProvider, api string, models components.ModelSpec) components.PrefixAsker {
+	if api != "responses" {
+		return h.prefixAskerFor(provider, models)
+	}
+	cli, ok := models.Incoming.(cheapmodel.OpenAI)
+	if !ok {
+		return nil
+	}
+	cli.MaxTokens = cheapmodel.PrefixAskMaxTokens
+	return responsesPrefixAsker{stash: h.sent, cli: cli}
 }

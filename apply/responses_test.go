@@ -247,8 +247,8 @@ func TestResponsesSummarizeSummaryOnlyModeRebuilds(t *testing.T) {
 	}
 }
 
-func TestResponsesSummarizeDeclinesUnsupportedMultimodalHistory(t *testing.T) {
-	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+func TestResponsesSummarizeStashesMultimodalHistory(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
 	p, _ := cfg.Build(nil)
 	st := store.NewMemory(store.Options{})
 	body := []byte(`{"model":"gpt-5.6","instructions":"stable","input":[` +
@@ -259,14 +259,36 @@ func TestResponsesSummarizeDeclinesUnsupportedMultimodalHistory(t *testing.T) {
 		`{"role":"user","content":"question"}]}`)
 	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
 		Models: components.ModelSpec{Incoming: stubModel{resp: "facts"}}}
-	for i := 0; i < 2; i++ {
-		res := apply.BodyOpts(context.Background(), p, st, o)
-		if res.Changed || string(res.Body) != string(body) {
-			t.Fatalf("turn %d changed opaque input: %s", i, res.Body)
-		}
-		if res.Run == nil || len(res.Run.Components) != 1 || !res.Run.Components[0].Skipped || res.Run.Saved() != 0 {
-			t.Fatalf("turn %d did not safely decline summary: %+v", i, res.Run)
-		}
+	apply.BodyOpts(context.Background(), p, st, o)
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("multimodal summary did not finish")
+	}
+	res := apply.BodyOpts(context.Background(), p, st, o)
+	if !res.Changed || gjson.GetBytes(res.Body, "input.#").Int() != 3 {
+		t.Fatalf("multimodal history was not recoverably summarized: %s", res.Body)
+	}
+	keys := expand.ParseMarkers(gjson.GetBytes(res.Body, "input.1.content").String())
+	if len(keys) != 1 {
+		t.Fatalf("summary has no expand marker: %s", res.Body)
+	}
+	stash, ok := expand.Resolve(st, keys[0])
+	if !ok || !strings.Contains(stash, `"type":"input_image"`) || !strings.Contains(stash, `"encrypted_content":"opaque"`) {
+		t.Fatalf("multimodal original was not stashed: %q", stash)
+	}
+}
+
+func TestResponsesSummarizeDoesNotClaimToCompactServerHeldHistory(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	body := []byte(`{"model":"gpt-5.6","previous_response_id":"resp_prior","input":[` +
+		`{"role":"user","content":"` + strings.Repeat("visible history ", 80) + `"},` +
+		`{"role":"user","content":"question"}]}`)
+	res := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "facts"}},
+	})
+	if res.Changed || string(res.Body) != string(body) {
+		t.Fatalf("upstream-held history was misrepresented as compacted: %s", res.Body)
 	}
 }
 

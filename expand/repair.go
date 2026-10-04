@@ -57,6 +57,9 @@ func RestoredInPlace(hashID string) string {
 // so the same transcript arrives needing the same repair on every later turn, and repairing
 // it to the same bytes each time is what keeps the provider's prefix cache warm.
 func RepairToolResults(provider string, body []byte, resolve func(id string) (string, bool)) (out []byte, restored []string) {
+	if provider == "responses" {
+		return repairResponsesToolResults(body, resolve)
+	}
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return body, nil
@@ -108,6 +111,57 @@ func RepairToolResults(provider string, body []byte, resolve func(id string) (st
 			out, restored = repairOne(out, restored, ours, blk.Get("tool_use_id").String(),
 				"messages."+strconv.Itoa(mi)+".content."+strconv.Itoa(bi),
 				blk.Get("is_error").Exists(), resolve)
+		}
+	}
+	return out, restored
+}
+
+func repairResponsesToolResults(body []byte, resolve func(id string) (string, bool)) ([]byte, []string) {
+	items := gjson.GetBytes(body, "input")
+	if !items.IsArray() {
+		return body, nil
+	}
+	ours := map[string]string{}
+	for _, item := range items.Array() {
+		typ := item.Get("type").String()
+		if typ != "function_call" && typ != "custom_tool_call" || item.Get("name").String() != ToolName {
+			continue
+		}
+		id := item.Get("call_id").String()
+		args := item.Get("arguments").String()
+		if typ == "custom_tool_call" {
+			args = item.Get("input").String()
+		}
+		if id != "" {
+			ours[id] = gjson.Get(args, "id").String()
+		}
+	}
+	if len(ours) == 0 {
+		return body, nil
+	}
+	out := body
+	var restored []string
+	for i, item := range items.Array() {
+		typ := item.Get("type").String()
+		if typ != "function_call_output" && typ != "custom_tool_call_output" {
+			continue
+		}
+		hash, ok := ours[item.Get("call_id").String()]
+		if !ok {
+			continue
+		}
+		orig, found := resolve(hash)
+		if !found {
+			noteUnresolved(hash)
+			orig = Unavailable(hash)
+		}
+		var err error
+		out, err = sjson.SetBytes(out, "input."+strconv.Itoa(i)+".output", orig)
+		if err != nil {
+			return body, nil
+		}
+		if found {
+			restored = append(restored, orig)
 		}
 	}
 	return out, restored
