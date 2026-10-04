@@ -61,6 +61,19 @@ verify with `gh pr view` rather than treating the helper warning alone as failur
 This fallback does not broaden authorization: only create branches, push commits, open issues/PRs,
 or post review replies when the user has requested those GitHub mutations.
 
+### Interpret command failures before retrying GitHub mutations
+
+Some nonzero exits are local reporting errors, not failed GitHub operations:
+
+- `gh pr checks` exits 8 while any check is **pending**. Read the per-check status or use
+  `gh run view`; do not report a test failure unless a check concludes `failure`.
+- A `gh api -X POST` can succeed on GitHub and then fail locally while formatting its reply.
+  For example, `--jq id` is invalid; use `--jq '.id'`. Before retrying a comment or reply,
+  list PR comments and check `in_reply_to_id` and body so a formatting error does not create
+  duplicate posts.
+- The credential-helper warnings described above do not reverse a successful Git ref update.
+  Verify the remote commit or PR head before attempting another push.
+
 ## Eval-box access from a managed Codex sandbox
 
 The `cgssh2` wrapper reaches the eval box (`contextguru2.vpc.cloud9.ibm.com`) only when the
@@ -73,3 +86,10 @@ For an authorized eval-box task, invoke `/Users/davidamid/cgssh2 '<remote comman
 escalation permits the known eval-box SSH connection. Request approval if prompted. Use the same
 pattern when piping only explicitly selected files to the remote worktree for testing. On that
 box, Go is available at `/usr/local/go/bin/go`. Never print or copy credentials as a workaround.
+
+The eval box may not have `rg`; use `grep` there when needed. A selected-file copy under `/tmp`
+has no Git metadata, so Go commands that inspect VCS state can fail with `error obtaining VCS
+status` even though the source compiles. Pass `-buildvcs=false` to both `go list` and `go test`
+in that test copy. If a pipeline produces no package names, `xargs` may otherwise invoke `go
+test` in the repository root and print a misleading `no Go files` error. Check the upstream
+command's exit status before treating that as a package-test failure.
