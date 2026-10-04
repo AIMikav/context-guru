@@ -9,6 +9,7 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
@@ -96,6 +97,71 @@ func TestResponsesUnsupportedInputPassesThroughByteForByte(t *testing.T) {
 	})
 	if res.Changed || string(res.Body) != string(body) {
 		t.Fatalf("passthrough changed bytes:\nwant %q\n got %q", body, res.Body)
+	}
+}
+
+func TestResponsesSessionIDForMatchesBodyOpts(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6","instructions":"stable","input":[{"role":"user","content":"task"}]}`)
+	res := apply.BodyOpts(context.Background(), nil, store.NewMemory(store.Options{}), apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Tenant: "tenant", Body: body,
+	})
+	if got := apply.SessionIDFor("tenant", "", bschemas.OpenAI, body); got == "" || got != res.Session {
+		t.Fatalf("SessionIDFor = %q, BodyOpts = %q", got, res.Session)
+	}
+}
+
+func TestResponsesSummarizeRebuildsPlainTextInput(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+	body := []byte(`{"model":"gpt-5.6","instructions":"keep this instruction","input":[` +
+		`{"role":"user","content":"task"},` +
+		`{"role":"assistant","content":"` + strings.Repeat("long answer ", 50) + `"},` +
+		`{"role":"user","content":"more context"},` +
+		`{"role":"user","content":"final question"}]}`)
+	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "essential facts"}}}
+	apply.BodyOpts(context.Background(), p, st, o)
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("background summary did not finish")
+	}
+	res := apply.BodyOpts(context.Background(), p, st, o)
+	if !res.Changed {
+		t.Fatalf("summary was not written to Responses input: %+v", res.Run)
+	}
+	if got := gjson.GetBytes(res.Body, "input.#").Int(); got != 3 {
+		t.Fatalf("input count = %d, want 3: %s", got, res.Body)
+	}
+	if gjson.GetBytes(res.Body, "instructions").Raw != gjson.GetBytes(body, "instructions").Raw ||
+		gjson.GetBytes(res.Body, "input.0").Raw != gjson.GetBytes(body, "input.0").Raw ||
+		gjson.GetBytes(res.Body, "input.2").Raw != gjson.GetBytes(body, "input.3").Raw {
+		t.Fatalf("retained fields changed: %s", res.Body)
+	}
+	if summary := gjson.GetBytes(res.Body, "input.1.content").String(); !strings.Contains(summary, "History Summary") || !strings.Contains(summary, "<<cg:") {
+		t.Fatalf("missing recoverable summary: %q", summary)
+	}
+}
+
+func TestResponsesSummarizeDoesNotTouchOpaqueState(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+	body := []byte(`{"model":"gpt-5.6","instructions":"stable","input":[` +
+		`{"role":"user","content":"task"},` +
+		`{"type":"reasoning","id":"r1","encrypted_content":"opaque"},` +
+		`{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"` + strings.Repeat("tool output ", 50) + `"},` +
+		`{"role":"user","content":"question"}]}`)
+	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "facts"}}}
+	for i := 0; i < 2; i++ {
+		res := apply.BodyOpts(context.Background(), p, st, o)
+		if res.Changed || string(res.Body) != string(body) {
+			t.Fatalf("turn %d changed opaque input: %s", i, res.Body)
+		}
+		if res.Run != nil && len(res.Run.Components) != 0 {
+			t.Fatalf("turn %d ran summarize despite unsafe input: %+v", i, res.Run.Components)
+		}
 	}
 }
 

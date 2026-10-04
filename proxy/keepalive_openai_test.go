@@ -8,6 +8,8 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
+	"github.com/rossoctl/context-guru/tenant"
 	"github.com/tidwall/gjson"
 )
 
@@ -37,7 +39,7 @@ func TestOpenAIResponsesPingPreservesTheCachedPrefix(t *testing.T) {
 }
 
 func TestOpenAIKeepAliveUsesItsOwnLifetimeAndOnlyKnownModels(t *testing.T) {
-	if defaultOpenAIKeepAliveIdle != time.Duration(config.DefaultKeepAliveOpenAIIdle)*time.Second {
+	if modelinfo.OpenAIDefaultKeepAliveIdle != time.Duration(config.DefaultKeepAliveOpenAIIdle)*time.Second {
 		t.Fatal("proxy and config disagree about the default OpenAI ping interval")
 	}
 	if !keepAliveEligible(bschemas.OpenAI, "azure/gpt-5.6-luna", "/v1/responses") ||
@@ -49,7 +51,7 @@ func TestOpenAIKeepAliveUsesItsOwnLifetimeAndOnlyKnownModels(t *testing.T) {
 		name string
 		idle time.Duration
 	}{
-		{"default", defaultOpenAIKeepAliveIdle},
+		{"default", modelinfo.OpenAIDefaultKeepAliveIdle},
 		{"configured", 30 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,5 +79,36 @@ func TestOpenAIKeepAliveUsesItsOwnLifetimeAndOnlyKnownModels(t *testing.T) {
 				t.Fatalf("ping did not fire at %s: %d", tc.idle, got)
 			}
 		})
+	}
+}
+
+func TestOpenAIKeepAliveIgnoresAnthropicIntervalControls(t *testing.T) {
+	k, _, clock := testKeeper(t, Limits{})
+	now := clock.now()
+	k.setStrategies([]tenant.Strategy{{
+		ID: "short", Active: true, IdleSeconds: 60, MaxPings: 2,
+		Windows: []tenant.Window{{Start: "00:00", End: "24:00"}},
+		Target:  tenant.Target{Mode: tenant.TargetAll}, UpdatedAt: now,
+	}})
+	armOn(t, k, "openai-session", 60*time.Second, 2, now.Add(time.Hour))
+	pol := kaPolicy()
+	pol.OpenAIIdle = 28 * time.Minute
+	pol.MinPrefixTokens = 1000
+	body := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	up := upstream{base: "http://up", path: "/v1/responses"}
+	k.record(&Tenancy{ID: "t1", Cache: pol}, "openai-session", now, body, up, req,
+		bschemas.OpenAI, up.path, http.StatusOK, Usage{CacheRead: 4000}, true)
+	k.record(&Tenancy{ID: "t1", Cache: pol}, "openai-session", now.Add(time.Second), body, up, req,
+		bschemas.OpenAI, up.path, http.StatusOK, Usage{CacheRead: 4000}, true)
+	k.mu.Lock()
+	e := k.live[kaKey("t1", "openai-session")]
+	k.mu.Unlock()
+	if e == nil {
+		t.Fatal("eligible OpenAI entry was not retained")
+	}
+	if e.pol.Idle != 28*time.Minute || e.appliedStrategy != "" {
+		t.Fatalf("short-interval control leaked into OpenAI: idle=%s strategy=%q", e.pol.Idle, e.appliedStrategy)
 	}
 }

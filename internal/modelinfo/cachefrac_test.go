@@ -33,6 +33,22 @@ func TestCacheWritePremiumIsPerFamily(t *testing.T) {
 	}
 }
 
+func TestGPT56OrLaterUsesFinalRoutedModel(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  bool
+	}{
+		{"route-gpt-5.5/gpt-5.6-luna", true},
+		{"route-gpt-5.6/gpt-5.5", false},
+		{"azure/gpt-5.6-luna", true},
+		{"azure/gpt-5.5", false},
+	} {
+		if got := GPT56OrLater(tc.model); got != tc.want {
+			t.Errorf("GPT56OrLater(%q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
 // TestFabricatedPremiumDoesNotReachNonAnthropicSavings is the dollar consequence: the
 // same 100k saved tokens must not be priced 25% higher just because the price feed
 // omitted a rate the provider never charges.

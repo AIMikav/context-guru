@@ -308,9 +308,11 @@ func applySummarizeTriggerDefaults(raw []byte, t *components.Trigger) error {
 	return t.Validate("summarize")
 }
 
-func (Summarize) Name() string                 { return "summarize" }
-func (Summarize) Enabled(*components.Ctx) bool { return true }
-func (*Summarize) NeedsModel() bool            { return true }
+func (Summarize) Name() string { return "summarize" }
+func (Summarize) Enabled(c *components.Ctx) bool {
+	return !c.DisallowCountChange
+}
+func (*Summarize) NeedsModel() bool { return true }
 
 func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input

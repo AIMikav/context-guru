@@ -610,19 +610,29 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 	// A matching ACTIVE strategy forces KeepAlive on and replaces Idle/MaxPings/
 	// MinPrefixTokens/MaxUSDPerPing; it sits ABOVE account config and BELOW a session
 	// override, which still wins on top and still cannot widen MaxUSDPerPing.
-	pol, applied := k.applyStrategy(tn.ID, pol, k.now())
+	applied := ""
+	if provider != bschemas.OpenAI {
+		pol, applied = k.applyStrategy(tn.ID, pol, k.now())
+	}
 	// A per-session manual override, if one is armed and unexpired. Everything below reads
 	// `pol` and neither knows nor cares where it came from. An override may switch the
 	// mechanism ON for a session whose account default (or no matching strategy) leaves it
 	// off — that is the point of it, and the arming request is the consent act — but it may
 	// not widen the per-ping cost guard, and it cannot reach around the kill switch or the
 	// no-audit-sink refusal above.
-	pol = k.overrideFor(tn.ID, session, pol)
+	// The manager strategy and session override APIs bound Idle to Anthropic's
+	// five-minute lifetime (60–290s). Applying them to a 30-minute OpenAI
+	// cache would buy 6–28 unnecessary pings per useful one. OpenAI currently
+	// uses only the account's separately configured interval; never tag a ping
+	// with a short-interval strategy that did not actually control it.
+	if provider != bschemas.OpenAI {
+		pol = k.overrideFor(tn.ID, session, pol)
+	}
 	model := gjson.GetBytes(body, "model").String()
 	if provider == bschemas.OpenAI {
 		pol.Idle = pol.OpenAIIdle
 		if pol.Idle <= 0 {
-			pol.Idle = defaultOpenAIKeepAliveIdle
+			pol.Idle = modelinfo.OpenAIDefaultKeepAliveIdle
 		}
 	}
 	if !pol.on() {
@@ -1194,10 +1204,6 @@ func (k *keeper) sendPing(j pingJob, body []byte) (Usage, int, error) {
 // keepAlivePingTimeout bounds one ping. Generous relative to what a max_tokens:1 answer
 // takes and far short of the request path's own header timeout.
 const keepAlivePingTimeout = 60 * time.Second
-
-// Two minutes before GPT-5.6+'s documented 30-minute minimum lifetime.
-// A 60-second ping timeout and the two-second sweep tick fit inside the margin.
-const defaultOpenAIKeepAliveIdle = 28 * time.Minute
 
 // keepAliveReserveFrac is the share of a tenant's rate and concurrency budget a ping may
 // never touch. A quarter, so a tenant at three quarters of its limit stops being pinged

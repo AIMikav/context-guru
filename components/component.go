@@ -298,7 +298,10 @@ type Ctx struct {
 	Ctx     context.Context
 	Session string
 	Store   store.Store
-	Model   ModelSpec
+	// DisallowCountChange prevents transcript-restructuring components from
+	// running when a host cannot safely write their output back to its wire shape.
+	DisallowCountChange bool
+	Model               ModelSpec
 	// Bypass short-circuits the whole pipeline (x-context-guru-bypass header).
 	Bypass bool
 	// CtxWindow is the model's max input tokens for THIS request, resolved by the

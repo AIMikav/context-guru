@@ -14,8 +14,10 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/store"
 	"gopkg.in/yaml.v3"
 )
@@ -161,7 +163,7 @@ type CacheConfig struct {
 // becomes 240.
 const (
 	DefaultKeepAliveIdle          = 280
-	DefaultKeepAliveOpenAIIdle    = 28 * 60
+	DefaultKeepAliveOpenAIIdle    = int(modelinfo.OpenAIDefaultKeepAliveIdle / time.Second)
 	DefaultKeepAliveMaxPings      = 2
 	DefaultKeepAliveMaxUSDPerPing = 0.25
 	DefaultKeepAliveMinPrefix     = 20000

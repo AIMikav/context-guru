@@ -1,6 +1,16 @@
 package modelinfo
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
+
+// The GPT-5.6+ minimum is refreshed by a cache read. Keep-alive leaves two
+// minutes for scheduling and upstream latency before that guarantee ends.
+const (
+	OpenAIMinimumCacheTTL      = 30 * time.Minute
+	OpenAIDefaultKeepAliveIdle = OpenAIMinimumCacheTTL - 2*time.Minute
+)
 
 // CacheWriteFracFor is the cache-CREATION rate as a multiple of the fresh input rate,
 // for a model whose price feed does not state one.
@@ -44,7 +54,9 @@ func chargesCacheWritePremium(model string) bool {
 // Routed model IDs (for example, azure/gpt-5.6-luna) are supported.
 func GPT56OrLater(model string) bool {
 	model = strings.ToLower(model)
-	i := strings.Index(model, "gpt-")
+	// A routing prefix may itself contain an older GPT name. The final model
+	// token is the one the request actually selects.
+	i := strings.LastIndex(model, "gpt-")
 	if i < 0 {
 		return false
 	}

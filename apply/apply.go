@@ -35,6 +35,7 @@ import (
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/components/reformat"
 	"github.com/rossoctl/context-guru/internal/logging"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/session"
@@ -874,8 +875,10 @@ func resolveCacheAware(mode string, provider bschemas.ModelProvider, body []byte
 	case "on":
 		return true
 	default: // "auto" / ""
-		switch provider {
-		case bschemas.Anthropic, bschemas.Bedrock, bschemas.BedrockMantle, bschemas.Vertex, bschemas.OpenAI:
+		if explicitBreakpointProvider(provider) {
+			return true
+		}
+		if provider == bschemas.OpenAI && modelinfo.GPT56OrLater(gjson.GetBytes(body, "model").String()) {
 			return true
 		}
 		return hasCacheBreakpoint(body)
@@ -1036,16 +1039,7 @@ func RecordCacheTouch(st store.Store, tenant string, body []byte, provider bsche
 	if st == nil || nowMs <= 0 || len(body) == 0 {
 		return
 	}
-	msgsRaw := messagesArray(body)
-	var norm []bschemas.ChatMessage
-	if msgsRaw.Exists() {
-		norm, _ = normalize(provider, msgsRaw.Array())
-	} else if provider == bschemas.OpenAI {
-		// A Responses keep-alive reads the same implicit prefix but has no
-		// Chat Completions messages array. Use the same normalized session head
-		// that bodyResponsesOpts uses for its content-derived alias.
-		norm, _ = normalizeResponses(body)
-	}
+	norm := normalizeSessionMessages(provider, body)
 	if len(norm) == 0 {
 		return
 	}
@@ -1179,6 +1173,20 @@ func messagesArray(body []byte) gjson.Result {
 	return msgsRaw
 }
 
+// normalizeSessionMessages is shared by the keep-alive touch and observe-mode
+// billed-input recorder. Both must derive the same session head as BodyOpts.
+func normalizeSessionMessages(provider bschemas.ModelProvider, body []byte) []bschemas.ChatMessage {
+	if msgsRaw := messagesArray(body); msgsRaw.Exists() {
+		norm, _ := normalize(provider, msgsRaw.Array())
+		return norm
+	}
+	if provider == bschemas.OpenAI {
+		norm, _ := normalizeResponses(body)
+		return norm
+	}
+	return nil
+}
+
 // sessionIDFrom is the ONE derivation of a request's session id, given its normalized messages.
 //
 // Every checkpoint, cold-cache decision and billed-input figure is keyed by this string, so two
@@ -1204,11 +1212,7 @@ func sessionIDFrom(tenant, explicitSess string, body []byte, norm []bschemas.Cha
 //
 // It re-parses the body, so it is for callers with no Trace. A caller holding one uses Trace.Session.
 func SessionIDFor(tenant, explicitSess string, provider bschemas.ModelProvider, body []byte) string {
-	msgsRaw := messagesArray(body)
-	if !msgsRaw.Exists() {
-		return ""
-	}
-	norm, _ := normalize(provider, msgsRaw.Array())
+	norm := normalizeSessionMessages(provider, body)
 	if len(norm) == 0 {
 		return ""
 	}

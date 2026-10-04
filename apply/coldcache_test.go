@@ -95,6 +95,16 @@ func TestOpenAIAutomaticCacheIsProtectedWithoutExplicitBreakpoints(t *testing.T)
 	}
 }
 
+func TestPre56OpenAIAutoDoesNotClaimKnownCacheLifetime(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`)
+	if resolveCacheAware("auto", bschemas.OpenAI, body) {
+		t.Fatal("pre-5.6 OpenAI must not claim cache awareness automatically")
+	}
+	if !resolveCacheAware("on", bschemas.OpenAI, body) {
+		t.Fatal("explicit cache awareness should still be honored")
+	}
+}
+
 // A tool output that merely CONTAINS the text "1h" must not extend our idea of the cache
 // lifetime. Over-stating the TTL is the safe direction for coldness, but it is
 // attacker-influenced content deciding a cost decision, so it must be structural — the same

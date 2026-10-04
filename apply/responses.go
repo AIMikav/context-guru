@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -24,6 +25,152 @@ type responseSlot struct {
 	path string
 	text string
 	pre  []byte
+}
+
+// A count-changing rewrite can only be serialized when every input item has
+// exactly one text slot. Reasoning, calls, images and multi-block items carry
+// state that must not be dropped or moved by a summary.
+func responsesCountChangeSafe(body []byte, slots []responseSlot) bool {
+	in := gjson.GetBytes(body, "input")
+	if !in.IsArray() {
+		return false
+	}
+	want := len(in.Array())
+	if gjson.GetBytes(body, "instructions").Type == gjson.String {
+		want++
+	}
+	if len(slots) != want {
+		return false
+	}
+	for i, item := range in.Array() {
+		if typ := item.Get("type").String(); typ != "" && typ != "message" {
+			return false
+		}
+		if role := item.Get("role").String(); role != "user" && role != "assistant" && role != "system" && role != "developer" {
+			return false
+		}
+		base := "input." + strconv.Itoa(i) + ".content"
+		content := item.Get("content")
+		if content.Type == gjson.String {
+			if !hasResponseSlot(slots, base) {
+				return false
+			}
+			continue
+		}
+		if !content.IsArray() || len(content.Array()) != 1 {
+			return false
+		}
+		block := content.Array()[0]
+		if kind := block.Get("type").String(); kind != "input_text" && kind != "output_text" {
+			return false
+		}
+		if block.Get("text").Type != gjson.String || !hasResponseSlot(slots, base+".0.text") {
+			return false
+		}
+	}
+	return true
+}
+
+func hasResponseSlot(slots []responseSlot, path string) bool {
+	for _, slot := range slots {
+		if slot.path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// Rebuild a plain-text Responses input around the one newly inserted summary.
+// Survivors keep their original wire shape, including any in-place text edits
+// made by later components. Any ambiguous mapping fails open.
+func rebuildResponsesCountChanged(body []byte, norm []bschemas.ChatMessage, slots []responseSlot, out []bschemas.ChatMessage) ([]byte, bool) {
+	start := 0
+	if len(slots) > 0 && slots[0].path == "instructions" {
+		if len(out) == 0 {
+			return body, false
+		}
+		b, _ := json.Marshal(out[0])
+		if !bytes.Equal(b, slots[0].pre) {
+			return body, false
+		}
+		start = 1
+	}
+	if len(out) >= len(norm) || len(out) <= start {
+		return body, false
+	}
+	// Only summarize currently changes count, and its wrapper identifies the
+	// inserted message without relying on retained text staying unchanged.
+	head := -1
+	for i := start; i < len(out); i++ {
+		text := schema.MessageText(out[i])
+		if strings.HasPrefix(text, "=== History Summary ===") && strings.Contains(text, "<<cg:") {
+			if head >= 0 {
+				return body, false
+			}
+			head = i
+		}
+	}
+	if head < start || out[head].Role != bschemas.ChatMessageRoleUser {
+		return body, false
+	}
+	tail := len(out) - head - 1
+	if head >= len(slots)-tail || head < start {
+		return body, false
+	}
+	items := gjson.GetBytes(body, "input").Array()
+	var parts [][]byte
+	appendSurvivor := func(outIdx, origIdx int) bool {
+		if out[outIdx].Role != norm[origIdx].Role {
+			return false
+		}
+		itemIdx := origIdx - start
+		if itemIdx < 0 || itemIdx >= len(items) {
+			return false
+		}
+		item := []byte(items[itemIdx].Raw)
+		if now := schema.MessageText(out[outIdx]); now != slots[origIdx].text {
+			pathParts := strings.SplitN(slots[origIdx].path, ".", 3)
+			if len(pathParts) != 3 {
+				return false
+			}
+			var err error
+			item, err = sjson.SetBytes(item, pathParts[2], now)
+			if err != nil {
+				return false
+			}
+		}
+		parts = append(parts, item)
+		return true
+	}
+	for i := start; i < head; i++ {
+		if !appendSurvivor(i, i) {
+			return body, false
+		}
+	}
+	summary, err := json.Marshal(struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{"user", schema.MessageText(out[head])})
+	if err != nil {
+		return body, false
+	}
+	parts = append(parts, summary)
+	for i := 0; i < tail; i++ {
+		if !appendSurvivor(head+1+i, len(norm)-tail+i) {
+			return body, false
+		}
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, part := range parts {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(part)
+	}
+	buf.WriteByte(']')
+	next, err := sjson.SetRawBytes(body, "input", buf.Bytes())
+	return next, err == nil
 }
 
 func responseMessage(role string, text string) bschemas.ChatMessage {
@@ -148,7 +295,8 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: bschemas.OpenAI, Input: append([]bschemas.ChatMessage(nil), norm...)}
 	c := &components.Ctx{Ctx: ctx, Session: res.Session, Store: st, Model: o.Models,
-		CtxWindow: o.Window, CtxWindowExact: o.WindowExact, CompactionPoint: o.CompactionPoint,
+		DisallowCountChange: !responsesCountChangeSafe(o.Body, slots),
+		CtxWindow:           o.Window, CtxWindowExact: o.WindowExact, CompactionPoint: o.CompactionPoint,
 		CompactionPointSource: o.CompactionPointSource, ModelName: gjson.GetBytes(o.Body, "model").String(),
 		Mode: mode, CacheAware: cacheAware, MaxCachedIdx: maxCachedIdx, IdleMs: idleMs,
 		CacheTTLMs: ttl.Milliseconds(), CacheTTLMinimum: ttlKind == CacheLifetimeMinimum,
@@ -160,9 +308,10 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	}
 	res.AttemptedTokens = schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: norm[start:]})
 	res.FrozenTokens = schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: norm[:start]})
-	// A component such as summarize may change transcript structure. Responses input
-	// contains opaque state items, so there is no safe positional rebuild; fail open.
 	if len(chat.Input) != len(norm) {
+		if next, ok := rebuildResponsesCountChanged(o.Body, norm, slots, chat.Input); ok {
+			res.Body, res.Changed = next, true
+		}
 		return res
 	}
 	body := o.Body
