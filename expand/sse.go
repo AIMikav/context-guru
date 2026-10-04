@@ -18,10 +18,36 @@ import (
 // Only the Anthropic Messages event stream is reconstructed (the streaming coding
 // agents in scope use it). For other dialects it returns ok=false.
 func AggregateSSE(provider string, raw []byte) (msg []byte, ok bool) {
+	if provider == "responses" {
+		return aggregateResponsesSSE(raw)
+	}
 	if provider != "anthropic" {
 		return nil, false
 	}
 	return aggregateAnthropicSSE(raw)
+}
+
+// Responses' terminal event carries the complete response, including its output
+// items. Only a completed response is safe to replay as a continuation prefix;
+// partial output-item deltas can omit arguments or opaque reasoning state.
+func aggregateResponsesSSE(raw []byte) ([]byte, bool) {
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		ev := gjson.Parse(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		if ev.Get("type").String() != "response.completed" {
+			continue
+		}
+		resp := ev.Get("response")
+		if resp.IsObject() && resp.Get("output").IsArray() {
+			return []byte(resp.Raw), true
+		}
+	}
+	return nil, false
 }
 
 // aggregateAnthropicSSE walks the message_start → content_block_* → message_delta

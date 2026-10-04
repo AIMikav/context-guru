@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 )
 
 // Per-session keep-alive overrides: a human pointing at one session and saying "keep this
@@ -175,21 +177,45 @@ func validOverride(session string, idle time.Duration, pings, minPrefix int,
 // — pol.on(), pingable(), the hard deadline, the per-ping cost guard, the kill switch, the
 // no-audit-sink refusal — reads the returned policy and is otherwise untouched.
 func (k *keeper) overrideFor(tenantID, session string, pol CachePolicy) CachePolicy {
-	if k == nil || session == "" {
+	o, ok := k.activeOverride(tenantID, session)
+	if !ok {
 		return pol
+	}
+	pol.KeepAlive = true
+	pol.Idle, pol.MaxPings = o.pol.Idle, o.pol.MaxPings
+	pol.MinPrefixTokens = o.pol.MinPrefixTokens
+	return pol
+}
+
+// OpenAI overrides enable a session and set its floor, but never import the
+// Anthropic-only 60-290s cadence. Bound the actual credential hold to one hour
+// even when an account configured a longer OpenAI interval or many pings.
+func (k *keeper) overrideForOpenAI(tenantID, session string, pol CachePolicy) CachePolicy {
+	o, ok := k.activeOverride(tenantID, session)
+	if !ok {
+		return pol
+	}
+	pol.KeepAlive = true
+	pol.MinPrefixTokens = o.pol.MinPrefixTokens
+	if pol.Idle <= 0 || pol.Idle > modelinfo.OpenAIDefaultKeepAliveIdle {
+		pol.Idle = modelinfo.OpenAIDefaultKeepAliveIdle
+	}
+	maxPings := int(maxOverrideHold/pol.Idle) - 1
+	pol.MaxPings = min(o.pol.MaxPings, maxPings)
+	return pol
+}
+
+func (k *keeper) activeOverride(tenantID, session string) (sessionOverride, bool) {
+	if k == nil || session == "" {
+		return sessionOverride{}, false
 	}
 	k.mu.Lock()
 	o, ok := k.overrides[kaKey(tenantID, session)]
 	k.mu.Unlock()
 	if !ok || !k.now().Before(o.until) {
-		return pol
+		return sessionOverride{}, false
 	}
-	// The three fields an override may move. MaxUSDPerPing stays the ACCOUNT's — see
-	// sessionOverride.pol — and so do the head-TTL fields, which are a different mechanism.
-	pol.KeepAlive = true
-	pol.Idle, pol.MaxPings = o.pol.Idle, o.pol.MaxPings
-	pol.MinPrefixTokens = o.pol.MinPrefixTokens
-	return pol
+	return o, true
 }
 
 // arm installs an override, refusing when a bound would be crossed.

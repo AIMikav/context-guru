@@ -116,10 +116,16 @@ const anthropicDef = `{"name":"` + ToolName + `","description":"` + toolDesc + `
 const openAIDef = `{"type":"function","function":{"name":"` + ToolName + `","description":"` + toolDesc +
 	`","parameters":` + schemaJSON + `}}`
 
+const responsesDef = `{"type":"function","name":"` + ToolName + `","description":"` + toolDesc +
+	`","parameters":` + schemaJSON + `}`
+
 // ToolDefRaw returns the provider-shaped tool definition.
 func ToolDefRaw(provider string) []byte {
 	if provider == "anthropic" {
 		return []byte(anthropicDef)
+	}
+	if provider == "responses" {
+		return []byte(responsesDef)
 	}
 	return []byte(openAIDef)
 }
@@ -128,7 +134,7 @@ func ToolDefRaw(provider string) []byte {
 // answer stray calls exactly when it is true.
 func HasTool(provider string, body []byte) bool {
 	field := "function.name"
-	if provider == "anthropic" {
+	if provider == "anthropic" || provider == "responses" {
 		field = "name"
 	}
 	for _, t := range gjson.GetBytes(body, "tools").Array() {
@@ -191,6 +197,17 @@ func toolChoiceIsAuto(tc gjson.Result) bool {
 // leaves the next request's repair to fix it. On that path the repair is the ONLY defence and the agent
 // does pay one turn.
 func ResponseCallIDs(provider string, resp []byte) (ids []string) {
+	if provider == "responses" {
+		gjson.GetBytes(resp, "output").ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() == "function_call" && item.Get("name").String() == ToolName {
+				if id := item.Get("call_id").String(); id != "" {
+					ids = append(ids, id)
+				}
+			}
+			return true
+		})
+		return ids
+	}
 	if provider == "anthropic" {
 		gjson.GetBytes(resp, "content").ForEach(func(_, blk gjson.Result) bool {
 			if blk.Get("type").String() == "tool_use" && blk.Get("name").String() == ToolName {
@@ -232,6 +249,9 @@ func ResponseCallIDs(provider string, resp []byte) (ids []string) {
 // that calls this tool alongside a CLIENT tool is handed to the client whole, so for that turn this
 // repair is the only defence rather than a second one. See the co-call note in the response loop.
 func AnswerStrayCalls(provider string, body []byte) (out []byte, answered int) {
+	if provider == "responses" {
+		return answerResponsesStrayCalls(body)
+	}
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return body, 0
@@ -290,6 +310,37 @@ func AnswerStrayCalls(provider string, body []byte) (out []byte, answered int) {
 					out = nb
 				}
 			}
+		}
+	}
+	if answered > 0 {
+		strayAnswered.Add(int64(answered))
+	}
+	return out, answered
+}
+
+func answerResponsesStrayCalls(body []byte) ([]byte, int) {
+	items := gjson.GetBytes(body, "input")
+	if !items.IsArray() {
+		return body, 0
+	}
+	ours := map[string]bool{}
+	for _, item := range items.Array() {
+		if item.Get("type").String() == "function_call" && item.Get("name").String() == ToolName {
+			if id := item.Get("call_id").String(); id != "" {
+				ours[id] = true
+			}
+		}
+	}
+	if len(ours) == 0 {
+		return body, 0
+	}
+	out, answered := body, 0
+	for i, item := range items.Array() {
+		if item.Get("type").String() != "function_call_output" || !ours[item.Get("call_id").String()] {
+			continue
+		}
+		if next, err := sjson.SetBytes(out, "input."+strconv.Itoa(i)+".output", StrayAnswer); err == nil {
+			out, answered = next, answered+1
 		}
 	}
 	if answered > 0 {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/kvcache"
 )
@@ -151,6 +152,11 @@ func kaSaved(alias string) string {
 		panic("dash: kaSaved needs a table alias; an un-aliased one resolves to the subquery")
 	}
 	col := alias + "keepalive_saved_usd"
+	// This is a reachability ceiling for rows ALREADY credited by keepaliveSavedUSD,
+	// not a second model-eligibility rule. The write path uses GPT56OrLater and
+	// never credits older OpenAI models; SQL needs only the provider's coverage
+	// window for a successful ping. Duplicating Go's routed-model parser here
+	// would introduce the drift that the model-specific write gate prevents.
 	// The `> 0` FIRST is not style: it short-circuits the probe to the credited rows. Measured on
 	// a 2.1 GB database, a full-table SUM is 314 ms this way and 61.9 SECONDS with the EXISTS
 	// first, for the identical answer. Do not reorder.
@@ -159,7 +165,9 @@ func kaSaved(alias string) string {
 			WHERE kp.keepalive = 1 AND kp.cache_read > 0
 			  AND kp.tenant_id = ` + alias + `tenant_id AND kp.session_id = ` + alias + `session_id
 			  AND kp.ts <= ` + alias + `ts
-			  AND kp.ts + ` + strconv.FormatInt(providerCacheTTLMs, 10) + ` >= ` + alias + `ts)
+			  AND kp.ts + (CASE WHEN kp.provider = 'openai' THEN ` +
+		strconv.FormatInt(apply.OpenAIMinimumCacheTTL.Milliseconds(), 10) + ` ELSE ` +
+		strconv.FormatInt(providerCacheTTLMs, 10) + ` END) >= ` + alias + `ts)
 		THEN ` + col + ` ELSE 0 END)`
 }
 

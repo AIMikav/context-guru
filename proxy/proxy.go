@@ -367,12 +367,17 @@ func (h *Handler) Mux() *http.ServeMux {
 		base:   h.opts.OpenAIUpstream,
 		path:   "/v1/chat/completions",
 		setKey: bearerKey(h.opts.OpenAIKey),
-	}, pickOpenAI))
+	}, pickOpenAI, ""))
+	m.HandleFunc("POST /openai/v1/responses", h.chat(bschemas.OpenAI, upstream{
+		base:   h.opts.OpenAIUpstream,
+		path:   "/v1/responses",
+		setKey: bearerKey(h.opts.OpenAIKey),
+	}, pickOpenAI, "responses"))
 	m.HandleFunc("POST /anthropic/v1/messages", h.chat(bschemas.Anthropic, upstream{
 		base:   h.opts.AnthropicUpstream,
 		path:   "/v1/messages",
 		setKey: headerKey("x-api-key", h.opts.AnthropicKey),
-	}, pickAnthropic))
+	}, pickAnthropic, ""))
 	// Token counting, forwarded verbatim with no pipeline. Absent this route, a client that
 	// asks how big its context is gets a 404 and falls back to working it out with inference
 	// requests — billed calls, added by a proxy sold on reducing them. See counttokens.go.
@@ -419,7 +424,7 @@ func (h *Handler) Mux() *http.ServeMux {
 			// setKey nil in single-tenant mode: pass Bob's own auth (BOBSHELL key)
 			// straight through. In hosted mode upstreamFor always injects, because the
 			// client's header holds OUR token, which must not leave the box.
-		}, pickBob))
+		}, pickBob, ""))
 		m.HandleFunc("/", h.passthrough(h.opts.BobUpstream))
 	}
 	return m
@@ -982,7 +987,7 @@ func failAuthAs(w http.ResponseWriter, err error, reason refusalReason, tenantID
 	fmt.Fprintf(w, "{\"error\":%q}\n", msg)
 }
 
-func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick func(*Tenancy) string) http.HandlerFunc {
+func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick func(*Tenancy) string, api string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Authenticate FIRST, before reading a body or doing any work. In hosted mode
 		// an unauthenticated caller must not be able to make the proxy buffer 32 MiB.
@@ -1089,6 +1094,10 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 		// panic anywhere here must forward the PRISTINE inbound body, never 500 the client.
 		// apply.BodyFull has its own recover; this backstops expand.Inject and anything else.
 		orig := body
+		wire := string(provider)
+		if api == "responses" {
+			wire = "responses"
+		}
 		var tr apply.Trace // hoisted: the lifecycle log line below reads it
 		func() {
 			defer func() {
@@ -1105,7 +1114,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			// when we are rewriting this request at all.
 			if tn.Mode != components.ModeObserve && !bypassed {
 				var repaired int
-				body, repaired = h.repairExpandErrors(provider, body, tn, cp)
+				body, repaired = h.repairExpandErrors(wire, body, tn, cp)
 				if repaired > 0 {
 					// A rewrite of the client's own transcript must never be silent: this is
 					// the only line that says the response side failed to withhold the call
@@ -1127,7 +1136,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				// one agent turn. It also catches a round the loop could not reconstruct at all.
 				// The counter (adjudicate_stray) is what says whether the description still works.
 				var strays int
-				if body, strays = adjudicate.AnswerStrayCalls(string(provider), body); strays > 0 {
+				if body, strays = adjudicate.AnswerStrayCalls(wire, body); strays > 0 {
 					lg.Debug("cg.adjudicate_stray", "answered", strays)
 				}
 			}
@@ -1137,6 +1146,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				// is charged to this request's row, and to no other tenant's.
 				ctx:         cp.llmCtx(r.Context()),
 				provider:    provider,
+				api:         api,
 				body:        body,
 				session:     r.Header.Get("x-context-guru-session"),
 				bypassed:    bypassed,
@@ -1215,7 +1225,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				// `off` mattered most: it is the A/B control arm, and a control that carries an
 				// extra tool declaration is not a control.
 				if im != expand.InjectAuto || tn.Pipe.HasOffload() {
-					body, _ = expand.Inject(string(provider), im, body, tn.Store.Persists())
+					body, _ = expand.Inject(wire, im, body, tn.Store.Persists())
 				}
 				// The adjudication tool, on every request of a pipeline that can ACTUALLY
 				// adjudicate, and on no other.
@@ -1238,14 +1248,13 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				// head of the cacheable prefix of EVERY preset, including `off` — which is the
 				// control arm of every published comparison in this repo — and including presets
 				// like codesmart that contain no extract_llm_sweep and so can never adjudicate.
-				// The provider half is not cosmetic either: prefixAskerFor returns nil for anything
-				// but Anthropic and cheapmodel/openai.go has no CompletePrefixed at all, so on the
-				// OpenAI route the ~217-token definition is unreachable by construction.
+				// The provider half is not cosmetic either: the prefixed ask needs a
+				// matching wire adapter. Responses has one; Chat Completions does not.
 				//
 				// Kept rather than dropped because a three-way A/B showed the DECLARATION is what
 				// makes removing tool_choice:none safe; see cheapmodel.CompletePrefixed.
-				if provider == bschemas.Anthropic && tn.Pipe.Has("extract_llm_sweep") {
-					body, _ = adjudicate.Inject(string(provider), body)
+				if (provider == bschemas.Anthropic || api == "responses") && tn.Pipe.Has("extract_llm_sweep") {
+					body, _ = adjudicate.Inject(wire, body)
 				}
 			}
 		}()
@@ -1389,8 +1398,8 @@ func refuseTooLarge(w http.ResponseWriter, limit int64) {
 // because the client keeps its own copy of the error and the repair therefore runs again on
 // every later turn. Nothing is charged to the process-wide bounce counter, which counts expand
 // CALLS, and ten repairs of one stale error are one call.
-func (h *Handler) repairExpandErrors(provider bschemas.ModelProvider, body []byte, tn *Tenancy, cp *capture) ([]byte, int) {
-	out, restored := expand.RepairToolResults(string(provider), body, func(hashID string) (string, bool) {
+func (h *Handler) repairExpandErrors(wire string, body []byte, tn *Tenancy, cp *capture) ([]byte, int) {
+	out, restored := expand.RepairToolResults(wire, body, func(hashID string) (string, bool) {
 		return expand.Resolve(tn.Store, hashID)
 	})
 	for _, orig := range restored {
@@ -1424,6 +1433,10 @@ var errNoUpstream = errors.New("no upstream configured")
 // markers — reaches the client as the model wrote it, is counted (sse_expand_after_stream),
 // and is answered on the NEXT request instead (expand.RepairToolResults).
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture, tn *Tenancy, session string, lg *slog.Logger) {
+	wire := string(provider)
+	if up.path == "/v1/responses" {
+		wire = "responses"
+	}
 	// ONE condition governs both halves of the loop: the tool is intercepted exactly when
 	// it is advertised on the outgoing request. Those used to be different conditions —
 	// advertised when the request had tools, intercepted (for SSE) when it had markers —
@@ -1441,7 +1454,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	// Advertised covers BOTH proxy-injected tools. The response loop is what keeps a
 	// proxy-injected tool_use away from the client, and gating it on expand alone let an
 	// adjudication call stream straight through on a request that advertised only that one.
-	advertised := expand.HasTool(string(provider), body) || adjudicate.HasTool(string(provider), body)
+	advertised := expand.HasTool(wire, body) || adjudicate.HasTool(wire, body)
 	// SSE accounting is PER CLIENT REQUEST, not per upstream round: one client request
 	// that drives several expand rounds waited for all of them, so timing a single
 	// round would report a healthy TTFB for a client that waited three round-trips.
@@ -1663,6 +1676,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			}
 			lg.Debug("cg.sse_splice", "round", round, "expand_call", found,
 				"blocks_sent", sp.blocks, "bytes", len(respBody))
+		case isSSE && wire == "responses" && expand.HasMarkersInMessages(body):
+			// Responses' terminal event includes the complete output array. Buffer
+			// only when a model-visible marker exists: advertising stays stable
+			// across turns, while marker-free ordinary traffic keeps streaming.
+			sse, sseBuffered = true, true
+			respBody, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
 		case isSSE:
 			// Non-Anthropic dialects are not inspected at all: AggregateSSE only reconstructs
 			// the Anthropic event stream, so there is nothing the loop could read even if we
@@ -1696,7 +1716,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			usage.StopReason = u.StopReason // same reasoning as the stream path above
 			usageWhy = noteUsageMiss(usageWhy, why, usageOK)
 		}
-		if isSSE && withheld == nil {
+		if isSSE && sp != nil && withheld == nil {
 			// The whole round is already on the wire. Either it never called expand, or it
 			// ran past sseRetainMaxBytes and the turn could no longer be rebuilt — and in
 			// that second case the client has our tool_use, which is the leak the counter
@@ -1747,7 +1767,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// if that fails, replay the raw stream unchanged (fail-open).
 		msg := respBody
 		if isSSE {
-			agg, ok := expand.AggregateSSE(string(provider), respBody)
+			agg, ok := expand.AggregateSSE(wire, respBody)
 			if !ok {
 				bail()
 				return
@@ -1755,7 +1775,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			msg = agg
 		}
 
-		calls, otherTools := expand.ResponseCalls(string(provider), msg, adjudicate.ToolName)
+		calls, otherTools := expand.ResponseCalls(wire, msg, adjudicate.ToolName)
 		// Calls the AGENT made to the adjudication tool. Answered HERE, in band, whenever this turn
 		// called PROXY tools only: by the time the request-path repair runs, the client has already
 		// received a tool_use for a tool it does not implement, already answered "not found", and
@@ -1776,7 +1796,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// see and declines, and a round the loop genuinely cannot reconstruct (SSE aggregation failed,
 		// or maxExpandRounds is spent). An earlier version of this comment said the backstop was only
 		// for "a path this loop does not see", which was false for the first of those.
-		strays := adjudicate.ResponseCallIDs(string(provider), msg)
+		strays := adjudicate.ResponseCallIDs(wire, msg)
 		if (len(calls) == 0 && len(strays) == 0) || otherTools {
 			bail() // normal answer (or a CLIENT tool) — hand it over unchanged
 			return
@@ -1819,7 +1839,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// back — `unresolved > 0` is the tell.
 		lg.Debug("cg.expand", "round", round, "calls", len(calls),
 			"resolved", got, "unresolved", len(calls)-got)
-		next, ok := expand.Continuation(string(provider), body, msg, resolved)
+		next, ok := expand.Continuation(wire, body, msg, resolved)
 		if !ok {
 			bail() // malformed shapes — fail open, hand the response over unchanged
 			return

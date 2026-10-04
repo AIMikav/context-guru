@@ -9857,8 +9857,10 @@ async function armSession(s) {
   // The worst-case SPEND comes back from the server, which owns every dollar on this page.
   const hold = ((kaState.k + 1) * kaState.x) / 60;
   const hours = prompt('Keep this session warm for how many hours?\n\n'
-    + `At ${kaState.x}s idle and ${kaState.k} pings, your provider credential may be held for `
-    + `up to ${hold.toFixed(0)} minutes at a time ((K+1) × X). Between 0.25 and 12 hours, and it `
+    + `For Anthropic, ${kaState.x}s idle and ${kaState.k} pings can hold your credential for `
+    + `up to ${hold.toFixed(0)} minutes at a time ((K+1) × X). For GPT-5.6+ Responses, `
+    + 'the account OpenAI cadence applies (at most 28 minutes), pings are capped to keep ' +
+      'credential hold within 60 minutes. Between 0.25 and 12 hours, and it '
     + 'is cleared if the service restarts.', '1');
   if (hours === null) return;
   const h = parseFloat(hours);
@@ -9883,8 +9885,9 @@ async function armSession(s) {
           'tokens are pinged'
         : 'there is NO prefix floor on this override, so every request on the session is pingable');
     alert(`Armed until ${when(out.until)}.\n\n` +
-      `Your credential may be held for up to ${out.hold_minutes.toFixed(0)} minutes at a ` +
-      `time ((K+1) × X), and this authorization is ${cost}.\n\n` +
+      `For Anthropic, your credential may be held for up to ${out.hold_minutes.toFixed(0)} ` +
+      `minutes at a time ((K+1) × X). For GPT-5.6+ Responses, the account OpenAI ` +
+      `cadence applies and credential hold is capped at 60 minutes. This authorization is ${cost}.\n\n` +
       guards + '.\n\n' +
       'It is cleared if the service restarts. The arm is recorded in your audit log.');
     loadKAArmed();

@@ -39,6 +39,13 @@ func TestUnknownPresetErrors(t *testing.T) {
 	}
 }
 
+func TestDuplicatePipelineComponentIsRejected(t *testing.T) {
+	if err := Validate([]byte("pipeline: [summarize, summarize]\n")); err == nil ||
+		!strings.Contains(err.Error(), "duplicate pipeline component") {
+		t.Fatalf("duplicate summarize was not rejected: %v", err)
+	}
+}
+
 // TestRichPresetCarriesComponentConfig verifies the codesmart preset expands to both
 // its pipeline AND its tuned per-component config (which a bare name-list can't carry) —
 // specifically that extract_llm is routed to the cheap "config" model, not the default.
@@ -157,6 +164,7 @@ cache:
 	// Defaults are resolved on demand, not on load: `keepalive: false` with a tuned interval
 	// is a legitimate parked configuration and must not read as enabled.
 	if got := (CacheConfig{}).Resolved(); got.KeepAliveIdleSeconds != DefaultKeepAliveIdle ||
+		got.KeepAliveOpenAIIdleSeconds != DefaultKeepAliveOpenAIIdle ||
 		got.KeepAliveMaxPings != DefaultKeepAliveMaxPings ||
 		got.KeepAliveMinPrefixTokens != DefaultKeepAliveMinPrefix ||
 		got.KeepAliveMaxUSDPerPing != DefaultKeepAliveMaxUSDPerPing ||
@@ -175,6 +183,12 @@ cache:
 			"preset: off\ncache:\n  keepalive: true\n  keepalive_idle_seconds: %d\n", idle))); err == nil {
 			t.Errorf("keepalive_idle_seconds: %d was accepted; a ping after the lifetime "+
 				"re-creates the entry at 12.5x the cost of the read it was meant to be", idle)
+		}
+	}
+	for _, idle := range []int{1730, 1800} {
+		if _, err := LoadBytes([]byte(fmt.Sprintf(
+			"preset: off\ncache:\n  keepalive: true\n  keepalive_openai_idle_seconds: %d\n", idle))); err == nil {
+			t.Errorf("OpenAI idle %d was accepted at or after its 30-minute guarantee", idle)
 		}
 	}
 	if _, err := LoadBytes([]byte("preset: off\ncache:\n  keepalive_max_pings: -1\n")); err == nil {

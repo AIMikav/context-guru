@@ -33,8 +33,8 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
-	"github.com/rossoctl/context-guru/components/reformat"
 	"github.com/rossoctl/context-guru/internal/logging"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/session"
@@ -357,6 +357,9 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			res = Result{Body: body}
 		}
 	}()
+	if o.API == "responses" {
+		return bodyResponsesOpts(ctx, pipe, st, o)
+	}
 	mode := o.Mode
 	if mode == "" {
 		mode = components.ModeSync
@@ -376,10 +379,6 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// taken, because `tools` may be serialized either side of `messages` and a rewrite
 	// after the fact would move every offset the writeback relies on.
 	// See components/reformat/toolschema.go for the mechanism and the break-even.
-	toolSchema := false
-	if !bypass && pipe != nil && pipe.Has("toolschema") {
-		body, toolSchema = reformat.CompactToolSchemas(body)
-	}
 	// Declaration filter: drop the tool/MCP declarations this account explicitly opted to
 	// stop carrying. Here for the same two reasons as the strip above — `tools` is a
 	// top-level field the pipeline never sees, and any rewrite of it must happen before a
@@ -392,14 +391,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// here, from the one configured list, and both report into the same two counters — the
 	// component's ledger says "declarations no longer sent", and a reader does not care which of
 	// the two shapes each one had.
-	filteredTokens, filteredDecls := 0, 0
-	if !bypass && pipe != nil {
-		if tf, ok := pipe.Find("toolfilter").(interface{ Removed() []string }); ok {
-			body, filteredTokens, filteredDecls = filterDeclarations(body, tf.Removed())
-			sBody, sTok, sN := filterSkillListing(body, tf.Removed())
-			body, filteredTokens, filteredDecls = sBody, filteredTokens+sTok, filteredDecls+sN
-		}
-	}
+	body, toolSchema, filteredTokens, filteredDecls := transformEnvelope(body, pipe, bypass, chatEnvelopeAdapter{})
 
 	// Mixed TTL: ask for the one-hour tier on the head's existing breakpoints. Here for the
 	// third time for the same reason as the two rewrites above — it edits `tools` and
@@ -472,10 +464,11 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// -1, not 0: unknown and "zero idle" are different facts, and the compaction gate PERMITS the
 	// first while it must refuse the second. See components.Ctx.IdleMs.
 	idleMs := int64(-1)
-	// ttlMs is the cache lifetime the cold decision below derives, carried onto the Ctx so a
-	// component can act BEFORE expiry rather than only after it. 0 when the cache-aware path did not
-	// run, which reads as "unknown" to every consumer.
+	// ttlMs is either a known expiry or a documented minimum guarantee. The
+	// provenance flag prevents a minimum from becoming a false cold verdict.
+	// Zero means the lifetime is unknown.
 	ttlMs := int64(0)
+	ttlMinimum := false
 	maxCachedIdx := -1
 	if cacheAware && !bypass {
 		// Messages present on the previous turn of this session are already committed
@@ -541,11 +534,17 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			// the agent compacts its own context (metaSessionKeys survives that, the derived
 			// sha256(system+firstUser) does not — see explicitSession). Passing the already
 			// widened ttl into the second call converges the two records as a side effect.
-			ttl := sessionTTL(st, sessionID, cacheTTL(provider, body))
-			if a := sessionTTL(st, alias, ttl); a > ttl {
-				ttl = a
+			ttl, lifetimeKind := CacheLifetime(provider, gjson.GetBytes(body, "model").String(), body)
+			ttlMinimum = lifetimeKind == CacheLifetimeMinimum
+			if lifetimeKind == CacheLifetimeExact {
+				ttl = sessionTTL(st, sessionID, ttl)
+				if a := sessionTTL(st, alias, ttl); a > ttl {
+					ttl = a
+				}
+				coldCache = cacheIsCold(prevAt, nowMs, ttl)
 			}
-			coldCache = cacheIsCold(prevAt, nowMs, ttl)
+			// A minimum only proves warmth before its boundary; past it the
+			// entry may still exist. Never lift TailOnlyCold on that guess.
 			// The SAME ttl the cold decision used, carried onto the Ctx. A component that wants to
 			// act BEFORE expiry rather than after needs the lifetime, not just the verdict, and
 			// re-deriving it there would be a second read of one fact — which is how the cold
@@ -631,6 +630,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		Mode:                mode,
 		PrefixAsk:           o.PrefixAsk,
 		CacheTTLMs:          ttlMs,
+		CacheTTLMinimum:     ttlMinimum,
 		// Set BEFORE the run, so cachesplit's own report is right at the source and every
 		// consumer of it agrees. Amending the report afterwards fixed the dashboard and
 		// left /stats and the Prometheus component counters still saying "skipped",
@@ -701,7 +701,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
 	// retained message's ORIGINAL raw bytes (byte-lossless, incl. Anthropic
 	// tool_result) and marshaling only genuinely new messages (the summary).
-	if len(chat.Input) != len(norm) {
+	if len(chat.Input) != len(norm) || summaryStructureChanged(norm, chat.Input) {
 		nb, ok := rebuildCountChanged(body, msgs, slots, chat.Input)
 		if !ok && systemSplit {
 			res.Body, res.Changed = body, true // keep the split even when the rebuild declined
@@ -865,52 +865,13 @@ func resolveCacheAware(mode string, provider bschemas.ModelProvider, body []byte
 	case "on":
 		return true
 	default: // "auto" / ""
-		switch provider {
-		case bschemas.Anthropic, bschemas.Bedrock, bschemas.BedrockMantle, bschemas.Vertex:
+		if explicitBreakpointProvider(provider) {
+			return true
+		}
+		if modelinfo.OpenAI30MinuteCache(string(provider), gjson.GetBytes(body, "model").String()) {
 			return true
 		}
 		return hasCacheBreakpoint(body)
-	}
-}
-
-// Prompt-cache lifetimes, per provider, for deciding whether a session that has been idle
-// still has a cached prefix at all.
-//
-// THE SAFE DIRECTION IS TO OVER-ESTIMATE. Believing a cache is cold when it is still warm
-// is the expensive mistake: a component that then rewrites deep history invalidates a live
-// prefix and forces a cache-WRITE of the whole suffix at 1.25x the fresh rate — precisely
-// the churn the tail gate exists to prevent. Believing it is warm when it has actually
-// expired only forgoes an opportunity. So every number here is an UPPER bound.
-const (
-	// anthropicDefaultTTL is the implicit lifetime of a bare {"type":"ephemeral"} mark.
-	// Every real captured Claude Code breakpoint is exactly that shape — no ttl field in
-	// any of ~5,000 captured requests — so this is the common case, not the fallback.
-	anthropicDefaultTTL = 5 * time.Minute
-	// extendedTTL is the lifetime an explicit ttl:"1h" asks for, and also the outer bound
-	// used where a provider caches automatically and declares no lifetime at all
-	// (OpenAI-shaped backends: documented as clearing after minutes of inactivity and
-	// always within the hour).
-	extendedTTL = time.Hour
-	// coldMargin is added to the TTL before calling a prefix cold, covering clock skew
-	// between this box and the provider and the gap between when a request was recorded
-	// here and when the provider last touched the entry.
-	coldMargin = time.Minute
-)
-
-// cacheTTL returns how long this request's prompt cache should be assumed to live.
-//
-// For the Anthropic family the request itself declares it, so this is exact rather than a
-// guess: the LONGEST ttl among the breakpoints wins, because any one of them being 1h means
-// part of the prefix may still be warm.
-func cacheTTL(provider bschemas.ModelProvider, body []byte) time.Duration {
-	switch provider {
-	case bschemas.Anthropic, bschemas.Bedrock, bschemas.BedrockMantle, bschemas.Vertex:
-		if bodyAsksExtendedTTL(body) {
-			return extendedTTL
-		}
-		return anthropicDefaultTTL
-	default:
-		return extendedTTL
 	}
 }
 
@@ -921,10 +882,8 @@ const (
 	TTLEphemeral1h = "ephemeral_1h"
 )
 
-// ttlTier names the cache lifetime this request asked for, or "" when it asked for no
-// caching at all. It is cacheTTL's answer as a LABEL: the duration is what the cold-cache
-// decision needs, and the label is what the dashboard needs, and deriving both from the same
-// structural scan is what keeps them from disagreeing.
+// ttlTier names an explicit cache_control tier, or "" when none was present.
+// OpenAI's implicit GPT-5.6+ cache has no Anthropic-style tier label.
 //
 // The empty answer matters and is not folded into 5m: a request with no cache_control anywhere
 // is not a 5-minute-TTL request, it is an uncached one, and a breakpoint histogram that
@@ -1070,11 +1029,7 @@ func RecordCacheTouch(st store.Store, tenant string, body []byte, provider bsche
 	if st == nil || nowMs <= 0 || len(body) == 0 {
 		return
 	}
-	msgsRaw := messagesArray(body)
-	if !msgsRaw.Exists() {
-		return
-	}
-	norm, _ := normalize(provider, msgsRaw.Array())
+	norm := normalizeSessionMessages(provider, body)
 	if len(norm) == 0 {
 		return
 	}
@@ -1208,6 +1163,20 @@ func messagesArray(body []byte) gjson.Result {
 	return msgsRaw
 }
 
+// normalizeSessionMessages is shared by the keep-alive touch and observe-mode
+// billed-input recorder. Both must derive the same session head as BodyOpts.
+func normalizeSessionMessages(provider bschemas.ModelProvider, body []byte) []bschemas.ChatMessage {
+	if msgsRaw := messagesArray(body); msgsRaw.Exists() {
+		norm, _ := normalize(provider, msgsRaw.Array())
+		return norm
+	}
+	if provider == bschemas.OpenAI {
+		norm, _ := normalizeResponses(body)
+		return norm
+	}
+	return nil
+}
+
 // sessionIDFrom is the ONE derivation of a request's session id, given its normalized messages.
 //
 // Every checkpoint, cold-cache decision and billed-input figure is keyed by this string, so two
@@ -1233,11 +1202,7 @@ func sessionIDFrom(tenant, explicitSess string, body []byte, norm []bschemas.Cha
 //
 // It re-parses the body, so it is for callers with no Trace. A caller holding one uses Trace.Session.
 func SessionIDFor(tenant, explicitSess string, provider bschemas.ModelProvider, body []byte) string {
-	msgsRaw := messagesArray(body)
-	if !msgsRaw.Exists() {
-		return ""
-	}
-	norm, _ := normalize(provider, msgsRaw.Array())
+	norm := normalizeSessionMessages(provider, body)
 	if len(norm) == 0 {
 		return ""
 	}

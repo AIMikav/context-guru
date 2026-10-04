@@ -1,6 +1,9 @@
 package expand
 
 import (
+	"bytes"
+	"strings"
+
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -42,6 +45,24 @@ func ResponseCalls(provider string, resp []byte, otherProxyTools ...string) (cal
 			case name == ToolName:
 				calls = append(calls, Call{CallID: blk.Get("id").String(), HashID: blk.Get("input.id").String()})
 			case !ours(name):
+				otherTools = true
+			}
+			return true
+		})
+	case "responses":
+		gjson.GetBytes(resp, "output").ForEach(func(_, item gjson.Result) bool {
+			typ := item.Get("type").String()
+			if typ != "function_call" && typ != "custom_tool_call" {
+				return true
+			}
+			name := item.Get("name").String()
+			if name == ToolName {
+				args := item.Get("arguments").String()
+				if typ == "custom_tool_call" {
+					args = item.Get("input").String()
+				}
+				calls = append(calls, Call{CallID: item.Get("call_id").String(), HashID: gjson.Get(args, "id").String()})
+			} else if !ours(name) {
 				otherTools = true
 			}
 			return true
@@ -90,6 +111,121 @@ func Continuation(provider string, reqBody, resp []byte, resolved map[string]str
 		out, err = sjson.SetRawBytes(out, "messages.-1", []byte(user))
 		if err != nil {
 			return nil, false
+		}
+		return out, true
+	case "responses":
+		items := gjson.GetBytes(reqBody, "input")
+		output := gjson.GetBytes(resp, "output")
+		if !items.IsArray() || !output.IsArray() {
+			return nil, false
+		}
+		// A Responses summary stash is an array of the exact input items it
+		// replaced. Restore those items at their original point before the
+		// continuation, so images/audio retain their modality rather than being
+		// flattened into a function-output string. Ordinary text stashes still
+		// travel as the tool output below.
+		replacements := map[int][]gjson.Result{}
+		restoredInPlace := map[string]bool{}
+		for _, call := range output.Array() {
+			id := call.Get("call_id").String()
+			orig, ok := resolved[id]
+			if !ok || call.Get("name").String() != ToolName {
+				continue
+			}
+			var rawArgs string
+			if call.Get("type").String() == "custom_tool_call" {
+				rawArgs = call.Get("input").String()
+			} else {
+				rawArgs = call.Get("arguments").String()
+			}
+			hash := gjson.Get(rawArgs, "id").String()
+			span := gjson.Parse(orig)
+			if hash == "" || !span.IsArray() || len(span.Array()) == 0 {
+				continue
+			}
+			valid := true
+			for _, original := range span.Array() {
+				if !original.IsObject() || original.Get("role").String() == "" && original.Get("type").String() == "" {
+					valid = false
+					break
+				}
+			}
+			if !valid {
+				continue
+			}
+			for i, item := range items.Array() {
+				content := item.Get("content").String()
+				if role := item.Get("role").String(); (role == "user" || role == "assistant") && strings.HasPrefix(content, "=== History Summary ===") &&
+					strings.Contains(content, Marker(hash)) {
+					if _, duplicate := replacements[i]; duplicate {
+						return nil, false
+					}
+					replacements[i] = span.Array()
+					restoredInPlace[id] = true
+					break
+				}
+			}
+		}
+		out := reqBody
+		if len(replacements) > 0 {
+			var b bytes.Buffer
+			b.WriteByte('[')
+			first := true
+			appendItem := func(raw string) {
+				if !first {
+					b.WriteByte(',')
+				}
+				first = false
+				b.WriteString(raw)
+			}
+			for i, item := range items.Array() {
+				if span, ok := replacements[i]; ok {
+					for _, original := range span {
+						appendItem(original.Raw)
+					}
+				} else {
+					appendItem(item.Raw)
+				}
+			}
+			b.WriteByte(']')
+			var err error
+			out, err = sjson.SetRawBytes(out, "input", b.Bytes())
+			if err != nil {
+				return nil, false
+			}
+		}
+		for _, item := range output.Array() {
+			var err error
+			out, err = sjson.SetRawBytes(out, "input.-1", []byte(item.Raw))
+			if err != nil {
+				return nil, false
+			}
+		}
+		for _, item := range output.Array() {
+			id := item.Get("call_id").String()
+			orig, ok := resolved[id]
+			if !ok {
+				continue
+			}
+			typ := item.Get("type").String()
+			if typ != "function_call" && typ != "custom_tool_call" {
+				return nil, false
+			}
+			answerType := "function_call_output"
+			if typ == "custom_tool_call" {
+				answerType = "custom_tool_call_output"
+			}
+			answer := `{"type":"` + answerType + `"}`
+			answer, _ = sjson.Set(answer, "call_id", id)
+			if restoredInPlace[id] {
+				orig = "[expand: original history restored in place above]"
+			}
+			answer, _ = sjson.Set(answer, "output", orig)
+			var err error
+			out, err = sjson.SetRawBytes(out, "input.-1", []byte(answer))
+			if err != nil {
+				return nil, false
+			}
 		}
 		return out, true
 

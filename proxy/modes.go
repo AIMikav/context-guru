@@ -54,7 +54,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 	headTTL1h, headTTLMinTokens := h.keeper.resolveHeadTTL(r.tn.ID, h.keeper.clockNow(),
 		r.tn.Cache.HeadTTL1h, r.tn.Cache.HeadTTLMinTokens)
 	res := apply.BodyOpts(r.ctx, r.tn.Pipe, r.tn.Store, apply.Opts{
-		Provider: r.provider, Body: r.body, Session: r.session, Tenant: r.tn.ID, Bypass: r.bypassed,
+		Provider: r.provider, API: r.api, Body: r.body, Session: r.session, Tenant: r.tn.ID, Bypass: r.bypassed,
 		Models: r.models, Window: r.window, WindowExact: r.windowExact, CacheMode: h.opts.CacheMode,
 		CompactionPoint: r.compactionPoint, CompactionPointSource: r.compactionPointSource,
 		SelfRates: r.rates, RatesFor: h.ratesFor(r.ctx),
@@ -64,7 +64,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 		// The asker a component may use to put a question to the request's own model over its
 		// cached transcript. nil on a non-Anthropic route or without an incoming client; a
 		// component decides for itself what nil means. See prefixask.go.
-		PrefixAsk: h.prefixAskerFor(r.provider, r.models),
+		PrefixAsk: h.prefixAskerForAPI(r.provider, r.api, r.models),
 	})
 	added := time.Since(start)
 	if res.Body == nil {
@@ -79,6 +79,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 type reqInfo struct {
 	ctx      context.Context
 	provider bschemas.ModelProvider
+	api      string
 	body     []byte
 	session  string
 	bypassed bool
@@ -150,7 +151,7 @@ func (h *Handler) observe(r *reqInfo) {
 
 	h.pool.Enqueue(key, func(ctx context.Context) {
 		apply.BodyOpts(logging.With(ctx, lg), info.tn.Pipe, info.tn.Shadow, apply.Opts{
-			Provider: info.provider, Body: info.body, Session: info.session, Tenant: info.tn.ID,
+			Provider: info.provider, API: info.api, Body: info.body, Session: info.session, Tenant: info.tn.ID,
 			Models: info.models, Window: info.window, WindowExact: info.windowExact, CacheMode: h.opts.CacheMode,
 			CompactionPoint: info.compactionPoint, CompactionPointSource: info.compactionPointSource,
 			Mode: components.ModeObserve,
