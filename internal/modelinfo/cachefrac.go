@@ -12,6 +12,12 @@ const (
 	OpenAIDefaultKeepAliveIdle = OpenAIMinimumCacheTTL - 2*time.Minute
 )
 
+// OpenAI30MinuteCache is the shared provider/model gate for the GPT-5.6+
+// automatic-cache guarantee. Route-specific callers may impose further limits.
+func OpenAI30MinuteCache(provider, model string) bool {
+	return provider == "openai" && GPT56OrLater(model)
+}
+
 // CacheWriteFracFor is the cache-CREATION rate as a multiple of the fresh input rate,
 // for a model whose price feed does not state one.
 //

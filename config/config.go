@@ -808,7 +808,12 @@ func PresetPipeline(name string) ([]string, bool) {
 // component with its raw config block.
 func (c *Config) Build(e components.Emitter) (*components.Pipeline, error) {
 	comps := make([]components.Component, 0, len(c.Pipeline))
+	seen := make(map[string]bool, len(c.Pipeline))
 	for _, name := range c.Pipeline {
+		if seen[name] {
+			return nil, fmt.Errorf("config: duplicate pipeline component %q", name)
+		}
+		seen[name] = true
 		var raw []byte
 		if node, ok := c.Components[name]; ok {
 			b, err := yaml.Marshal(&node)

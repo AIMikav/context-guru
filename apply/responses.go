@@ -264,7 +264,10 @@ func responsesSummaryStash(body []byte, slots []responseSlot, start, end int) ([
 	return b.Bytes(), nil
 }
 
-// Rebuild a Responses input around one summary, preserving every opaque item
+// Rebuild a Responses input around the one summary a valid pipeline can emit
+// (config rejects duplicate component names). A future count-changing
+// component must extend this adapter with its own native wire representation.
+// Preserve every opaque item
 // outside the removed plain-text span and every retained item's original wire
 // shape (including in-place text edits made by later components).
 func rebuildResponsesCountChanged(body []byte, norm []bschemas.ChatMessage, slots []responseSlot, out []bschemas.ChatMessage) ([]byte, bool) {
@@ -546,6 +549,8 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: bschemas.OpenAI, Input: append([]bschemas.ChatMessage(nil), norm...)}
 	c := &components.Ctx{Ctx: ctx, Session: res.Session, Store: st, Model: o.Models,
+		// OpenAI's 30m is a minimum, never proof of expiry. ColdCache stays
+		// false even after a long idle gap, matching the Chat Completions path.
 		// A previous_response_id points to upstream-held history that this
 		// request cannot inspect or replace. Summarizing only the visible tail
 		// would claim to compact a history that remains in the provider's state.
@@ -588,9 +593,6 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		}
 		if slots[i].opaque {
 			continue
-		}
-		if _, ok := responseInputIndex(slots[i].path); ok && strings.Count(slots[i].path, ".") == 1 {
-			continue // opaque item: never rewrite its wire representation as text
 		}
 		next, err := sjson.SetBytes(body, slots[i].path, text)
 		if err != nil {

@@ -1,10 +1,12 @@
 package expand
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestResponsesExpandWireAdapter(t *testing.T) {
@@ -51,6 +53,57 @@ func TestResponsesSSEAndRequestRepair(t *testing.T) {
 	}
 	if strings.Contains(string(ToolDefRaw("responses")), `"function":`) {
 		t.Fatal("Responses definition used Chat Completions shape")
+	}
+}
+
+func TestResponsesRepairIsIdempotentAndAvoidsDuplicateContent(t *testing.T) {
+	resolve := func(id string) (string, bool) { return "original text", id == "HASH" }
+	body := []byte(`{"input":[{"role":"user","content":"original text"},` +
+		`{"type":"function_call","call_id":"c1","name":"context_guru_expand","arguments":"{\"id\":\"HASH\"}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"No such tool"}]}`)
+	first, restored := RepairToolResults("responses", body, resolve)
+	if len(restored) != 1 || gjson.GetBytes(first, "input.2.output").String() != RestoredInPlace("HASH") {
+		t.Fatalf("repair duplicated content already in input: %s restored=%v", first, restored)
+	}
+	second, _ := RepairToolResults("responses", first, resolve)
+	if string(second) != string(first) {
+		t.Fatalf("second repair changed the body: first=%s second=%s", first, second)
+	}
+	withoutOriginal := []byte(strings.Replace(string(body), `{"role":"user","content":"original text"},`, ``, 1))
+	full, _ := RepairToolResults("responses", withoutOriginal, resolve)
+	if gjson.GetBytes(full, "input.1.output").String() != "original text" {
+		t.Fatalf("repair pointed at absent content: %s", full)
+	}
+	imageSpan := `[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]`
+	imageBody := []byte(`{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]},` +
+		`{"type":"function_call","call_id":"c1","name":"context_guru_expand","arguments":"{\"id\":\"HASH\"}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"No such tool"}]}`)
+	imageRepaired, _ := RepairToolResults("responses", imageBody, func(id string) (string, bool) {
+		return imageSpan, id == "HASH"
+	})
+	if gjson.GetBytes(imageRepaired, "input.2.output").String() != RestoredInPlace("HASH") {
+		t.Fatalf("native image span was duplicated in the tool output: %s", imageRepaired)
+	}
+}
+
+func TestResponsesRepairKeepsEarlierSuccessWhenLaterWriteFails(t *testing.T) {
+	body := []byte(`{"input":[{"type":"function_call","call_id":"c1","name":"context_guru_expand","arguments":"{\"id\":\"H1\"}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"not found"},` +
+		`{"type":"function_call","call_id":"c2","name":"context_guru_expand","arguments":"{\"id\":\"H2\"}"},` +
+		`{"type":"function_call_output","call_id":"c2","output":"not found"}]}`)
+	set := func(b []byte, path string, value interface{}) ([]byte, error) {
+		if path == "input.3.output" {
+			return nil, errors.New("simulated malformed second item")
+		}
+		return sjson.SetBytes(b, path, value)
+	}
+	got, restored := repairResponsesToolResultsWithSet(body, func(id string) (string, bool) {
+		return id, true
+	}, set)
+	if gjson.GetBytes(got, "input.1.output").String() != "H1" ||
+		gjson.GetBytes(got, "input.3.output").String() != "not found" ||
+		len(restored) != 1 || restored[0] != "H1" {
+		t.Fatalf("failed second repair rolled back first: %s restored=%v", got, restored)
 	}
 }
 

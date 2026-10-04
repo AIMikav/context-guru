@@ -292,6 +292,25 @@ func TestResponsesSummarizeDoesNotClaimToCompactServerHeldHistory(t *testing.T) 
 	}
 }
 
+func TestResponsesMinimumLifetimeNeverClaimsColdAfterLongIdle(t *testing.T) {
+	probe := &cachePhaseProbe{}
+	p := components.NewPipeline([]components.Component{probe}, nil)
+	st, tracker := store.NewMemory(store.Options{}), modes.NewTracker(0)
+	body := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"stable"}]}`)
+	base := time.Unix(1_700_000_000, 0)
+	for _, at := range []time.Time{base, base.Add(48 * time.Hour)} {
+		apply.BodyOpts(context.Background(), p, st, apply.Opts{
+			Provider: bschemas.OpenAI, API: "responses", Body: body,
+			Session: "same-session", Tracker: tracker, Now: at,
+		})
+	}
+	if probe.seen.ColdCache || probe.seen.CacheTTLMs != (30*time.Minute).Milliseconds() ||
+		!probe.seen.CacheTTLMinimum {
+		t.Fatalf("minimum lifetime was treated as expiry: cold=%v ttl=%d minimum=%v",
+			probe.seen.ColdCache, probe.seen.CacheTTLMs, probe.seen.CacheTTLMinimum)
+	}
+}
+
 func TestResponsesSummarizeKeepsOpaqueTailVerbatim(t *testing.T) {
 	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 5, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
 	p, _ := cfg.Build(nil)

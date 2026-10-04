@@ -27,8 +27,10 @@ const (
 
 // CacheLifetime returns the only lifetime facts the cache gate may act on.
 // GPT-5.6+ defaults to a 30-minute MINIMUM after the latest write or reuse;
-// OpenAI may retain the prefix longer. Earlier OpenAI models have variable
-// retention, so their lifetime is unknown without a reliable per-request fact.
+// OpenAI may retain the prefix longer, with no documented maximum. Therefore
+// even a very old OpenAI entry cannot safely set ColdCache or lift TailOnlyCold.
+// Earlier OpenAI models have variable retention, so their lifetime is unknown
+// without a reliable per-request fact.
 func CacheLifetime(provider bschemas.ModelProvider, model string, body []byte) (time.Duration, CacheLifetimeKind) {
 	if explicitBreakpointProvider(provider) {
 		if bodyAsksExtendedTTL(body) {
@@ -36,7 +38,7 @@ func CacheLifetime(provider bschemas.ModelProvider, model string, body []byte) (
 		}
 		return AnthropicDefaultCacheTTL, CacheLifetimeExact
 	}
-	if provider == bschemas.OpenAI && modelinfo.GPT56OrLater(model) {
+	if modelinfo.OpenAI30MinuteCache(string(provider), model) {
 		return OpenAIMinimumCacheTTL, CacheLifetimeMinimum
 	}
 	return 0, CacheLifetimeUnknown

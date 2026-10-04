@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -324,5 +325,27 @@ func TestResponsesPrefixAskerUsesIncomingOpenAIClient(t *testing.T) {
 	if h.prefixAskerForAPI(bschemas.OpenAI, "", models) != nil ||
 		h.prefixAskerForAPI(bschemas.OpenAI, "responses", components.ModelSpec{}) != nil {
 		t.Fatal("prefix asker escaped Responses or was built without incoming credentials")
+	}
+}
+
+func TestResponsesPrefixAskerUsesOnlyItsSessionAndReportsMissingPrefix(t *testing.T) {
+	var got []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"verdict"}]}],` +
+			`"usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1100},"output_tokens":2}}`))
+	}))
+	defer srv.Close()
+	stash := newSentStash()
+	stash.put("one", []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"ONLY-ONE"}]}`))
+	a := responsesPrefixAsker{stash: stash, cli: cheapmodel.OpenAI{BaseURL: srv.URL, Model: "gpt-5.6", APIKey: "k"}}
+	if _, _, err := a.Ask(context.Background(), "two", "ask"); err != components.ErrNoPrefix || got != nil {
+		t.Fatalf("missing session used another prefix: err=%v body=%s", err, got)
+	}
+	reply, usage, err := a.Ask(context.Background(), "one", "ASK-ONE")
+	if err != nil || reply != "verdict" || usage.CacheRead != 1100 ||
+		!strings.Contains(string(got), "ONLY-ONE") || !strings.Contains(string(got), "ASK-ONE") {
+		t.Fatalf("stashed Responses ask failed: reply=%q usage=%+v err=%v body=%s", reply, usage, err, got)
 	}
 }

@@ -39,6 +39,13 @@ func TestUnknownPresetErrors(t *testing.T) {
 	}
 }
 
+func TestDuplicatePipelineComponentIsRejected(t *testing.T) {
+	if err := Validate([]byte("pipeline: [summarize, summarize]\n")); err == nil ||
+		!strings.Contains(err.Error(), "duplicate pipeline component") {
+		t.Fatalf("duplicate summarize was not rejected: %v", err)
+	}
+}
+
 // TestRichPresetCarriesComponentConfig verifies the codesmart preset expands to both
 // its pipeline AND its tuned per-component config (which a bare name-list can't carry) —
 // specifically that extract_llm is routed to the cheap "config" model, not the default.

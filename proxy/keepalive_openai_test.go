@@ -92,6 +92,7 @@ func TestOpenAIKeepAliveIgnoresAnthropicIntervalControls(t *testing.T) {
 	}})
 	armOn(t, k, "openai-session", 60*time.Second, 2, now.Add(time.Hour))
 	pol := kaPolicy()
+	pol.KeepAlive = false // the manual arm must enable this one session
 	pol.OpenAIIdle = 28 * time.Minute
 	pol.MinPrefixTokens = 1000
 	body := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"hello"}]}`)
@@ -108,7 +109,21 @@ func TestOpenAIKeepAliveIgnoresAnthropicIntervalControls(t *testing.T) {
 	if e == nil {
 		t.Fatal("eligible OpenAI entry was not retained")
 	}
-	if e.pol.Idle != 28*time.Minute || e.appliedStrategy != "" {
-		t.Fatalf("short-interval control leaked into OpenAI: idle=%s strategy=%q", e.pol.Idle, e.appliedStrategy)
+	if !e.pol.KeepAlive || e.pol.Idle != 28*time.Minute || e.pol.MaxPings != 1 ||
+		e.pol.MinPrefixTokens != 0 || e.appliedStrategy != "" {
+		t.Fatalf("manual OpenAI override was ineffective or imported an Anthropic cadence: policy=%+v strategy=%q",
+			e.pol, e.appliedStrategy)
+	}
+	if hold := time.Duration(e.pol.MaxPings+1) * e.pol.Idle; hold > maxOverrideHold {
+		t.Fatalf("OpenAI override retained credentials for %s, beyond %s", hold, maxOverrideHold)
+	}
+	k.disarm("t1", "openai-session")
+	k.record(&Tenancy{ID: "t1", Cache: pol}, "openai-session", now.Add(2*time.Second), body, up, req,
+		bschemas.OpenAI, up.path, http.StatusOK, Usage{CacheRead: 4000}, true)
+	k.mu.Lock()
+	e = k.live[kaKey("t1", "openai-session")]
+	k.mu.Unlock()
+	if e != nil {
+		t.Fatal("disarmed OpenAI session remained retained on an account with keep-alive off")
 	}
 }

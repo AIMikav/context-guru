@@ -575,7 +575,15 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	if c.Session == "" {
 		return s.summarizeInline(c, rep, req, msgs, model, span, headCount, start, end, stale)
 	}
-	if why := s.startAsyncSummary(c, model, span, spanJSON, summaryCoveredHash(c, start, end, span), conversationGoal(req), end-start); why != "" {
+	var coveredHash string
+	if spanJSON != nil && c.SummaryStashPayload != nil {
+		// The marker-full path already built these exact wire bytes above for
+		// the reserve check; do not walk and serialize the Responses span twice.
+		coveredHash = hashKey(string(spanJSON) + ":" + spanHash(span))
+	} else {
+		coveredHash = summaryCoveredHash(c, start, end, span)
+	}
+	if why := s.startAsyncSummary(c, model, span, spanJSON, coveredHash, conversationGoal(req), end-start); why != "" {
 		// Another summary is already in flight for this session. This turn must not start a
 		// second: a session that keeps firing would otherwise queue one full-transcript model
 		// call per turn, each paying for a ~48k-token prompt, with the last writer's checkpoint

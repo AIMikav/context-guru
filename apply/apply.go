@@ -543,6 +543,8 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 				}
 				coldCache = cacheIsCold(prevAt, nowMs, ttl)
 			}
+			// A minimum only proves warmth before its boundary; past it the
+			// entry may still exist. Never lift TailOnlyCold on that guess.
 			// The SAME ttl the cold decision used, carried onto the Ctx. A component that wants to
 			// act BEFORE expiry rather than after needs the lifetime, not just the verdict, and
 			// re-deriving it there would be a second read of one fact — which is how the cold
@@ -866,7 +868,7 @@ func resolveCacheAware(mode string, provider bschemas.ModelProvider, body []byte
 		if explicitBreakpointProvider(provider) {
 			return true
 		}
-		if provider == bschemas.OpenAI && modelinfo.GPT56OrLater(gjson.GetBytes(body, "model").String()) {
+		if modelinfo.OpenAI30MinuteCache(string(provider), gjson.GetBytes(body, "model").String()) {
 			return true
 		}
 		return hasCacheBreakpoint(body)

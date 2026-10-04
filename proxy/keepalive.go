@@ -621,10 +621,10 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 	// not widen the per-ping cost guard, and it cannot reach around the kill switch or the
 	// no-audit-sink refusal above.
 	// The manager strategy and session override APIs bound Idle to Anthropic's
-	// five-minute lifetime (60–290s). Applying them to a 30-minute OpenAI
-	// cache would buy 6–28 unnecessary pings per useful one. OpenAI currently
-	// uses only the account's separately configured interval; never tag a ping
-	// with a short-interval strategy that did not actually control it.
+	// five-minute lifetime (60–290s). Applying that cadence to a 30-minute
+	// OpenAI cache would buy 6–28 unnecessary pings per useful one. Strategies
+	// remain Anthropic-only; a manual session override uses an OpenAI-specific
+	// cadence and a one-hour credential-hold ceiling instead.
 	if provider != bschemas.OpenAI {
 		pol = k.overrideFor(tn.ID, session, pol)
 	}
@@ -634,6 +634,7 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 		if pol.Idle <= 0 {
 			pol.Idle = modelinfo.OpenAIDefaultKeepAliveIdle
 		}
+		pol = k.overrideForOpenAI(tn.ID, session, pol)
 	}
 	if !pol.on() {
 		k.retire(key)
@@ -1220,7 +1221,7 @@ func keepAliveEligible(p bschemas.ModelProvider, model, route string) bool {
 	case bschemas.Anthropic, bschemas.Bedrock, bschemas.BedrockMantle, bschemas.Vertex:
 		return true
 	case bschemas.OpenAI:
-		return route == "/v1/responses" && modelinfo.GPT56OrLater(model)
+		return route == "/v1/responses" && modelinfo.OpenAI30MinuteCache(string(p), model)
 	}
 	return false
 }
