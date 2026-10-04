@@ -19,12 +19,9 @@ Start Codex and ask it to **set up context-guru**. The setup skill deliberately 
 codex -p context-guru
 ```
 
-Codex uses OpenAI's Responses API. The proxy currently forwards that envelope byte-for-byte; the
-existing context-reduction pipeline still applies only to Chat Completions and Anthropic Messages
-requests. This compatibility mode makes routing safe and observable without pretending that a
-Responses request was optimized. The plugin therefore does not save Codex context or tokens yet;
-native Responses rewriting is tracked in
-[#373](https://github.com/rossoctl/context-guru/issues/373).
+Codex uses OpenAI's Responses API. The proxy natively reduces compatible `instructions` and `input`
+text and tool-output items with the deterministic `conservative` preset, while preserving opaque
+state items and Responses streaming events.
 
 The plugin requires `context-guru-proxy` on `PATH`, or a binary built at
 `bin/context-guru-proxy` in this checkout.

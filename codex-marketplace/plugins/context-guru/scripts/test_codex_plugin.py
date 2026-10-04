@@ -55,6 +55,7 @@ class CodexPluginTest(unittest.TestCase):
         self.assertIn("requires_openai_auth = false", text)
         self.assertEqual(PLUGIN.profile().stat().st_mode & 0o777, 0o600)
         command = PLUGIN.proxy_command("/proxy", 8791, provider["base_url"])
+        self.assertEqual(command[3:5], ["--preset", "conservative"])
         self.assertEqual(command[-2:], ["--openai-upstream", "https://gateway.example.test"])
 
     def test_reads_selected_base_provider_without_external_toml_dependency(self):

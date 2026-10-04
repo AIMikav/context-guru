@@ -105,8 +105,8 @@ def start_proxy(executable, port, upstream=None):
 
 def proxy_command(executable, port, upstream=None):
     root = state_dir()
-    command = [executable, "--listen", f"127.0.0.1:{port}", "--preset", "off", "--dashboard",
-               "--dashboard-db", str(root / "dashboard.db")]
+    command = [executable, "--listen", f"127.0.0.1:{port}", "--preset", "conservative",
+               "--dashboard", "--dashboard-db", str(root / "dashboard.db")]
     if upstream:
         command.extend(["--openai-upstream", upstream.rstrip("/")])
     return command

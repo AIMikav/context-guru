@@ -59,9 +59,6 @@ Choose your setup. Each button opens only the instructions for that path.
   </tbody>
 </table>
 
-Codex routing and observability work today, but Responses traffic is not yet context-reduced. That
-work is tracked in [#373](https://github.com/rossoctl/context-guru/issues/373).
-
 ## Presets
 
 Change what gets trimmed with:
