@@ -1,6 +1,13 @@
 # Agent notes
 
-## GitHub access from a managed Codex worktree
+## Working with Codex/OpenAI
+
+The instructions in this section apply **only** when the active agent/runtime is OpenAI Codex.
+Agents running under Claude Code, another provider, or an environment with different sandbox and
+authentication settings must ignore this section and use their own environment's documented
+workflow.
+
+### GitHub access from a managed Codex worktree
 
 `gh` and HTTPS GitHub access are already authenticated in this environment. Do not print, copy, or
 attempt to recover credentials. Read-only commands such as `gh pr view`, `gh api`, `git status`, and
@@ -26,7 +33,7 @@ approvals_reviewer = "user"
 
 Then restart Codex. Do not modify user configuration unless the user explicitly asks.
 
-### Safe fallback for creating or updating a PR
+#### Safe fallback for creating or updating a PR
 
 When the shared Git metadata remains unwritable, use a clean temporary clone. This stays within the
 writable `/tmp` root and uses the existing GitHub authentication:
