@@ -516,9 +516,15 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	sys, first := schema.SessionHead(norm)
 	res.Session = session.Scoped(o.Tenant, explicitSession(o.Session, o.Body), sys, first)
 	cacheAware := resolveCacheAware(o.CacheMode, bschemas.OpenAI, o.Body)
+	// A previous_response_id request contains only this turn's delta, not a
+	// cumulatively growing transcript. Boundary/TurnAt would interpret a smaller
+	// delta as agent compaction and report a cached prefix we cannot see. Keep
+	// cache awareness for provider pricing/lifetime, but leave the visible input
+	// entirely eligible and its idle phase unknown.
+	serverHeldHistory := gjson.GetBytes(o.Body, "previous_response_id").String() != ""
 	maxCachedIdx, idleMs := -1, int64(-1)
-	nowMs := o.nowMs()
-	if cacheAware {
+	if cacheAware && !serverHeldHistory {
+		nowMs := o.nowMs()
 		if o.Tracker != nil {
 			var prevAt int64
 			maxCachedIdx, prevAt = o.Tracker.TurnAt(res.Session, len(norm), nowMs)
@@ -554,7 +560,7 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		// A previous_response_id points to upstream-held history that this
 		// request cannot inspect or replace. Summarizing only the visible tail
 		// would claim to compact a history that remains in the provider's state.
-		DisallowCountChange: !gjson.GetBytes(o.Body, "input").IsArray() || gjson.GetBytes(o.Body, "previous_response_id").String() != "",
+		DisallowCountChange: !gjson.GetBytes(o.Body, "input").IsArray() || serverHeldHistory,
 		AllowSummarySpan: func(start, end int) bool {
 			return responsesSummarySpanSafe(o.Body, slots, start, end)
 		},

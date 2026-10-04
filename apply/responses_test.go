@@ -292,6 +292,46 @@ func TestResponsesSummarizeDoesNotClaimToCompactServerHeldHistory(t *testing.T) 
 	}
 }
 
+func TestResponsesServerHeldHistoryDoesNotCreateCachedPrefixBoundaries(t *testing.T) {
+	for _, useTracker := range []bool{false, true} {
+		t.Run(strconv.FormatBool(useTracker), func(t *testing.T) {
+			probe := &cachePhaseProbe{}
+			p := components.NewPipeline([]components.Component{probe}, nil)
+			st := store.NewMemory(store.Options{})
+			var tracker *modes.Tracker
+			if useTracker {
+				tracker = modes.NewTracker(0)
+			}
+			beforeResets := modes.CompactionResets()
+			for i, count := range []int{3, 1, 2} {
+				var items []string
+				for j := 0; j < count; j++ {
+					items = append(items, `{"role":"user","content":"visible delta `+strconv.Itoa(j)+`"}`)
+				}
+				body := []byte(`{"model":"gpt-5.6","previous_response_id":"resp_` + strconv.Itoa(i) +
+					`","input":[` + strings.Join(items, ",") + `]}`)
+				res := apply.BodyOpts(context.Background(), p, st, apply.Opts{
+					Provider: bschemas.OpenAI, API: "responses", Body: body,
+					Session: "same-session", Tracker: tracker,
+					Now: time.Unix(1_700_000_000+int64(i*60), 0),
+				})
+				if !res.CacheAware || res.MaxCachedIdx != -1 || res.FrozenTokens != 0 ||
+					res.AttemptedTokens <= 0 || probe.seen.IdleMs != -1 ||
+					probe.seen.MaxCachedIdx != -1 || !probe.seen.DisallowCountChange {
+					t.Fatalf("server-held turn %d reported a visible cached prefix: result=%+v ctx=%+v",
+						i, res.Trace, probe.seen)
+				}
+			}
+			if got := modes.CompactionResets(); got != beforeResets {
+				t.Fatalf("server-held deltas produced %d false compaction resets", got-beforeResets)
+			}
+			if tracker != nil && tracker.Sessions() != 0 {
+				t.Fatal("server-held deltas entered the cumulative-transcript tracker")
+			}
+		})
+	}
+}
+
 func TestResponsesMinimumLifetimeNeverClaimsColdAfterLongIdle(t *testing.T) {
 	probe := &cachePhaseProbe{}
 	p := components.NewPipeline([]components.Component{probe}, nil)
