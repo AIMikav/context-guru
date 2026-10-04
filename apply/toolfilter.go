@@ -122,6 +122,10 @@ import (
 // remove holds exact declaration names, plus the bare form `mcp__<server>` which stands for
 // every tool of that MCP server — the unit a user actually adds and removes.
 func filterDeclarations(body []byte, remove []string) (out []byte, removedTokens, removed int) {
+	return filterDeclarationsWithAdapter(body, remove, chatEnvelopeAdapter{})
+}
+
+func filterDeclarationsWithAdapter(body []byte, remove []string, wire envelopeAdapter) (out []byte, removedTokens, removed int) {
 	if len(remove) == 0 {
 		return body, 0, 0
 	}
@@ -158,11 +162,11 @@ func filterDeclarations(body []byte, remove []string) (out []byte, removedTokens
 	// declaration, so it cannot have emitted the call. The only way to arrive here is the
 	// turn an account switches the filter ON mid-session, which re-anchors once by
 	// definition.
-	if pendingCallFor(body, names, servers) {
+	if wire.pendingCallFor(body, names, servers) {
 		return body, 0, 0
 	}
 	// Pass 2: the prose gate (hazard 2 above), on candidates only.
-	prose := proseRegion(body)
+	prose := wire.proseRegion(body)
 	forced := forcedToolName(body)
 	kept := make([]string, 0, len(arr))
 	for i, t := range arr {
@@ -278,6 +282,12 @@ func forcedToolName(body []byte) string {
 // something we were asked to remove. See the call site for why the predicate is scoped to
 // the remove set rather than to "any pending call".
 func pendingCallFor(body []byte, names, servers map[string]bool) bool {
+	return chatEnvelopeAdapter{}.pendingCallFor(body, names, servers)
+}
+
+type chatEnvelopeAdapter struct{}
+
+func (chatEnvelopeAdapter) pendingCallFor(body []byte, names, servers map[string]bool) bool {
 	last := ""
 	gjson.GetBytes(body, "messages").ForEach(func(_, m gjson.Result) bool {
 		last = m.Raw
@@ -330,6 +340,10 @@ func pendingCallFor(body []byte, names, servers map[string]bool) bool {
 // What is left is the agent's own hand-written instructions, which do not change within a
 // session. That is measured, not assumed: see the file comment and the two guard tests.
 func proseRegion(body []byte) string {
+	return chatEnvelopeAdapter{}.proseRegion(body)
+}
+
+func (chatEnvelopeAdapter) proseRegion(body []byte) string {
 	var b strings.Builder
 	add := func(txt string) {
 		if txt == "" || strings.HasPrefix(txt, billingHeaderBlock) {
@@ -451,6 +465,10 @@ func identByte(prose string, i int) bool {
 // Fails open on everything: no listing, no terminator, a body shape it does not recognise, a
 // re-encode that errors — all return the input untouched and a saving of zero.
 func filterSkillListing(body []byte, remove []string) (out []byte, removedTokens, removed int) {
+	return filterSkillListingWithAdapter(body, remove, chatEnvelopeAdapter{})
+}
+
+func filterSkillListingWithAdapter(body []byte, remove []string, wire envelopeAdapter) (out []byte, removedTokens, removed int) {
 	drop := map[string]bool{}
 	for _, r := range remove {
 		if n := strings.TrimPrefix(r, skills.RemovePrefix); n != r && n != "" {
@@ -463,7 +481,7 @@ func filterSkillListing(body []byte, remove []string) (out []byte, removedTokens
 	// Which message holds the listing, and — when its content is an array — which block. The
 	// FIRST match, the same choice dash's reader makes, so the page and the filter describe the
 	// same listing on a body that somehow carries two.
-	path, text := skillListingPath(body)
+	path, text := wire.skillListingPath(body)
 	if path == "" {
 		return body, 0, 0
 	}
@@ -478,7 +496,7 @@ func filterSkillListing(body []byte, remove []string) (out []byte, removedTokens
 		rest, tail = rest[:j], rest[j:]
 	}
 	// The prose gate, with the listing itself removed from the region it tests against.
-	prose := strings.Replace(proseRegion(body), text, "", 1)
+	prose := strings.Replace(wire.proseRegion(body), text, "", 1)
 	l := skills.Parse(rest)
 	for name := range drop {
 		if proseReferenced(prose, name) {
@@ -511,6 +529,10 @@ func filterSkillListing(body []byte, remove []string) (out []byte, removedTokens
 // overwhelming majority of requests have nothing to do here — a body with no listing must not
 // pay a walk of a multi-megabyte messages array. Only on a hit does it walk to find the path.
 func skillListingPath(body []byte) (string, string) {
+	return chatEnvelopeAdapter{}.skillListingPath(body)
+}
+
+func (chatEnvelopeAdapter) skillListingPath(body []byte) (string, string) {
 	// bytes.Contains, not strings.Contains(string(body), ...): the body runs to megabytes and the
 	// conversion would copy all of it on the request goroutine, on every request, to answer a
 	// question that is usually "no".

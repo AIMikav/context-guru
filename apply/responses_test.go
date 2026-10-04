@@ -2,6 +2,8 @@ package apply_test
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,8 @@ import (
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/components/offload"
+	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/skills"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
@@ -110,6 +114,89 @@ func TestResponsesSessionIDForMatchesBodyOpts(t *testing.T) {
 	}
 }
 
+func TestResponsesEnvelopeToolTransforms(t *testing.T) {
+	cfg := pipe(t, "pipeline: [toolschema, toolfilter]\ncomponents:\n  toolfilter: {remove: [unused, Keep]}\n")
+	p, _ := cfg.Build(nil)
+	body := []byte(`{"model":"gpt-5.6","instructions":"You may use Keep when needed.",` +
+		`"input":[{"role":"user","content":"task"}],"tools":[` +
+		`{"type":"function","name":"Keep","description":"keep","parameters":{"type":"object","title":"drop","properties":{"x":{"type":"string","title":"drop"}}}},` +
+		`{"type":"function","name":"unused","parameters":{"type":"object","title":"drop"}},` +
+		`{"type":"custom","name":"freeform","format":{"type":"text"}}]}`)
+	res := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Body: body,
+	})
+	if !res.Changed || res.FilteredDecls != 1 || res.FilteredDeclTokens == 0 {
+		t.Fatalf("transforms did not act: changed=%v decls=%d tokens=%d", res.Changed, res.FilteredDecls, res.FilteredDeclTokens)
+	}
+	if got := gjson.GetBytes(res.Body, "tools.#").Int(); got != 2 {
+		t.Fatalf("tool count = %d: %s", got, res.Body)
+	}
+	if gjson.GetBytes(res.Body, "tools.0.parameters.title").Exists() || gjson.GetBytes(res.Body, "tools.0.parameters.properties.x.title").Exists() {
+		t.Fatalf("Responses parameter annotations survived: %s", res.Body)
+	}
+	if got := gjson.GetBytes(res.Body, "tools.0.name").String(); got != "Keep" {
+		t.Fatalf("prose-described tool was removed: %s", res.Body)
+	}
+	if gjson.GetBytes(res.Body, "input").Raw != gjson.GetBytes(body, "input").Raw ||
+		gjson.GetBytes(res.Body, "instructions").Raw != gjson.GetBytes(body, "instructions").Raw {
+		t.Fatal("envelope transforms changed transcript fields")
+	}
+	second := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Body: body,
+	})
+	if string(res.Body) != string(second.Body) {
+		t.Fatal("Responses tool transform is not byte-stable")
+	}
+}
+
+func TestResponsesToolFilterKeepsForcedAndPendingCalls(t *testing.T) {
+	cfg := pipe(t, "pipeline: [toolfilter]\ncomponents:\n  toolfilter: {remove: [shell]}\n")
+	p, _ := cfg.Build(nil)
+	for _, tc := range []struct{ name, suffix string }{
+		{"forced", `,"tool_choice":{"type":"function","name":"shell"}`},
+		{"pending", `,"input":[{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}]`},
+		{"answered", `,"input":[{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.6","tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"function","name":"other","parameters":{"type":"object"}}]` + tc.suffix + `}`)
+			res := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body})
+			want := int64(2)
+			if tc.name == "answered" {
+				want = 1
+			}
+			if got := gjson.GetBytes(res.Body, "tools.#").Int(); got != want {
+				t.Fatalf("tool count = %d, want %d: %s", got, want, res.Body)
+			}
+		})
+	}
+}
+
+func TestResponsesToolFilterReadsLeadingDeveloperProse(t *testing.T) {
+	cfg := pipe(t, "pipeline: [toolfilter]\ncomponents:\n  toolfilter: {remove: [Keep, unused]}\n")
+	p, _ := cfg.Build(nil)
+	body := []byte(`{"model":"gpt-5.6","input":[{"role":"developer","content":"Keep can be used when necessary."},{"role":"user","content":"task"}],` +
+		`"tools":[{"type":"function","name":"Keep","parameters":{"type":"object"}},{"type":"function","name":"unused","parameters":{"type":"object"}}]}`)
+	res := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body})
+	if got := gjson.GetBytes(res.Body, "tools.#").Int(); got != 1 || gjson.GetBytes(res.Body, "tools.0.name").String() != "Keep" {
+		t.Fatalf("developer prose did not protect named tool: %s", res.Body)
+	}
+}
+
+func TestResponsesToolFilterRemovesSkillFromInstructions(t *testing.T) {
+	cfg := pipe(t, "pipeline: [toolfilter]\ncomponents:\n  toolfilter: {remove: [skill__unused]}\n")
+	p, _ := cfg.Build(nil)
+	instructions := "<system-reminder>\n" + skills.Header + "\n\n- unused: Old skill.\n- needed: Kept skill.\n" + skills.ReminderEnd
+	body, _ := json.Marshal(map[string]any{"model": "gpt-5.6", "instructions": instructions,
+		"input": []any{map[string]any{"role": "user", "content": "task"}}})
+	res := apply.BodyOpts(context.Background(), p, store.NewMemory(store.Options{}), apply.Opts{
+		Provider: bschemas.OpenAI, API: "responses", Body: body,
+	})
+	got := gjson.GetBytes(res.Body, "instructions").String()
+	if !res.Changed || res.FilteredDecls != 1 || strings.Contains(got, "- unused:") || !strings.Contains(got, "- needed:") {
+		t.Fatalf("Responses instruction listing not filtered safely: changed=%v decls=%d instructions=%q", res.Changed, res.FilteredDecls, got)
+	}
+}
+
 func TestResponsesSummarizeRebuildsPlainTextInput(t *testing.T) {
 	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
 	p, _ := cfg.Build(nil)
@@ -142,7 +229,25 @@ func TestResponsesSummarizeRebuildsPlainTextInput(t *testing.T) {
 	}
 }
 
-func TestResponsesSummarizeDoesNotTouchOpaqueState(t *testing.T) {
+func TestResponsesSummarizeSummaryOnlyModeRebuilds(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 1, keep_last: 1, marker_mode: summary, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+	body := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"task"},{"role":"assistant","content":"` + strings.Repeat("older context ", 50) + `"},{"role":"user","content":"question"}]}`)
+	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "facts"}}}
+	apply.BodyOpts(context.Background(), p, st, o)
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("summary did not finish")
+	}
+	res := apply.BodyOpts(context.Background(), p, st, o)
+	if !res.Changed || gjson.GetBytes(res.Body, "input.#").Int() != 3 ||
+		!strings.Contains(gjson.GetBytes(res.Body, "input.1.content").String(), expand.SummaryMarker) {
+		t.Fatalf("summary-only marker was not written: %s", res.Body)
+	}
+}
+
+func TestResponsesSummarizeDeclinesUnsupportedMultimodalHistory(t *testing.T) {
 	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
 	p, _ := cfg.Build(nil)
 	st := store.NewMemory(store.Options{})
@@ -150,7 +255,7 @@ func TestResponsesSummarizeDoesNotTouchOpaqueState(t *testing.T) {
 		`{"role":"user","content":"task"},` +
 		`{"type":"reasoning","id":"r1","encrypted_content":"opaque"},` +
 		`{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},` +
-		`{"type":"function_call_output","call_id":"c1","output":"` + strings.Repeat("tool output ", 50) + `"},` +
+		`{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"` + strings.Repeat("tool output ", 50) + `"},{"type":"input_image","image_url":"opaque"}]},` +
 		`{"role":"user","content":"question"}]}`)
 	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
 		Models: components.ModelSpec{Incoming: stubModel{resp: "facts"}}}
@@ -159,9 +264,90 @@ func TestResponsesSummarizeDoesNotTouchOpaqueState(t *testing.T) {
 		if res.Changed || string(res.Body) != string(body) {
 			t.Fatalf("turn %d changed opaque input: %s", i, res.Body)
 		}
-		if res.Run != nil && len(res.Run.Components) != 0 {
-			t.Fatalf("turn %d ran summarize despite unsafe input: %+v", i, res.Run.Components)
+		if res.Run == nil || len(res.Run.Components) != 1 || !res.Run.Components[0].Skipped || res.Run.Saved() != 0 {
+			t.Fatalf("turn %d did not safely decline summary: %+v", i, res.Run)
 		}
+	}
+}
+
+func TestResponsesSummarizeKeepsOpaqueTailVerbatim(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 5, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+	body := []byte(`{"model":"gpt-5.6","instructions":"stable","input":[` +
+		`{"role":"user","content":"task"},` +
+		`{"role":"assistant","content":"` + strings.Repeat("old answer ", 50) + `"},` +
+		`{"role":"user","content":"old follow-up"},` +
+		`{"role":"assistant","content":"latest answer"},` +
+		`{"type":"reasoning","id":"r1","encrypted_content":"opaque"},` +
+		`{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"c1","output":"tool result"},` +
+		`{"role":"user","content":"latest question"}]}`)
+	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "earlier facts"}}}
+	apply.BodyOpts(context.Background(), p, st, o)
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("background summary did not finish")
+	}
+	res := apply.BodyOpts(context.Background(), p, st, o)
+	if !res.Changed || gjson.GetBytes(res.Body, "input.#").Int() != 7 {
+		t.Fatalf("mixed-state summary did not reduce text span: body=%s report=%+v", res.Body, res.Run)
+	}
+	for outIdx, origIdx := range map[int]int{0: 0, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7} {
+		outPath, origPath := "input."+strconv.Itoa(outIdx), "input."+strconv.Itoa(origIdx)
+		if gjson.GetBytes(res.Body, outPath).Raw != gjson.GetBytes(body, origPath).Raw {
+			t.Errorf("retained item %d changed: %s", origIdx, res.Body)
+		}
+	}
+	if summary := gjson.GetBytes(res.Body, "input.1.content").String(); !strings.Contains(summary, "History Summary") || !strings.Contains(summary, "<<cg:") {
+		t.Fatalf("summary not recoverable: %q", summary)
+	}
+}
+
+func TestResponsesSummarizeStashesAndReplacesCompleteOpaqueHistory(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_first: 2, keep_last: 1, start_from_message: 0, min_tokens: 1, trigger: {min_request_frac: 0}}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+	body := []byte(`{"model":"gpt-5.6","instructions":"stable","input":[` +
+		`{"role":"user","content":"task"},` +
+		`{"role":"assistant","content":"` + strings.Repeat("old answer ", 50) + `"},` +
+		`{"type":"reasoning","id":"r1","encrypted_content":"opaque"},` +
+		`{"type":"custom_tool_call","call_id":"c1","name":"shell","input":"{}"},` +
+		`{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"first old tool result"},{"type":"input_text","text":"second old tool result"}]},` +
+		`{"role":"user","content":"old follow-up"},` +
+		`{"role":"user","content":"latest question"}]}`)
+	o := apply.Opts{Provider: bschemas.OpenAI, API: "responses", Body: body,
+		Models: components.ModelSpec{Incoming: stubModel{resp: "earlier facts"}}}
+	apply.BodyOpts(context.Background(), p, st, o)
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("background summary did not finish")
+	}
+	res := apply.BodyOpts(context.Background(), p, st, o)
+	if !res.Changed || gjson.GetBytes(res.Body, "input.#").Int() != 3 {
+		t.Fatalf("complete historical exchange did not compact: body=%s report=%+v", res.Body, res.Run)
+	}
+	if gjson.GetBytes(res.Body, "input.0").Raw != gjson.GetBytes(body, "input.0").Raw ||
+		gjson.GetBytes(res.Body, "input.2").Raw != gjson.GetBytes(body, "input.6").Raw {
+		t.Fatal("retained task or latest turn changed")
+	}
+	keys := expand.ParseMarkers(gjson.GetBytes(res.Body, "input.1.content").String())
+	if len(keys) != 1 {
+		t.Fatalf("summary has no expand key: %s", res.Body)
+	}
+	stash, ok := expand.Resolve(st, keys[0])
+	if !ok || gjson.Get(stash, "#").Int() != 5 ||
+		gjson.Get(stash, "1.encrypted_content").String() != "opaque" ||
+		gjson.Get(stash, "2.call_id").String() != "c1" {
+		t.Fatalf("opaque history not recoverable from stash: %q", stash)
+	}
+	changedOpaque := []byte(strings.Replace(string(body), `"encrypted_content":"opaque"`, `"encrypted_content":"different"`, 1))
+	o.Body = changedOpaque
+	changed := apply.BodyOpts(context.Background(), p, st, o)
+	if changed.Changed || string(changed.Body) != string(changedOpaque) {
+		t.Fatalf("changed opaque history incorrectly reused the old checkpoint: %s", changed.Body)
+	}
+	if !offload.WaitForAllSummariesForTest(5 * time.Second) {
+		t.Fatal("replacement summary did not finish")
 	}
 }
 

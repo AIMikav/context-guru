@@ -33,7 +33,6 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
-	"github.com/rossoctl/context-guru/components/reformat"
 	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/modes"
@@ -380,10 +379,6 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// taken, because `tools` may be serialized either side of `messages` and a rewrite
 	// after the fact would move every offset the writeback relies on.
 	// See components/reformat/toolschema.go for the mechanism and the break-even.
-	toolSchema := false
-	if !bypass && pipe != nil && pipe.Has("toolschema") {
-		body, toolSchema = reformat.CompactToolSchemas(body)
-	}
 	// Declaration filter: drop the tool/MCP declarations this account explicitly opted to
 	// stop carrying. Here for the same two reasons as the strip above — `tools` is a
 	// top-level field the pipeline never sees, and any rewrite of it must happen before a
@@ -396,14 +391,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// here, from the one configured list, and both report into the same two counters — the
 	// component's ledger says "declarations no longer sent", and a reader does not care which of
 	// the two shapes each one had.
-	filteredTokens, filteredDecls := 0, 0
-	if !bypass && pipe != nil {
-		if tf, ok := pipe.Find("toolfilter").(interface{ Removed() []string }); ok {
-			body, filteredTokens, filteredDecls = filterDeclarations(body, tf.Removed())
-			sBody, sTok, sN := filterSkillListing(body, tf.Removed())
-			body, filteredTokens, filteredDecls = sBody, filteredTokens+sTok, filteredDecls+sN
-		}
-	}
+	body, toolSchema, filteredTokens, filteredDecls := transformEnvelope(body, pipe, bypass, chatEnvelopeAdapter{})
 
 	// Mixed TTL: ask for the one-hour tier on the head's existing breakpoints. Here for the
 	// third time for the same reason as the two rewrites above — it edits `tools` and
@@ -711,7 +699,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
 	// retained message's ORIGINAL raw bytes (byte-lossless, incl. Anthropic
 	// tool_result) and marshaling only genuinely new messages (the summary).
-	if len(chat.Input) != len(norm) {
+	if len(chat.Input) != len(norm) || summaryStructureChanged(norm, chat.Input) {
 		nb, ok := rebuildCountChanged(body, msgs, slots, chat.Input)
 		if !ok && systemSplit {
 			res.Body, res.Changed = body, true // keep the split even when the rebuild declined

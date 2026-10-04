@@ -301,6 +301,14 @@ type Ctx struct {
 	// DisallowCountChange prevents transcript-restructuring components from
 	// running when a host cannot safely write their output back to its wire shape.
 	DisallowCountChange bool
+	// AllowSummarySpan is supplied by a wire adapter when only some normalized
+	// spans can be rebuilt without dropping opaque provider state. Nil means the
+	// ordinary Chat/Anthropic adapter has no extra restriction.
+	AllowSummarySpan func(start, end int) bool
+	// SummaryStashPayload lets an adapter preserve exact provider wire items in
+	// the expand stash when normalized ChatMessages omit opaque fields. Nil uses
+	// the ordinary normalized-message JSON payload.
+	SummaryStashPayload func(start, end int, span []schemas.ChatMessage) ([]byte, error)
 	Model               ModelSpec
 	// Bypass short-circuits the whole pipeline (x-context-guru-bypass header).
 	Bypass bool

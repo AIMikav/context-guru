@@ -60,3 +60,16 @@ verify with `gh pr view` rather than treating the helper warning alone as failur
 
 This fallback does not broaden authorization: only create branches, push commits, open issues/PRs,
 or post review replies when the user has requested those GitHub mutations.
+
+## Eval-box access from a managed Codex sandbox
+
+The `cgssh2` wrapper reaches the eval box (`contextguru2.vpc.cloud9.ibm.com`) only when the
+command runs **outside** the local filesystem/network sandbox. Inside the sandbox, SSH can fail
+with `Could not resolve hostname ...`; this is a sandbox DNS restriction, not an SSH or API-key
+failure. Do not repeatedly retry the same sandboxed command or change credentials to fix it.
+
+For an authorized eval-box task, invoke `/Users/davidamid/cgssh2 '<remote command>'` with
+`sandbox_permissions: "require_escalated"` on the command tool, and briefly explain that the
+escalation permits the known eval-box SSH connection. Request approval if prompted. Use the same
+pattern when piping only explicitly selected files to the remote worktree for testing. On that
+box, Go is available at `/usr/local/go/bin/go`. Never print or copy credentials as a workaround.

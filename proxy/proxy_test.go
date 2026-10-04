@@ -145,6 +145,36 @@ func openAIBody(msgs ...map[string]any) []byte {
 	return b
 }
 
+func TestResponsesRouteAppliesSharedEnvelopeTransforms(t *testing.T) {
+	var up upstreamCapture
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"resp_test","object":"response","output":[],"usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	h, _ := buildHandler(t, "pipeline: [toolschema, toolfilter]\ncomponents:\n  toolfilter: {remove: [unused]}\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+	body := `{"model":"gpt-5.6","instructions":"stable","input":[{"role":"user","content":"task"},{"type":"reasoning","id":"r1","encrypted_content":"opaque"}],` +
+		`"tools":[{"type":"function","name":"Keep","parameters":{"type":"object","title":"drop"}},` +
+		`{"type":"function","name":"unused","parameters":{"type":"object"}}]}`
+	resp, err := http.Post(srv.URL+"/openai/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d", resp.StatusCode)
+	}
+	got := up.last()
+	if got.path != "/v1/responses" || gjson.GetBytes(got.body, "tools.#").Int() != 1 ||
+		gjson.GetBytes(got.body, "tools.0.parameters.title").Exists() ||
+		gjson.GetBytes(got.body, "input.1").Raw != gjson.Get(body, "input.1").Raw {
+		t.Fatalf("Responses transforms or opaque pass-through failed: %s", got.String())
+	}
+}
+
 // expandableBody is a realistic post-offload request: the client declares its own tools
 // AND the transcript carries a <<cg:HASH>> marker. Both are required before the proxy
 // advertises context_guru_expand (expand.Inject under InjectAuto), and the proxy inspects

@@ -314,6 +314,24 @@ func (Summarize) Enabled(c *components.Ctx) bool {
 }
 func (*Summarize) NeedsModel() bool { return true }
 
+func summaryStashJSON(c *components.Ctx, start, end int, span []bschemas.ChatMessage) ([]byte, error) {
+	if c.SummaryStashPayload != nil {
+		return c.SummaryStashPayload(start, end, span)
+	}
+	return json.Marshal(span)
+}
+
+func summaryCoveredHash(c *components.Ctx, start, end int, span []bschemas.ChatMessage) string {
+	if c.SummaryStashPayload != nil {
+		b, err := c.SummaryStashPayload(start, end, span)
+		if err != nil {
+			return "unsafe"
+		}
+		return hashKey(string(b) + ":" + spanHash(span))
+	}
+	return spanHash(span)
+}
+
 func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input
 	// Keep msg0 (system/first) + the last keepLast; summarize the span between — with both
@@ -340,6 +358,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// turn. First thing, and unconditionally: the money was spent whatever this turn decides, and
 	// the compaction-episode panel charges it as a debit. See takeDeferredUsage.
 	takeDeferredUsage(c)
+	if end > start && c.AllowSummarySpan != nil && !c.AllowSummarySpan(start, end) {
+		rep.Gate("wire_span_unsafe")
+		rep.Skipped = true
+		return nil, nil
+	}
 
 	sized := s.trigger.Fires(req, c)
 	if !sized {
@@ -515,8 +538,10 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// response tells anyone it happened. The actual PutStash still runs in the goroutine (see
 	// commitAsyncSummary) and can still refuse if another session took the slot meanwhile — this
 	// probe removes the steady-state waste, not the race.
+	var spanJSON []byte
 	if effectiveMode(c, s.mode) == markerFull {
-		spanJSON, err := json.Marshal(span)
+		var err error
+		spanJSON, err = summaryStashJSON(c, start, end, span)
 		if err != nil {
 			return nil, err
 		}
@@ -550,7 +575,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	if c.Session == "" {
 		return s.summarizeInline(c, rep, req, msgs, model, span, headCount, start, end, stale)
 	}
-	if why := s.startAsyncSummary(c, model, span, conversationGoal(req), end-start); why != "" {
+	if why := s.startAsyncSummary(c, model, span, spanJSON, summaryCoveredHash(c, start, end, span), conversationGoal(req), end-start); why != "" {
 		// Another summary is already in flight for this session. This turn must not start a
 		// second: a session that keeps firing would otherwise queue one full-transcript model
 		// call per turn, each paying for a ~48k-token prompt, with the last writer's checkpoint
@@ -634,7 +659,7 @@ func (s *Summarize) replayStale(c *components.Ctx, rep *components.Report, req *
 	// counted as stash_missing, and the replay proceeds because the summary text must stay
 	// byte-identical to the turn that created it.
 	if cp.Key != "" {
-		if b, err := json.Marshal(msgs[start:boundary]); err == nil {
+		if b, err := summaryStashJSON(c, start, boundary, msgs[start:boundary]); err == nil {
 			commitRefresh(c, rep, markerFull, cp.Key, string(b))
 		}
 	}
@@ -728,7 +753,7 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 		return nil, nil, false, false
 	}
 	covered := msgs[start:boundary]
-	if spanHash(covered) != cp.CoveredHash {
+	if summaryCoveredHash(c, start, boundary, covered) != cp.CoveredHash {
 		// COUNTED SEPARATELY because this is the only decline an UPSTREAM COMPONENT can cause. The hash
 		// is over msgs as the rest of the pipeline left them, and `summarize` runs last, so any
 		// component mutating a message inside the checkpointed span lands here. extract_llm_sweep is the
@@ -783,7 +808,7 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 	// Refresh the stashed original span so expand keeps resolving it (full-mode
 	// checkpoints only — summary/off never stashed, so Key is empty).
 	if cp.Key != "" {
-		if b, err := json.Marshal(covered); err == nil {
+		if b, err := summaryStashJSON(c, start, boundary, covered); err == nil {
 			// A refresh of a key already present always succeeds (see store.Stasher), so a
 			// false answer here means the payload had ALREADY left the store — the marker in
 			// the replayed summary is dangling and cannot be un-dangled, because the summary

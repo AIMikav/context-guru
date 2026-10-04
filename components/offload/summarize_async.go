@@ -222,7 +222,7 @@ func (s *Summarize) summaryWait() time.Duration {
 // means the proxy is shedding compaction under load. One gate name for both would report a busy
 // deployment as a busy session.
 func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
-	span []bschemas.ChatMessage, goal string, coveredCount int) string {
+	span []bschemas.ChatMessage, spanJSON []byte, coveredHash, goal string, coveredCount int) string {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
 		return "summary_already_in_flight"
@@ -245,6 +245,7 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 		"session", c.Session, "covered_messages", coveredCount)
 	spanCopy := make([]bschemas.ChatMessage, len(span))
 	copy(spanCopy, span)
+	stashCopy := append([]byte(nil), spanJSON...)
 	// Everything the goroutine needs, read HERE while we are still on the request's goroutine.
 	//
 	// `st`, not `store`: the obvious name shadows the store PACKAGE, which this goroutine also
@@ -314,7 +315,7 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 		if strings.TrimSpace(summary) == "" {
 			return
 		}
-		s.commitAsyncSummary(mode, session, st, spanCopy, summary, coveredCount)
+		s.commitAsyncSummary(mode, session, st, spanCopy, stashCopy, coveredHash, summary, coveredCount)
 	}()
 	return ""
 }
@@ -331,13 +332,9 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 // it produces reaches the wire through the next turn's replay, which is the one place that splice
 // happens.
 func (s *Summarize) commitAsyncSummary(mode markerMode, session string, st store.Store,
-	span []bschemas.ChatMessage, summary string, coveredCount int) {
+	span []bschemas.ChatMessage, spanJSON []byte, coveredHash, summary string, coveredCount int) {
 	var key string
 	if mode == markerFull {
-		spanJSON, err := json.Marshal(span)
-		if err != nil {
-			return
-		}
 		key = hashKey(string(spanJSON))
 		if !store.PutStash(st, key, spanJSON) {
 			// No stash means the summary would be an unrecoverable drop. Refuse the whole
@@ -348,7 +345,7 @@ func (s *Summarize) commitAsyncSummary(mode markerMode, session string, st store
 	cp := sumCheckpoint{
 		SummaryMsg:   summaryWrapper(summary, key, mode),
 		CoveredCount: coveredCount,
-		CoveredHash:  spanHash(span),
+		CoveredHash:  coveredHash,
 		Key:          key,
 	}
 	if b, err := json.Marshal(cp); err == nil {
