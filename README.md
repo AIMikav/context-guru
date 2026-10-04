@@ -31,10 +31,33 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 
 Choose your setup. Each button opens only the instructions for that path.
 
-| | **Personal use** | **Enterprise use** |
-|---|:---:|:---:|
-| **Claude Code** | [![Install locally](https://img.shields.io/badge/install-locally-009688?style=for-the-badge&logo=anthropic&logoColor=white)](docs/how-to/install-plugin.md) | [![Connect to your organization](https://img.shields.io/badge/connect-organization-455A64?style=for-the-badge&logo=anthropic&logoColor=white)](docs/hosted.md#user-setup) |
-| **Codex** | [![Install locally](https://img.shields.io/badge/install-locally-009688?style=for-the-badge&logo=openai&logoColor=white)](codex-marketplace/plugins/context-guru/README.md) | [![Connect to your organization](https://img.shields.io/badge/connect-organization-455A64?style=for-the-badge&logo=openai&logoColor=white)](docs/hosted.md#user-setup) |
+<table>
+  <thead>
+    <tr>
+      <th></th>
+      <th>Personal use</th>
+      <th>Enterprise use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>Claude Code</th>
+      <td align="center">
+        <a href="docs/how-to/install-plugin.md"><img alt="Install locally" src="https://img.shields.io/badge/install-locally-009688?style=for-the-badge&amp;logo=anthropic&amp;logoColor=white"></a>
+      </td>
+      <td align="center" rowspan="2">
+        <a href="docs/hosted.md#user-setup"><img alt="Connect to your organization" src="https://img.shields.io/badge/connect-organization-455A64?style=for-the-badge&amp;logoColor=white"></a><br>
+        <sub>Claude Code or Codex</sub>
+      </td>
+    </tr>
+    <tr>
+      <th>Codex (experimental)</th>
+      <td align="center">
+        <a href="codex-marketplace/plugins/context-guru/README.md"><img alt="Install locally" src="https://img.shields.io/badge/install-locally-009688?style=for-the-badge&amp;logo=openai&amp;logoColor=white"></a>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 Codex routing and observability work today, but Responses traffic is not yet context-reduced. That
 work is tracked in [#373](https://github.com/rossoctl/context-guru/issues/373).
