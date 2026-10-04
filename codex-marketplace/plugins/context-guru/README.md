@@ -19,9 +19,10 @@ Start Codex and ask it to **set up context-guru**. The setup skill deliberately 
 codex -p context-guru
 ```
 
-Codex uses OpenAI's Responses API. The proxy natively reduces compatible `instructions` and `input`
-text and tool-output items with the deterministic `conservative` preset, while preserving opaque
-state items and Responses streaming events.
+Codex uses OpenAI's Responses API. Content reduction defaults to `off`, so requests are forwarded
+without trimming. Cache keep-alive is enabled by default: eligible OpenAI Responses sessions are
+refreshed shortly before their 30-minute cache lifetime ends. You can opt into content reduction
+separately after verifying the routed setup.
 
 The plugin requires `context-guru-proxy` on `PATH`, or a binary built at
 `bin/context-guru-proxy` in this checkout.

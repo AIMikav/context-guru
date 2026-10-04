@@ -55,8 +55,20 @@ class CodexPluginTest(unittest.TestCase):
         self.assertIn("requires_openai_auth = false", text)
         self.assertEqual(PLUGIN.profile().stat().st_mode & 0o777, 0o600)
         command = PLUGIN.proxy_command("/proxy", 8791, provider["base_url"])
-        self.assertEqual(command[3:5], ["--preset", "conservative"])
+        self.assertEqual(command[3:5], ["--config", str(PLUGIN.proxy_config())])
         self.assertEqual(command[-2:], ["--openai-upstream", "https://gateway.example.test"])
+
+    def test_proxy_config_uses_off_preset_and_cache_keepalive(self):
+        path = PLUGIN.write_proxy_config()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.read_text(),
+                         f"{PLUGIN.CONFIG_MARKER}\npreset: off\ncache:\n  keepalive: true\n")
+
+    def test_refuses_unmanaged_proxy_config(self):
+        PLUGIN.proxy_config().parent.mkdir(parents=True)
+        PLUGIN.proxy_config().write_text("preset: mine\n")
+        with self.assertRaisesRegex(RuntimeError, "unmanaged proxy config"):
+            PLUGIN.write_proxy_config()
 
     def test_reads_selected_base_provider_without_external_toml_dependency(self):
         PLUGIN.codex_home().mkdir(parents=True)
@@ -115,6 +127,7 @@ screen_reader_detection_done = true
 
     def test_reset_dry_run_changes_nothing(self):
         PLUGIN.write_profile(8791)
+        PLUGIN.write_proxy_config()
         PLUGIN.state_dir().mkdir(parents=True, exist_ok=True)
         record = PLUGIN.state_dir() / "install.json"
         record.write_text(json.dumps({"port": 8791, "pid": 999999, "binary": "/missing"}))
@@ -126,10 +139,12 @@ screen_reader_detection_done = true
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("result=planned", completed.stdout)
         self.assertTrue(PLUGIN.profile().exists())
+        self.assertTrue(PLUGIN.proxy_config().exists())
         self.assertTrue(record.exists())
 
     def test_reset_backup_is_private(self):
         PLUGIN.write_profile(8791, {"experimental_bearer_token": "secret"})
+        PLUGIN.write_proxy_config()
         completed = subprocess.run(
             ["sh", str(Path(__file__).with_name("reset.sh")), "--yes"],
             env=os.environ.copy(), text=True, capture_output=True,
@@ -138,6 +153,7 @@ screen_reader_detection_done = true
         backups = list((PLUGIN.state_dir() / "recovery").iterdir())
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertFalse(PLUGIN.proxy_config().exists())
 
     def test_explicit_update_sets_upgrade_gate(self):
         args = type("Args", (), {"check": False, "install": True})()

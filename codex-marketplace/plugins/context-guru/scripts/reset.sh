@@ -17,13 +17,18 @@ CODEX_DIR=${CODEX_HOME:-"$HOME/.codex"}
 STATE_BASE=${XDG_STATE_HOME:-"$HOME/.local/state"}
 STATE_DIR="$STATE_BASE/context-guru-codex"
 PROFILE="$CODEX_DIR/context-guru.config.toml"
+PROXY_CONFIG="$STATE_DIR/proxy.yaml"
 RECORD="$STATE_DIR/install.json"
 MARKER='# Managed by the context-guru Codex plugin.'
 
 owned=0
 if [ -f "$PROFILE" ] && [ "$(sed -n '1p' "$PROFILE")" = "$MARKER" ]; then owned=1; fi
+config_owned=0
+if [ -f "$PROXY_CONFIG" ] && [ "$(sed -n '1p' "$PROXY_CONFIG")" = "$MARKER" ]; then config_owned=1; fi
 echo "profile=$PROFILE"
 echo "profile_owned=$owned"
+echo "proxy_config=$PROXY_CONFIG"
+echo "proxy_config_owned=$config_owned"
 [ -f "$RECORD" ] && echo "record=$RECORD" || echo "record=(none)"
 
 if [ "$DRY" = 1 ]; then echo "result=planned"; exit 0; fi
@@ -40,6 +45,10 @@ if [ "$owned" = 1 ]; then
   chmod 600 "$STATE_DIR/recovery/context-guru.config.toml.$stamp"
   rm "$PROFILE"
   echo "profile_removed=true"
+fi
+if [ "$config_owned" = 1 ]; then
+  rm "$PROXY_CONFIG"
+  echo "proxy_config_removed=true"
 fi
 
 # Read only integer PID and path-shaped binary fields; never eval record content.

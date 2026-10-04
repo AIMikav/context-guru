@@ -14,6 +14,7 @@ import time
 import urllib.request
 
 MARKER = "# Managed by the context-guru Codex plugin."
+CONFIG_MARKER = "# Managed by the context-guru Codex plugin."
 
 
 def codex_home():
@@ -27,6 +28,10 @@ def state_dir():
 
 def profile():
     return codex_home() / "context-guru.config.toml"
+
+
+def proxy_config():
+    return state_dir() / "proxy.yaml"
 
 
 def facts(**values):
@@ -85,6 +90,23 @@ def install_escape_hatch():
     return target
 
 
+def write_proxy_config():
+    path = proxy_config()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not path.read_text().startswith(CONFIG_MARKER):
+        raise RuntimeError(f"refusing to overwrite unmanaged proxy config: {path}")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        f"{CONFIG_MARKER}\n"
+        "preset: off\n"
+        "cache:\n"
+        "  keepalive: true\n"
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+    return path
+
+
 def start_proxy(executable, port, upstream=None):
     root = state_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -105,7 +127,7 @@ def start_proxy(executable, port, upstream=None):
 
 def proxy_command(executable, port, upstream=None):
     root = state_dir()
-    command = [executable, "--listen", f"127.0.0.1:{port}", "--preset", "conservative",
+    command = [executable, "--listen", f"127.0.0.1:{port}", "--config", str(proxy_config()),
                "--dashboard", "--dashboard-db", str(root / "dashboard.db")]
     if upstream:
         command.extend(["--openai-upstream", upstream.rstrip("/")])
@@ -188,6 +210,11 @@ def setup(_args):
         facts(result="profile_conflict", profile=path, detail="refusing to overwrite unmanaged profile")
         return 2
     provider = base_provider()
+    try:
+        write_proxy_config()
+    except Exception as error:
+        facts(result="config_conflict", config=proxy_config(), detail=error)
+        return 2
     existing = read_record()
     port = int(existing.get("port", 0))
     if port and healthy(port):
@@ -339,6 +366,9 @@ def uninstall(args):
         facts(process="not_owned")
     if owned:
         path.unlink()
+    config = proxy_config()
+    if config.exists() and config.read_text().startswith(CONFIG_MARKER):
+        config.unlink()
     install = state_dir() / "install.json"
     if install.exists() and process_result != "not_owned":
         install.unlink()
