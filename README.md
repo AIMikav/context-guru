@@ -27,6 +27,18 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 <img src="docs/img/context_guru_stats_sqaure.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
 </p>
 
+## Demo
+
+<p align="center">
+<a href="https://rossoctl.github.io/context-guru/video/demo.mp4">
+<video src="https://rossoctl.github.io/context-guru/video/demo.mp4" width="720" controls muted playsinline></video>
+</a>
+</p>
+
+<p align="center">
+<sub>Video not playing? <a href="https://rossoctl.github.io/context-guru/video/demo.mp4">watch it directly</a>.</sub>
+</p>
+
 ## Install
 
 Choose your setup. Each button opens only the instructions for that path.
