@@ -1,6 +1,6 @@
 # context-guru for Codex
 
-This is the Codex plugin bundle for context-guru. It installs a dedicated Codex profile, starts a
+This is the Codex plugin bundle for context-guru. It routes ordinary Codex sessions through a
 loopback proxy, exposes health and statistics skills, and can remove only the state it owns.
 
 Register the GitHub marketplace and install the plugin:
@@ -10,12 +10,15 @@ codex plugin marketplace add rossoctl/context-guru
 codex plugin add context-guru@context-guru
 ```
 
-Start Codex and ask it to **set up context-guru**. The setup skill deliberately does not edit
-`~/.codex/config.toml`. After setup, start a routed session with:
+Start Codex and invoke the setup skill:
 
-```sh
-codex -p context-guru
+```text
+$context-guru-setup
 ```
+
+Setup asks before routing model traffic, preserves the currently selected provider as the proxy's
+upstream, and updates `~/.codex/config.toml`. The change takes effect in the next session; after
+that, start Codex normally with `codex`.
 
 Codex uses OpenAI's Responses API. Content reduction defaults to `off`, so requests are forwarded
 without trimming. Cache keep-alive is enabled by default: eligible OpenAI Responses sessions are
@@ -29,6 +32,6 @@ or newer.
 
 Setup copies a standalone recovery command to
 `~/.local/state/context-guru-codex/context-guru-reset`. Use it from an ordinary, unrouted shell if
-the proxy is down and the routed profile cannot start Codex. It backs up and removes only the
-marked profile, and signals only the recorded process whose command still names the recorded
-binary.
+the proxy is down and Codex cannot start. It restores the previous default provider, removes only
+the marked provider block, and signals only the recorded process whose command still names the
+recorded binary.

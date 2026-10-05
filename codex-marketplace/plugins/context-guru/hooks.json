@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./scripts/codex_plugin.py serve",
-            "async": true,
+            "command": "python3 ./scripts/codex_plugin.py ensure",
+            "async": false,
             "timeout": 30
           }
         ]

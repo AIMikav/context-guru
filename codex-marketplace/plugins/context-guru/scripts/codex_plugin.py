@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and operate context-guru's isolated Codex profile."""
+"""Install and operate context-guru's default Codex routing."""
 
 import argparse
 import hashlib
@@ -18,6 +18,10 @@ import tempfile
 import time
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config_route import install as install_default_route
+from config_route import is_routed, restore as restore_default_route
+
 MARKER = "# Managed by the context-guru Codex plugin."
 CONFIG_MARKER = "# Managed by the context-guru Codex plugin."
 RELEASE_REPO = "rossoctl/context-guru"
@@ -35,6 +39,14 @@ def state_dir():
 
 def profile():
     return codex_home() / "context-guru.config.toml"
+
+
+def main_config():
+    return codex_home() / "config.toml"
+
+
+def routing_state():
+    return state_dir() / "routing.json"
 
 
 def proxy_config():
@@ -178,6 +190,9 @@ def install_escape_hatch():
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
     target.chmod(0o700)
+    helper = state_dir() / "config_route.py"
+    shutil.copyfile(Path(__file__).with_name("config_route.py"), helper)
+    helper.chmod(0o700)
     return target
 
 
@@ -268,33 +283,15 @@ def base_provider():
     return provider
 
 
-def write_profile(port, provider=None):
-    path = profile()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    provider = provider or {}
-    auth = provider.get("experimental_bearer_token")
-    auth_line = f"experimental_bearer_token = {json.dumps(auth)}\n" if auth else ""
-    body = f'''{MARKER}
-model_provider = "context-guru"
-
-[model_providers.context-guru]
-name = "context-guru (local)"
-base_url = "http://127.0.0.1:{port}/openai/v1"
-wire_api = "responses"
-requires_openai_auth = {str(bool(provider.get("requires_openai_auth", True))).lower()}
-{auth_line}'''
-    if path.exists() and not path.read_text().startswith(MARKER):
-        raise RuntimeError(f"refusing to overwrite unmanaged profile: {path}")
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(body)
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
-
-
-def setup(_args):
-    path = profile()
-    if path.exists() and not path.read_text().startswith(MARKER):
-        facts(result="profile_conflict", profile=path, detail="refusing to overwrite unmanaged profile")
+def setup(args):
+    if args.plan:
+        facts(result="planned", scope="user", config=main_config(),
+              reset=state_dir() / "context-guru-reset",
+              consent_question="Route every new Codex session on this machine through a local "
+                               "context-guru proxy, with cache keep-alive using your own quota?")
+        return 0
+    if not args.i_consent_to_traffic_interception:
+        facts(result="refused", reason="consent_required")
         return 2
     try:
         write_proxy_config()
@@ -309,14 +306,26 @@ def setup(_args):
         except Exception as error:
             facts(result="binary_install_failed", detail=error)
             return 2
-    provider = base_provider()
     existing = read_record()
+    provider = existing.get("provider") if is_routed(main_config()) else None
+    if not isinstance(provider, dict):
+        provider = base_provider()
     port = int(existing.get("port", 0))
     if port and healthy(port):
-        write_profile(port, provider)
-        reset = install_escape_hatch()
-        facts(result="already_running", port=port, profile=profile(), reset=reset,
-              launch="codex -p context-guru")
+        try:
+            install_default_route(main_config(), routing_state(), port, provider)
+            reset = install_escape_hatch()
+        except Exception as error:
+            facts(result="setup_failed", detail=error)
+            return 1
+        existing.update(config=str(main_config()), provider=provider,
+                        upstream=provider.get("base_url"))
+        (state_dir() / "install.json").write_text(json.dumps(existing, indent=2) + "\n")
+        old_profile = profile()
+        if old_profile.exists() and old_profile.read_text().startswith(MARKER):
+            old_profile.unlink()
+        facts(result="already_running", port=port, config=main_config(), reset=reset,
+              launch="codex")
         return 0
     port = first_free_port()
     root = state_dir()
@@ -327,17 +336,19 @@ def setup(_args):
         facts(result="start_failed", log=root / "proxy.log")
         return 1
     try:
-        write_profile(port, provider)
+        install_default_route(main_config(), routing_state(), port, provider)
         reset = install_escape_hatch()
     except Exception as error:
         process.terminate()
         facts(result="setup_failed", detail=error)
         return 1
+    old_profile = profile()
+    if old_profile.exists() and old_profile.read_text().startswith(MARKER):
+        old_profile.unlink()
     record = {"port": port, "pid": process.pid, "binary": executable,
-              "profile": str(profile()), "upstream": upstream}
+              "config": str(main_config()), "upstream": upstream, "provider": provider}
     (root / "install.json").write_text(json.dumps(record, indent=2) + "\n")
-    facts(result="installed", port=port, profile=profile(), reset=reset,
-          launch="codex -p context-guru")
+    facts(result="installed", port=port, config=main_config(), reset=reset, launch="codex")
     return 0
 
 
@@ -345,7 +356,7 @@ def ensure(_args):
     record = read_record()
     port = int(record.get("port", 0))
     executable = record.get("binary")
-    if not port or not executable or not profile().exists():
+    if not port or not executable or not is_routed(main_config()):
         return 0
     if healthy(port):
         return 0
@@ -364,7 +375,7 @@ def serve(_args):
     record = read_record()
     port = int(record.get("port", 0))
     executable = record.get("binary")
-    if not port or not executable or not profile().exists() or healthy(port):
+    if not port or not executable or not is_routed(main_config()) or healthy(port):
         return 0
     record["pid"] = os.getpid()
     (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -380,9 +391,9 @@ def status(_args):
     record = read_record()
     port = int(record.get("port", 0))
     up = bool(port and healthy(port))
-    configured = profile().exists() and profile().read_text().startswith(MARKER)
-    values = {"result": "ok" if up and configured else "not_ready", "profile": profile(),
-              "profile_configured": str(configured).lower(), "port": port or "(none)",
+    configured = is_routed(main_config())
+    values = {"result": "ok" if up and configured else "not_ready", "config": main_config(),
+              "default_routing_configured": str(configured).lower(), "port": port or "(none)",
               "proxy_up": str(up).lower(), "session_routed": "unknown"}
     if up:
         try:
@@ -457,16 +468,18 @@ def update(args):
 
 def uninstall(args):
     record = read_record()
-    path = profile()
-    owned = path.exists() and path.read_text().startswith(MARKER)
-    facts(result="planned" if args.dry_run else "removing", profile=path,
-          profile_owned=str(owned).lower(), pid=record.get("pid", "(none)"))
+    routed = is_routed(main_config())
+    facts(result="planned" if args.dry_run else "removing", config=main_config(),
+          default_routing_configured=str(routed).lower(), pid=record.get("pid", "(none)"))
     if args.dry_run:
         return 0
     process_result = stop_owned(record)
     if process_result == "not_owned":
         facts(process="not_owned")
-    if owned:
+    restore_result = restore_default_route(routing_state())
+    facts(config_restore=restore_result)
+    path = profile()
+    if path.exists() and path.read_text().startswith(MARKER):
         path.unlink()
     config = proxy_config()
     if config.exists() and config.read_text().startswith(CONFIG_MARKER):
@@ -481,7 +494,9 @@ def uninstall(args):
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("setup")
+    install = commands.add_parser("setup")
+    install.add_argument("--plan", action="store_true")
+    install.add_argument("--i-consent-to-traffic-interception", action="store_true")
     commands.add_parser("status")
     commands.add_parser("ensure")
     commands.add_parser("serve")
