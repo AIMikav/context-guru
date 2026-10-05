@@ -46,6 +46,9 @@ class InsightsTest(unittest.TestCase):
             result = INSIGHTS.report()
         self.assertEqual({f["id"] for f in result["findings"]},
                          {"measured-net-savings", "keepalive-net"})
+        net = next(f for f in result["findings"] if f["id"] == "measured-net-savings")
+        self.assertEqual(net["severity"], "ok")
+        self.assertEqual(net["fix"], "none")
 
     def test_focused_capabilities_report_is_deterministic(self):
         responses = {

@@ -49,7 +49,8 @@ def report(area="all"):
     if total is not None and area in ("all", "components"):
         findings.append(finding("measured-net-savings", "ok" if total >= 0 else "high",
                                 "Measured net context-guru value",
-                                "Run $context-guru-preset-picker.", usd=total,
+                                ("none" if total >= 0 else
+                                 "Run $context-guru-preset-picker."), usd=total,
                                 basis="measured over the retained window"))
     keepalive = number(savings.get("keepalive_net_usd"))
     if keepalive is None:
@@ -69,9 +70,6 @@ def report(area="all"):
                                 "Tokens removed by configured components", "none",
                                 tokens=saved_tokens,
                                 basis="measured in tokens; unpriced, so no dollar figure"))
-    severity = {"high": 0, "warning": 1, "ok": 2, "info": 3}
-    findings.sort(key=lambda row: (severity[row["severity"]],
-                                   -abs(row.get("usd", 0)), row["id"]))
     if area in ("all", "components"):
         for name, values in (stats.get("components") or {}).items():
             if not isinstance(values, dict):
@@ -100,6 +98,7 @@ def report(area="all"):
                     f"unused-capability-{name}", "warning", f"{name} was declared but never used",
                     row.get("fix") or "Disable this capability in its owning configuration.",
                     basis="measured size of the problem, NOT a projected saving"))
+    severity = {"high": 0, "warning": 1, "ok": 2, "info": 3}
     findings.sort(key=lambda row: (severity[row["severity"]],
                                    -abs(row.get("usd", 0)), row["id"]))
     return {"result": "ok", "area": area, "requests": stats.get("requests"),

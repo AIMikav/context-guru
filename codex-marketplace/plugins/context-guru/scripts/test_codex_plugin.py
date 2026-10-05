@@ -17,11 +17,12 @@ SPEC.loader.exec_module(PLUGIN)
 
 
 class CodexPluginTest(unittest.TestCase):
-    def test_session_start_hook_is_async(self):
+    def test_session_start_hook_uses_plugin_root_and_is_synchronous(self):
         hooks_path = MODULE_PATH.parent.parent / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
         handler = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        self.assertEqual(handler["command"], "python3 ./scripts/codex_plugin.py ensure")
+        self.assertEqual(handler["command"],
+                         'python3 "${PLUGIN_ROOT}/scripts/codex_plugin.py" ensure')
         self.assertIs(handler["async"], False)
 
     def setUp(self):
