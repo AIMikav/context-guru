@@ -118,6 +118,11 @@ proxy binary, which the update command above already covers. To refresh the plug
 |---|---|
 | `/plugin marketplace update rossoctl/context-guru`<br>`/reload-plugins` | `codex plugin marketplace upgrade context-guru`<br>Then restart Codex. |
 
+Codex remembers the sparse paths from marketplace registration and reuses them during upgrade;
+the `upgrade` command does not take separate `--sparse` flags. For an older registration that was
+created without sparse paths and now times out, follow the one-time re-registration steps in the
+[Codex troubleshooting guide](codex-marketplace/plugins/context-guru/README.md#operations-and-troubleshooting).
+
 More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#upgrading).
 
 ## Troubleshooting
