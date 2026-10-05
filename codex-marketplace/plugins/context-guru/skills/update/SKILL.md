@@ -7,9 +7,13 @@ description: Check for and install a newer context-guru proxy binary. Use when t
 
 Run `python3 ../../scripts/codex_plugin.py update --check` from this skill directory first. This is
 read-only and reports the installed and latest versions. If the check fails, say the version is
-unknown rather than claiming it is current.
+unknown rather than claiming it is current. If it fails because the command sandbox blocks the
+release-network request, retry the same read-only check with
+`sandbox_permissions="require_escalated"` and explain why.
 
 Only after the user explicitly asks to install the update, run
 `python3 ../../scripts/codex_plugin.py update --install`. This downloads and checksum-verifies the
 release using the shared installer, then safely restarts only the recorded context-guru process.
-Report the installer's result verbatim when it refuses or fails.
+Run installation with `sandbox_permissions="require_escalated"`, explaining that it downloads and
+writes the binary and restarts the local proxy. Report the installer's result verbatim when it
+refuses or fails.

@@ -63,6 +63,11 @@ recorded binary.
 | Remove routing from a healthy session | `$context-guru-uninstall` |
 | Recover when routed sessions cannot run | `~/.local/state/context-guru-codex/context-guru-reset` |
 
+Codex may ask permission when these skills need to access the local proxy, write configuration or
+state under your home directory, download an update, or restart the proxy. A sandboxed command can
+be blocked from `127.0.0.1` even when the proxy is healthy; status and insights therefore retry
+their read-only health checks with permission instead of reporting a false outage.
+
 The uninstall skill and recovery script restore the provider that was selected before setup. They
 do not remove the Codex plugin registration. To remove that too, from an ordinary shell:
 

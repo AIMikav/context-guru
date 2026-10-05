@@ -25,6 +25,18 @@ class CodexPluginTest(unittest.TestCase):
                          'python3 "${PLUGIN_ROOT}/scripts/codex_plugin.py" ensure')
         self.assertIs(handler["async"], False)
 
+    def test_skills_cover_sandbox_boundaries(self):
+        skills = MODULE_PATH.parent.parent / "skills"
+        for name in ("status", "insights", "insights-capabilities",
+                     "insights-components", "insights-idle"):
+            text = (skills / name / "SKILL.md").read_text()
+            self.assertIn('sandbox_permissions="require_escalated"', text, name)
+            self.assertIn("unverified", text, name)
+        for name in ("setup", "preset-picker", "cache-strategy-picker",
+                     "update", "uninstall"):
+            text = (skills / name / "SKILL.md").read_text()
+            self.assertIn('sandbox_permissions="require_escalated"', text, name)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
