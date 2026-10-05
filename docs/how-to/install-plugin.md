@@ -88,6 +88,10 @@ figures on `/context-guru:status` and the dashboard are list-price estimates. Do
 installer add `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; that's what would move you onto metered
 billing, and it won't do it on its own.
 
+Re-verifying this claim after a change needs an isolated subscription login, not the operator's
+real one — see
+[Test the proxy against a subscription, in an isolated sandbox](test-subscription-sandbox.md).
+
 ## What gets installed where
 
 | Thing | Scope | How often |
