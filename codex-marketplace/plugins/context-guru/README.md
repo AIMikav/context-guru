@@ -31,7 +31,8 @@ that, start Codex normally with `codex`.
 
 The proxy runs as a user service—`systemd --user` on Linux or a LaunchAgent on macOS—rather than as
 a child of a Codex command. This lets it survive command-sandbox teardown and restart independently
-after a failure or login.
+after a failure or login. Proxy lifecycle does not depend on a `SessionStart` hook because Codex
+hooks cannot request the permissions needed to escape their command sandbox.
 
 Codex uses OpenAI's Responses API. Content reduction defaults to `off`, so requests are forwarded
 without trimming. Cache keep-alive is enabled by default: eligible OpenAI Responses sessions are

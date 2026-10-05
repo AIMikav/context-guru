@@ -18,13 +18,10 @@ SPEC.loader.exec_module(PLUGIN)
 
 
 class CodexPluginTest(unittest.TestCase):
-    def test_session_start_hook_uses_plugin_root_and_is_synchronous(self):
+    def test_proxy_lifecycle_does_not_depend_on_a_sandboxed_session_hook(self):
         hooks_path = MODULE_PATH.parent.parent / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
-        handler = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        self.assertEqual(handler["command"],
-                         'python3 "${PLUGIN_ROOT}/scripts/codex_plugin.py" ensure')
-        self.assertIs(handler["async"], False)
+        self.assertEqual(hooks, {"hooks": {}})
 
     def test_skills_cover_sandbox_boundaries(self):
         skills = MODULE_PATH.parent.parent / "skills"
