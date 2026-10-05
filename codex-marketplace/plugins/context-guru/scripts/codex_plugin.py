@@ -204,6 +204,12 @@ def install_escape_hatch():
     helper = state_dir() / "config_route.py"
     shutil.copyfile(Path(__file__).with_name("config_route.py"), helper)
     helper.chmod(0o700)
+    controller = state_dir() / "codex_plugin.py"
+    shutil.copyfile(Path(__file__), controller)
+    controller.chmod(0o700)
+    updater = state_dir() / "context-guru-update"
+    shutil.copyfile(Path(__file__).with_name("update.sh"), updater)
+    updater.chmod(0o700)
     return target
 
 
