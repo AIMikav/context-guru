@@ -6,6 +6,12 @@
 
 **Provider-agnostic context engineering for LLM agents.**
 
+<p align="center">
+<a href="https://rossoctl.github.io/context-guru/video/demo.mp4">
+<video src="https://rossoctl.github.io/context-guru/video/demo.mp4" width="720" controls muted playsinline></video>
+</a>
+</p>
+
 [![Docs](https://img.shields.io/badge/docs-online-009688.svg)](https://rossoctl.github.io/context-guru/)
 [![Go Reference](https://img.shields.io/badge/pkg.go.dev-reference-007d9c.svg)](https://pkg.go.dev/github.com/rossoctl/context-guru)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -25,18 +31,6 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 
 <p align="center">
 <img src="docs/img/context_guru_stats_sqaure.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
-</p>
-
-## Demo
-
-<p align="center">
-<a href="https://rossoctl.github.io/context-guru/video/demo.mp4">
-<video src="https://rossoctl.github.io/context-guru/video/demo.mp4" width="720" controls muted playsinline></video>
-</a>
-</p>
-
-<p align="center">
-<sub>Video not playing? <a href="https://rossoctl.github.io/context-guru/video/demo.mp4">watch it directly</a>.</sub>
 </p>
 
 ## Install
