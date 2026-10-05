@@ -6,13 +6,13 @@ loopback proxy, exposes health and statistics skills, and can remove only the st
 Register the GitHub marketplace and install the plugin:
 
 ```sh
-codex plugin marketplace add rossoctl/context-guru
+codex plugin marketplace add rossoctl/context-guru --sparse .agents --sparse codex-marketplace
 codex plugin add context-guru@context-guru
 ```
 
-The first command clones and registers the GitHub marketplace. On the first run it can take a
-minute or more, depending on GitHub/network speed and local disk performance, and may be quiet
-while it downloads. Let it finish before running the second command.
+The sparse paths keep Codex from cloning the monorepo's unrelated source and history. Without them,
+the marketplace clone can exceed Codex's 30-second timeout. Let the first command finish before
+running the second command.
 
 Run marketplace registration from an ordinary shell. You can install the plugin afterward either
 with the second command above or from `/plugins` inside Codex. Asking an existing Codex session to
@@ -99,6 +99,11 @@ To refresh the plugin code without removing it:
 ```sh
 codex plugin marketplace upgrade context-guru
 ```
+
+Registrations created with the sparse install command retain those paths during upgrades. If an
+older, non-sparse registration times out while upgrading, use the two removal commands above, then
+repeat the sparse marketplace and plugin install commands at the top of this page. This changes the
+plugin registration only; it does not remove the existing proxy routing or state.
 
 Restart Codex after installing or refreshing plugin code. Routing or proxy changes made by setup
 take effect for model traffic in the next Codex process.
