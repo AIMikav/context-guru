@@ -64,19 +64,24 @@ that predate user-service supervision retain the guarded recorded-process cleanu
 | Task | Command |
 |---|---|
 | Check routing and proxy health | `$context-guru-status` |
-| Update the proxy binary | `$context-guru-update` |
+| Check for a proxy update | `$context-guru-update` |
+| Install a proxy update | `~/.local/state/context-guru-codex/context-guru-update` from an ordinary shell |
 | Plan removal and show instructions | `$context-guru-uninstall` |
 | Remove routing and stop the proxy | `~/.local/state/context-guru-codex/context-guru-reset --yes` from an ordinary shell |
+
+Proxy updates are not automatic on Codex. Run `$context-guru-update` periodically to check. When
+an update is available, exit Codex and run the standalone updater shown above; then start a new
+session. Updating the Codex plugin bundle is separate and uses the marketplace command below.
 
 Codex may ask permission when these skills need to access the local proxy, write configuration or
 state under your home directory, download an update, or restart the proxy. A sandboxed command can
 be blocked from `127.0.0.1` even when the proxy is healthy; status and insights therefore retry
 their read-only health checks with permission instead of reporting a false outage.
 
-Do not perform removal from a routed Codex session. Codex selects its transport when the session
-starts; stopping the proxy strands that session and it cannot recover even after routing is
-restored. `$context-guru-uninstall` therefore performs only a dry-run and directs you to the
-standalone command above. Exit Codex, run it, then start a new session.
+Do not perform proxy update or removal from a routed Codex session. Codex selects its transport
+when the session starts, so lifecycle operations on that proxy belong in an ordinary shell.
+`$context-guru-update` and `$context-guru-uninstall` therefore check or plan only and direct you to
+the corresponding standalone command. Exit Codex, run it, then start a new session.
 
 The uninstall skill and recovery script restore the provider that was selected before setup. They
 do not remove the Codex plugin registration. To remove that too, from an ordinary shell:

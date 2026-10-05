@@ -33,6 +33,11 @@ class CodexPluginTest(unittest.TestCase):
         for name in ("setup", "preset-picker", "cache-strategy-picker", "update"):
             text = (skills / name / "SKILL.md").read_text()
             self.assertIn('sandbox_permissions="require_escalated"', text, name)
+        update = (skills / "update" / "SKILL.md").read_text()
+        self.assertIn("does not run this check automatically", update)
+        self.assertIn("periodically", update)
+        self.assertIn("Do not install the update from inside Codex", update)
+        self.assertIn("context-guru-update", update)
         uninstall = (skills / "uninstall" / "SKILL.md").read_text()
         self.assertIn("Do not run the mutating uninstall command from inside Codex", uninstall)
         self.assertIn("context-guru-reset --yes", uninstall)
@@ -197,6 +202,8 @@ screen_reader_detection_done = true
         self.assertTrue(os.access(target, os.X_OK))
         self.assertIn("Managed by the context-guru Codex plugin", target.read_text())
         self.assertTrue((PLUGIN.state_dir() / "config_route.py").is_file())
+        self.assertTrue(os.access(PLUGIN.state_dir() / "context-guru-update", os.X_OK))
+        self.assertTrue(os.access(PLUGIN.state_dir() / "codex_plugin.py", os.X_OK))
 
     def test_default_route_preserves_and_restores_original_provider(self):
         path = PLUGIN.main_config()
