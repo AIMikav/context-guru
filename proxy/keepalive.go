@@ -16,7 +16,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
-	"github.com/rossoctl/context-guru/dash"
+	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/rossoctl/context-guru/tenant"
@@ -234,6 +234,12 @@ type kaEntry struct {
 	// the masked body below, and for the same reason: the entry exists exactly between one request
 	// and the next, which is when the ping fires.
 	st store.Store
+	// emitter is this tenant's components.Emitter, captured at record time off tn.Pipe the same
+	// way st is captured off tn.Store — so record1 can report a ping without reaching into a
+	// concrete sink (dash) itself. See components.KeepAliveEmitter and issue #382. NopEmitter
+	// (never nil) when the tenant has no pipeline, which type-asserts to nothing and makes
+	// reporting a no-op rather than a panic.
+	emitter components.Emitter
 	// body is the bytes last sent upstream, held MASKED under the same per-process key as the
 	// credential (see credMask). A keeper-owned copy, so it can be overwritten on release
 	// without corrupting a slice something else still reads.
@@ -685,6 +691,7 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 	hdr, auth := pingHeaders(r, up)
 	e := &kaEntry{
 		tenant: tn.ID, session: session, startedAt: startedAt, body: owned, up: up, st: tn.Store,
+		emitter:  tn.Pipe.Emitter(),
 		provider: provider, model: model, route: route, preset: tn.Preset,
 		agent: r.UserAgent(), pol: pol, prefix: prefix, stopReason: u.StopReason,
 		pingUSD: k.projectedPingUSD(model, prefix, route),
@@ -866,7 +873,7 @@ func (k *keeper) sweep(now time.Time) int {
 		raw := append([]byte(nil), e.body...)
 		xorMask(raw)
 		due = append(due, pingJob{e: e, raw: raw, hdr: e.hdr.Clone(), auth: auth, up: e.up,
-			tenant: e.tenant, session: e.session, st: e.st, ping: e.pings})
+			tenant: e.tenant, session: e.session, st: e.st, emitter: e.emitter, ping: e.pings})
 	}
 	k.mu.Unlock()
 
@@ -893,8 +900,11 @@ type pingJob struct {
 	tenant, session string
 	// st is the tenant's store, copied here for the same reason everything else is: the job runs
 	// on its own goroutine and must hold a copy rather than a pointer into keeper state.
-	st   store.Store
-	ping int
+	st store.Store
+	// emitter is e.emitter, copied out under the keeper's lock for the same reason st is: the
+	// job runs on its own goroutine and must hold a copy rather than reach back into the entry.
+	emitter components.Emitter
+	ping    int
 }
 
 // fire sends one ping and accounts for it. Always fails open and quietly: the agent is not
@@ -970,13 +980,21 @@ func (k *keeper) markStopped(e *kaEntry) {
 	e.stopped = true
 }
 
-// record1 books one ping: the session's running spend, the process counter, and the
-// dashboard row. Returns the ping's cost.
+// record1 books one ping: the session's running spend, the process counter, and whatever
+// audit row the host's Emitter chooses to keep. Returns the ping's cost.
 //
 // The row is the whole reason this is shippable. It carries the ping's own tokens and cost,
 // marked keepalive, attributed to the tenant and the session — so the money this mechanism
 // spends is visible in the same ledger as the money it saves, and an account can see it
 // without being told.
+//
+// This function used to build a dash.Event and call k.h.rec.Record(ev) directly — the one
+// piece of host-specific machinery wired into the keeper itself (issue #382). It now computes
+// the ping's own cost (the figure its OWN bookkeeping needs: e.spent, k.spentUSD, the debug
+// log line in fire) without any sink's help, and separately reports a components.KeepAliveReport
+// through j.emitter for whichever sink the host configured — cmd/context-guru-proxy wires a
+// dashEmitter that writes the identical dash.Event this used to build inline.
+//
 // startedAt is when THIS ping's request began, not when it completed. The provider's cache lifetime
 // runs from request start, which is the same anchor kaEntry.startedAt uses and for the same reason.
 func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt time.Time) float64 {
@@ -993,26 +1011,6 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt t
 	if p := k.h.opts.Prices; p != nil && model != "" {
 		price, priced = p.Price(context.Background(), model)
 	}
-	ev := &dash.Event{
-		TS: k.now().UnixMilli(), TenantID: j.tenant, Model: model,
-		Provider: string(provider), Route: route, Preset: preset,
-		Status: status, KeepAlive: true,
-		// Which manager-controlled strategy resolved this PING's policy, "" when none did
-		// — tagged on the ping's own row, never on the real request it later rescues, since
-		// only the ping's policy resolution ever consults the strategy list.
-		KeepAliveStrategyID: appliedStrategy,
-	}
-	ev.SessionID = j.session
-	ev.Agent = dash.AgentFor(agent)
-	ev.FreshInput, ev.CacheRead = u.FreshInput, u.CacheRead
-	ev.CacheWrite, ev.OutputTokens = u.CacheWrite, u.Output
-	ev.CacheWrite1h = u.CacheWrite1h
-	ev.StopReason = u.StopReason
-	ev.UpstreamMs = ms
-	// What the ping actually asked for, so the row says it rather than reading as a request
-	// with no output budget. The audit trail is the reason these rows exist; a column that is
-	// blank because nobody filled it in is the same defect at a smaller scale.
-	ev.MaxTokens = pingOutputBudget(route)
 	// A ping is not agent traffic, so it gets no cache-miss attribution and never touches
 	// the session-recency map: doing so would re-date the session and make the NEXT real
 	// request's gap read as four minutes instead of the twenty it actually was, hiding the
@@ -1046,8 +1044,14 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt t
 	if status >= 200 && status < 300 && u.CacheRead > 0 {
 		apply.RecordCacheTouch(j.st, j.tenant, j.raw, provider, startedAt.UnixMilli())
 	}
-	ev.Price(price, priced && (u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0))
-	cost := ev.CostUSD
+	// The same gate dash.Event.Price used to apply before pricing anything: no cost without a
+	// usable rate, and no cost claimed for a ping whose usage reported nothing at all.
+	var cost float64
+	if priced && !price.Zero() && (u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
+		// See modelinfo.Price.CostWithCacheWrite1h for the one-hour write premium this folds
+		// in — the same helper dash.Event.Price uses, so the two cannot drift apart again.
+		cost = price.CostWithCacheWrite1h(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output, u.CacheWrite1h)
+	}
 	k.mu.Lock()
 	e.spent += cost
 	e.refreshed = u.CacheRead
@@ -1058,8 +1062,23 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt t
 			break
 		}
 	}
-	if k.h.rec != nil {
-		k.h.rec.Record(ev)
+	if ka, ok := j.emitter.(components.KeepAliveEmitter); ok {
+		ka.KeepAlivePing(components.KeepAliveReport{
+			Tenant: j.tenant, Session: j.session, Model: model, Provider: string(provider),
+			Route: route, Pings: j.ping, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite,
+			Output: u.Output, CostUSD: cost, Status: status, DurationMs: ms,
+			TS: k.now().UnixMilli(), Agent: agent, Preset: preset, StopReason: u.StopReason,
+			// Which manager-controlled strategy resolved this PING's policy, "" when none did
+			// — tagged on the ping's own row, never on the real request it later rescues, since
+			// only the ping's policy resolution ever consults the strategy list.
+			Strategy:   appliedStrategy,
+			FreshInput: u.FreshInput, CacheWrite1h: u.CacheWrite1h,
+			// What the ping actually asked for, so the row says it rather than reading as a
+			// request with no output budget. The audit trail is the reason these rows exist; a
+			// column that is blank because nobody filled it in is the same defect at a smaller
+			// scale.
+			MaxTokens: pingOutputBudget(route),
+		})
 	}
 	return cost
 }

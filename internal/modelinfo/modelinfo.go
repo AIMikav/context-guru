@@ -85,6 +85,28 @@ func (p Price) Cost(fresh, cacheRead, cacheWrite, output int64) float64 {
 		float64(cacheWrite)*p.CacheWrite + float64(output)*p.Output
 }
 
+// CostWithCacheWrite1h is Cost plus the one-hour cache-write premium.
+//
+// Cost knows a single write rate — the 5-minute one, at roughly 1.25x base input — so tokens
+// the provider billed at the 1-hour tier (2.0x) are short by the difference. Derived from the
+// documented multiplier rather than from a second configured rate, because no gateway
+// publishes one: 2.0x input, minus whatever the 5m write rate is, on exactly the tokens the
+// response says were written at 1h.
+//
+// Hoisted here so dash's Event.Price and the host-level keep-alive mechanism's own cost
+// bookkeeping (proxy/keepalive.go's record1) price the SAME request shape identically instead
+// of each inlining this formula — the two had drifted apart once already (see issue #382's
+// review) when the keep-alive mechanism was decoupled from dash's event type.
+func (p Price) CostWithCacheWrite1h(fresh, cacheRead, cacheWrite, output, cacheWrite1h int64) float64 {
+	cost := p.Cost(fresh, cacheRead, cacheWrite, output)
+	if cacheWrite1h > 0 {
+		if premium := 2*p.Input - p.CacheWrite; premium > 0 {
+			cost += float64(cacheWrite1h) * premium
+		}
+	}
+	return cost
+}
+
 // Zero reports whether no rate at all is known (so a cost figure would be a lie).
 func (p Price) Zero() bool {
 	return p.Input == 0 && p.Output == 0 && p.CacheRead == 0 && p.CacheWrite == 0

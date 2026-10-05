@@ -28,6 +28,18 @@ func NewPipeline(comps []Component, e Emitter) *Pipeline {
 	return &Pipeline{comps: comps, emitter: e}
 }
 
+// Emitter returns the pipeline's configured Emitter, so a caller that needs an optional
+// capability on it (e.g. KeepAliveEmitter) has one path to reach it instead of threading a
+// second field through every place a Pipeline is built. Nil-safe: a nil *Pipeline (a
+// Tenancy built with none, or one from before a pipeline exists) reports NopEmitter, so a
+// caller's type assertion simply finds nothing rather than panicking.
+func (p *Pipeline) Emitter() Emitter {
+	if p == nil {
+		return NopEmitter{}
+	}
+	return p.emitter
+}
+
 // Names returns the component names in pipeline order, which is what makes an EMPTY pipeline
 // reportable. Without it a caller can only see the per-component stats, and a pipeline configured
 // with no components is indistinguishable there from one whose components all ran and did nothing:
