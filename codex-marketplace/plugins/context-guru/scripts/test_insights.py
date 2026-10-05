@@ -61,6 +61,11 @@ class InsightsTest(unittest.TestCase):
                          ["unused-capability-unused"])
         self.assertEqual(result["findings"][0]["fix"], "Disable unused.")
 
+    def test_null_capabilities_are_an_empty_measurement_not_a_crash(self):
+        responses = {"/api/stats": {"requests": 0}, "/api/tools": {"tools": None}}
+        with mock.patch.object(INSIGHTS, "get", side_effect=lambda _port, path: responses[path]):
+            self.assertEqual(INSIGHTS.report("capabilities")["findings"], [])
+
     def test_focused_component_report_uses_measured_tokens(self):
         stats = {"requests": 3, "components": {
             "dedup": {"saved_tokens_unique": 42},

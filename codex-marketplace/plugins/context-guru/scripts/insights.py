@@ -89,7 +89,7 @@ def report(area="all"):
         except Exception:
             capabilities = None
         rows = capabilities if isinstance(capabilities, list) else (
-            capabilities.get("tools", []) if isinstance(capabilities, dict) else [])
+            capabilities.get("tools") or [] if isinstance(capabilities, dict) else [])
         for row in rows:
             if not isinstance(row, dict):
                 continue
