@@ -27,44 +27,37 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 <img src="docs/img/context_guru_stats_sqaure.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
 </p>
 
-## Install (Claude Code plugin)
+## Install
 
-```
-/plugin marketplace add rossoctl/context-guru
-/plugin install context-guru@context-guru
-/reload-plugins     # REQUIRED — next lines else answer "Unknown command"
-/permissions        # add a new rule → paste the line below → Project settings (local)
-Bash(/Users/{you}/.claude/plugins/cache/context-guru/**)
-/context-guru:install
-```
+Choose your setup. Each button opens only the instructions for that path.
 
-<!-- If you want to install it for your entire org instead of one machine, follow the proxy
-     installation guide: docs/setup.md -->
-
-Check what it's saving:
-
-```
-/context-guru:status
-```
-
-It reports the preset and cache strategy running, and the dollars saved so far — keep-alive
-savings, any content-trimming savings, and the net. Want the raw numbers instead of the reading of
-them? `/context-guru:status --stats` prints the `/stats` endpoint verbatim.
-
-If you want to also carry less, not just pay less, opt into content trimming:
-
-```
-/context-guru:preset-picker   # → conservative, the safe first step into trimming
-```
-
-### Status line
-
-A terminal status line is installed **on by default** alongside the plugin. Run this command to turn it off/on:
-```
-/context-guru:statusline off/on
-```
-More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md), or ask
-`/context-guru:statusline` to enable an extra segment or turn it back on.
+<table>
+  <thead>
+    <tr>
+      <th></th>
+      <th>Personal use</th>
+      <th>Enterprise use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>Claude Code</th>
+      <td align="center">
+        <a href="docs/how-to/install-plugin.md"><img alt="Install locally" src="https://img.shields.io/badge/install-locally-009688?style=for-the-badge&amp;logo=anthropic&amp;logoColor=white"></a>
+      </td>
+      <td align="center" rowspan="2">
+        <a href="docs/hosted.md#user-setup"><img alt="Connect to your organization" src="https://img.shields.io/badge/connect-organization-455A64?style=for-the-badge&amp;logoColor=white"></a><br>
+        <sub>Claude Code or Codex</sub>
+      </td>
+    </tr>
+    <tr>
+      <th>Codex (experimental)</th>
+      <td align="center">
+        <a href="codex-marketplace/plugins/context-guru/README.md"><img alt="Install locally" src="https://img.shields.io/badge/install-locally-009688?style=for-the-badge&amp;logo=openai&amp;logoColor=white"></a>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Presets
 
