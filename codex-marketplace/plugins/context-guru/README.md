@@ -25,6 +25,12 @@ without trimming. Cache keep-alive is enabled by default: eligible OpenAI Respon
 refreshed shortly before their 30-minute cache lifetime ends. You can opt into content reduction
 separately after verifying the routed setup.
 
+Use `$context-guru-preset-picker` to inspect or change the reduction level, and
+`$context-guru-cache-strategy-picker` to inspect or change OpenAI cache keep-alive. Both preserve
+the other setting and restart the owned proxy. `$context-guru-insights` produces a deterministic,
+ranked report from measured proxy data; its cost arithmetic and exact fix commands come from code,
+not model estimation.
+
 During setup, the plugin downloads the latest `context-guru-proxy` release for the current platform,
 verifies it against the release's SHA-256 checksums, and installs it into its private state directory.
 An existing `context-guru-proxy` on `PATH` is reused instead. Codex requires proxy release v0.4.0

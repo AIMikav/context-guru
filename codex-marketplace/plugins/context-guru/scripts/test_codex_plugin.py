@@ -251,6 +251,46 @@ screen_reader_detection_done = true
                                side_effect=RuntimeError("download failed")):
             self.assertEqual(PLUGIN.update(args), 1)
 
+    def test_configure_preset_preserves_cache_and_restarts(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("off", False)
+        args = type("Args", (), {"show": False, "preset": "high", "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy", return_value=True) as restart:
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.read_proxy_options(), ("high", False))
+        restart.assert_called_once()
+
+    def test_configure_cache_preserves_preset(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("medium", False)
+        args = type("Args", (), {"show": False, "preset": None,
+                                  "cache_strategy": "30-min-ping"})()
+        with mock.patch.object(PLUGIN, "restart_proxy", return_value=True):
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.read_proxy_options(), ("medium", True))
+
+    def test_configure_refuses_unmanaged_options(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.proxy_config().write_text("preset: mine\n")
+        args = type("Args", (), {"show": False, "preset": "off", "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy") as restart:
+            self.assertEqual(PLUGIN.configure(args), 2)
+        restart.assert_not_called()
+
+    def test_configure_show_is_read_only(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("xhigh", True)
+        before = PLUGIN.proxy_config().read_bytes()
+        args = type("Args", (), {"show": True, "preset": None, "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy") as restart:
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.proxy_config().read_bytes(), before)
+        restart.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

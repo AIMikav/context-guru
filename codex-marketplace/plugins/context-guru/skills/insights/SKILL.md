@@ -5,7 +5,7 @@ description: Analyze measured context, token, prompt-cache, idle-time, and tool 
 
 # Analyze Codex context cost
 
-Run `python3 ../../scripts/codex_plugin.py status` first. Stop with its setup or proxy-down diagnosis
-when unhealthy. Summarize the returned statistics, keeping measured cost, projections, intervals,
-and unpriced tokens distinct. Never add unlike figures. On a subscription plan, describe dollar
-values as estimated usage-limit value rather than a lower bill.
+Run `python3 ../../scripts/insights.py`. Report its ranked findings in order and preserve every
+measurement label and fix command exactly. The script—not the model—does the arithmetic and sorting.
+Stop on `not_installed` or `proxy_unavailable`. On a subscription plan, describe dollar values as
+estimated usage-limit value rather than a lower bill.

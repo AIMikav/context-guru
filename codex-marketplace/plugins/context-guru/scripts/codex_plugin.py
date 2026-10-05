@@ -213,6 +213,84 @@ def write_proxy_config():
     return path
 
 
+def read_proxy_options():
+    preset, keepalive = "off", True
+    try:
+        lines = proxy_config().read_text().splitlines()
+    except OSError:
+        return preset, keepalive
+    in_cache = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("preset:"):
+            preset = stripped.split(":", 1)[1].strip()
+        elif stripped == "cache:":
+            in_cache = True
+        elif line and not line.startswith((" ", "\t", "#")):
+            in_cache = False
+        elif in_cache and stripped.startswith("keepalive:"):
+            keepalive = stripped.split(":", 1)[1].strip().lower() == "true"
+    return preset, keepalive
+
+
+def save_proxy_options(preset, keepalive):
+    if preset not in {"off", "conservative", "medium", "high", "xhigh"}:
+        raise RuntimeError(f"unknown preset: {preset}")
+    path = proxy_config()
+    if path.exists() and not path.read_text().startswith(CONFIG_MARKER):
+        raise RuntimeError(f"refusing to overwrite unmanaged proxy config: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(f"{CONFIG_MARKER}\npreset: {preset}\ncache:\n"
+                         f"  keepalive: {str(keepalive).lower()}\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def restart_proxy(record):
+    port, executable = int(record.get("port", 0)), record.get("binary")
+    if not port or not executable:
+        return False
+    stopped = stop_owned(record)
+    if stopped == "not_owned":
+        return False
+    for _ in range(20):
+        if not healthy(port):
+            break
+        time.sleep(0.1)
+    process = start_proxy(executable, port, record.get("upstream"))
+    if process is None:
+        return False
+    record["pid"] = process.pid
+    (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
+    return True
+
+
+def configure(args):
+    if not routing_state().exists():
+        facts(result="not_installed")
+        return 2
+    preset, keepalive = read_proxy_options()
+    if args.show:
+        facts(result="ok", preset=preset,
+              cache_strategy="30-min-ping" if keepalive else "none")
+        return 0
+    if args.preset:
+        preset = args.preset
+    if args.cache_strategy:
+        keepalive = args.cache_strategy == "30-min-ping"
+    try:
+        save_proxy_options(preset, keepalive)
+    except Exception as error:
+        facts(result="refused", detail=error)
+        return 2
+    restarted = restart_proxy(read_record())
+    facts(result="configured", preset=preset,
+          cache_strategy="30-min-ping" if keepalive else "none",
+          proxy_restarted=str(restarted).lower())
+    return 0 if restarted else 1
+
+
 def start_proxy(executable, port, upstream=None):
     root = state_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -506,9 +584,13 @@ def main():
     mode.add_argument("--install", action="store_true")
     remove = commands.add_parser("uninstall")
     remove.add_argument("--dry-run", action="store_true")
+    settings = commands.add_parser("configure")
+    settings.add_argument("--show", action="store_true")
+    settings.add_argument("--preset", choices=("off", "conservative", "medium", "high", "xhigh"))
+    settings.add_argument("--cache-strategy", choices=("none", "30-min-ping"))
     args = parser.parse_args()
     return {"setup": setup, "status": status, "ensure": ensure, "serve": serve,
-            "update": update, "uninstall": uninstall}[args.command](args)
+            "update": update, "uninstall": uninstall, "configure": configure}[args.command](args)
 
 
 if __name__ == "__main__":
