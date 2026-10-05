@@ -479,6 +479,13 @@ type SessionRow struct {
 	Start           int64   `json:"start"`
 	End             int64   `json:"end"`
 	Models          string  `json:"models"`
+	// PrimaryModel is the single model that did the most output work in this session —
+	// the model with the highest summed output_tokens for this session_id — not just
+	// whichever string GROUP_CONCAT(DISTINCT ...) happened to list first. A session
+	// mixes the caller's main-agent model with the client's own small/fast-model
+	// housekeeping calls (e.g. title generation), and those are indistinguishable in
+	// the schema except by the volume of work each one did.
+	PrimaryModel    string  `json:"primary_model"`
 	Providers       string  `json:"providers"`
 	Agents          string  `json:"agents"`
 	Presets         string  `json:"presets"`
@@ -540,6 +547,11 @@ func (d *DB) Sessions(f Filter, limit, offset int) ([]*SessionRow, int64, error)
 	q := `SELECT r.session_id, GROUP_CONCAT(DISTINCT r.tenant_id), COUNT(*), MIN(r.ts), MAX(r.ts),
 		GROUP_CONCAT(DISTINCT r.model), GROUP_CONCAT(DISTINCT r.provider),
 		GROUP_CONCAT(DISTINCT r.agent), GROUP_CONCAT(DISTINCT r.preset),
+		-- The model with the most output_tokens for this session, picked by the same
+		-- correlated subquery pattern as pingsBySession's second query, but cheap enough
+		-- (one session's own rows) to inline rather than join.
+		(SELECT r2.model FROM requests r2 WHERE r2.session_id = r.session_id
+			GROUP BY r2.model ORDER BY SUM(r2.output_tokens) DESC, r2.model LIMIT 1),
 		SUM(r.tokens_before), SUM(r.tokens_after), SUM(r.saved_unique),
 		SUM(r.attempted_tokens), SUM(r.frozen_tokens),
 		SUM(r.cache_read), SUM(r.cache_write), SUM(r.output_tokens), SUM(r.fresh_input),
@@ -562,9 +574,9 @@ func (d *DB) Sessions(f Filter, limit, offset int) ([]*SessionRow, int64, error)
 	now := time.Now().UnixMilli()
 	for rows.Next() {
 		var s SessionRow
-		var models, providers, agents, presets, tenant sql.NullString
+		var models, providers, agents, presets, tenant, primaryModel sql.NullString
 		if err := rows.Scan(&s.SessionID, &tenant, &s.Turns, &s.Start, &s.End,
-			&models, &providers, &agents, &presets,
+			&models, &providers, &agents, &presets, &primaryModel,
 			&s.TokensBefore, &s.TokensAfter, &s.SavedUnique,
 			&s.AttemptedTokens, &s.FrozenTokens,
 			&s.CacheRead, &s.CacheWrite, &s.OutputTokens, &s.FreshInput,
@@ -575,6 +587,7 @@ func (d *DB) Sessions(f Filter, limit, offset int) ([]*SessionRow, int64, error)
 		}
 		s.TenantID = tenant.String
 		s.Models, s.Providers, s.Agents, s.Presets = models.String, providers.String, agents.String, presets.String
+		s.PrimaryModel = primaryModel.String
 		s.Saved = s.TokensBefore - s.TokensAfter
 		s.SavedUSD = s.BaselineCostUSD - s.CostUSD - s.CGLLMCostUSD
 		s.InFlight = now-s.End < cacheTTLMs

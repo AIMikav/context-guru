@@ -3535,7 +3535,7 @@ async function loadSessions() {
             }, 'in flight')
             : null),
         wide ? el('td', {}, el('span', { class: 'trunc', title: s.tenant_id, text: s.tenant_id || '—' })) : null,
-        el('td', { text: firstOf(s.models) }),
+        el('td', { title: s.models || '', text: s.primary_model || firstOf(s.models) }),
         el('td', { text: firstOf(s.agents) }),
         el('td', { text: firstOf(s.presets) }),
         el('td', { class: 'num', text: num(s.turns) }),

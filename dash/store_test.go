@@ -643,6 +643,35 @@ func TestSessionsAggregate(t *testing.T) {
 	}
 }
 
+// TestSessionsPrimaryModelPicksHighestOutputTokens pins the fix for issue #385: a session
+// mixes the caller's main-agent model with the client's own small/fast-model housekeeping
+// calls, and GROUP_CONCAT(DISTINCT model) alone has no notion of which one is "the" model —
+// PrimaryModel must pick the one that did the most output work, not an arbitrary member of
+// the distinct set.
+func TestSessionsPrimaryModelPicksHighestOutputTokens(t *testing.T) {
+	db := openTestDB(t)
+	housekeeping := mkEvent(1000, "sess-1", "claude-haiku-4-5", 100, 100)
+	housekeeping.OutputTokens = 20
+	mainTurn := mkEvent(2000, "sess-1", "claude-sonnet-5", 1000, 900)
+	mainTurn.OutputTokens = 500
+	if err := db.insertBatch([]*Event{housekeeping, mainTurn}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := db.Sessions(Filter{}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("sessions = %d rows; want 1", len(rows))
+	}
+	if rows[0].PrimaryModel != "claude-sonnet-5" {
+		t.Errorf("PrimaryModel = %q; want claude-sonnet-5 (the model with the most output_tokens)", rows[0].PrimaryModel)
+	}
+	if rows[0].Models != "claude-haiku-4-5,claude-sonnet-5" && rows[0].Models != "claude-sonnet-5,claude-haiku-4-5" {
+		t.Errorf("Models = %q; want both models still listed", rows[0].Models)
+	}
+}
+
 func TestPercentileExact(t *testing.T) {
 	db := openTestDB(t)
 	var evs []*Event
