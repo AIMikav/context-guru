@@ -31,6 +31,9 @@ the other setting and restart the owned proxy. `$context-guru-insights` produces
 ranked report from measured proxy data; its cost arithmetic and exact fix commands come from code,
 not model estimation.
 
+For a narrower report, use `$context-guru-insights-capabilities`,
+`$context-guru-insights-components`, or `$context-guru-insights-idle`.
+
 During setup, the plugin downloads the latest `context-guru-proxy` release for the current platform,
 verifies it against the release's SHA-256 checksums, and installs it into its private state directory.
 An existing `context-guru-proxy` on `PATH` is reused instead. Codex requires proxy release v0.4.0

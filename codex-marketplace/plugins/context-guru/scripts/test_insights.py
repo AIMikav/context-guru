@@ -47,6 +47,30 @@ class InsightsTest(unittest.TestCase):
         self.assertEqual({f["id"] for f in result["findings"]},
                          {"measured-net-savings", "keepalive-net"})
 
+    def test_focused_capabilities_report_is_deterministic(self):
+        responses = {
+            "/api/stats": {"requests": 3},
+            "/api/tools": {"tools": [
+                {"name": "used", "calls": 2},
+                {"name": "unused", "calls": 0, "fix": "Disable unused."},
+            ]},
+        }
+        with mock.patch.object(INSIGHTS, "get", side_effect=lambda _port, path: responses[path]):
+            result = INSIGHTS.report("capabilities")
+        self.assertEqual([f["id"] for f in result["findings"]],
+                         ["unused-capability-unused"])
+        self.assertEqual(result["findings"][0]["fix"], "Disable unused.")
+
+    def test_focused_component_report_uses_measured_tokens(self):
+        stats = {"requests": 3, "components": {
+            "dedup": {"saved_tokens_unique": 42},
+            "unknown": {"saved_tokens": "missing"},
+        }}
+        with mock.patch.object(INSIGHTS, "get", return_value=stats):
+            result = INSIGHTS.report("components")
+        self.assertEqual([f["id"] for f in result["findings"]], ["component-dedup"])
+        self.assertEqual(result["findings"][0]["tokens"], 42)
+
 
 if __name__ == "__main__":
     unittest.main()
