@@ -483,7 +483,8 @@ def setup(args):
         install_default_route(main_config(), routing_state(), port, provider)
         reset = install_escape_hatch()
     except Exception as error:
-        process.terminate()
+        stop_owned({"service": "systemd" if platform.system() == "Linux" else "launchd",
+                    "pid": process.pid, "binary": executable})
         facts(result="setup_failed", detail=error)
         return 1
     old_profile = profile()

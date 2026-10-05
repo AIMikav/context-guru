@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tarfile
 import tempfile
@@ -104,6 +105,20 @@ class CodexPluginTest(unittest.TestCase):
         self.assertFalse(unit.exists())
         self.assertIn(["systemctl", "--user", "disable", "--now", unit.name],
                       [call.args[0] for call in run.call_args_list])
+
+    def test_macos_proxy_is_started_by_launch_agent(self):
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Darwin"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.subprocess, "Popen") as popen, \
+             mock.patch.object(PLUGIN, "healthy", return_value=True):
+            process = PLUGIN.start_proxy("/opt/context guru/proxy", 8791)
+        self.assertEqual(process.pid, 0)
+        popen.assert_not_called()
+        with open(PLUGIN.launchd_plist(), "rb") as handle:
+            data = plistlib.load(handle)
+        self.assertEqual(data["ProgramArguments"][0], "/opt/context guru/proxy")
+        self.assertTrue(data["KeepAlive"])
+        self.assertIn("bootstrap", [part for call in run.call_args_list for part in call.args[0]])
 
     def test_refuses_unmanaged_proxy_config(self):
         PLUGIN.proxy_config().parent.mkdir(parents=True)

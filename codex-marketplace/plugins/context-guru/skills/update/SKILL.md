@@ -13,7 +13,7 @@ release-network request, retry the same read-only check with
 
 Only after the user explicitly asks to install the update, run
 `python3 ../../scripts/codex_plugin.py update --install`. This downloads and checksum-verifies the
-release using the shared installer, then safely restarts only the recorded context-guru process.
+release using the shared installer, then safely restarts only context-guru's owned user service.
 Run installation with `sandbox_permissions="require_escalated"`, explaining that it downloads and
 writes the binary and restarts the local proxy. Report the installer's result verbatim when it
 refuses or fails.
