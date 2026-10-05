@@ -1,8 +1,11 @@
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -95,6 +98,20 @@ screen_reader_detection_done = true
         with self.assertRaisesRegex(RuntimeError, "unmanaged profile"):
             PLUGIN.write_profile(8791)
 
+    def test_setup_bootstraps_release_when_binary_is_missing(self):
+        args = type("Args", (), {})()
+        process = mock.Mock(pid=4321)
+        with mock.patch.object(PLUGIN, "find_binary", return_value=None), \
+             mock.patch.object(PLUGIN, "install_release_binary",
+                               return_value=("/managed/context-guru-proxy", "v1.2.3")) as install, \
+             mock.patch.object(PLUGIN, "first_free_port", return_value=8791), \
+             mock.patch.object(PLUGIN, "start_proxy", return_value=process), \
+             mock.patch.object(PLUGIN, "install_escape_hatch", return_value=Path("/reset")):
+            self.assertEqual(PLUGIN.setup(args), 0)
+        install.assert_called_once_with()
+        record = json.loads((PLUGIN.state_dir() / "install.json").read_text())
+        self.assertEqual(record["binary"], "/managed/context-guru-proxy")
+
     def test_uninstall_keeps_unmanaged_profile_and_unowned_process(self):
         PLUGIN.profile().parent.mkdir(parents=True)
         PLUGIN.profile().write_text("model = 'mine'\n")
@@ -116,14 +133,51 @@ screen_reader_detection_done = true
         self.assertTrue(os.access(target, os.X_OK))
         self.assertIn("Managed by the context-guru Codex plugin", target.read_text())
 
+    def test_release_binary_is_checksum_verified_and_installed_privately(self):
+        payload = b"released proxy"
+        archive_buffer = io.BytesIO()
+        with tarfile.open(fileobj=archive_buffer, mode="w:gz") as bundle:
+            info = tarfile.TarInfo("context-guru_1.2.3_linux_amd64/context-guru-proxy")
+            info.size = len(payload)
+            bundle.addfile(info, io.BytesIO(payload))
+        archive = archive_buffer.getvalue()
+        checksum = hashlib.sha256(archive).hexdigest()
+
+        def fake_fetch(url):
+            if url.endswith("checksums.txt"):
+                return f"{checksum}  context-guru_1.2.3_linux_amd64.tar.gz\n".encode()
+            return archive
+
+        with mock.patch.object(PLUGIN, "release_platform", return_value=("linux", "amd64")), \
+             mock.patch.object(PLUGIN, "fetch", side_effect=fake_fetch):
+            path, version = PLUGIN.install_release_binary("v1.2.3")
+        self.assertEqual(version, "v1.2.3")
+        self.assertEqual(Path(path), PLUGIN.managed_binary().resolve())
+        self.assertEqual(PLUGIN.managed_binary().read_bytes(), payload)
+        self.assertTrue(os.access(path, os.X_OK))
+        with mock.patch.object(PLUGIN.shutil, "which", return_value=None):
+            self.assertEqual(PLUGIN.find_binary(), path)
+
+    def test_release_binary_rejects_checksum_mismatch(self):
+        with mock.patch.object(PLUGIN, "release_platform", return_value=("linux", "amd64")), \
+             mock.patch.object(PLUGIN, "fetch", side_effect=[b"archive", b"0" * 64 + b"  context-guru_1.2.3_linux_amd64.tar.gz\n"]):
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                PLUGIN.install_release_binary("v1.2.3")
+        self.assertFalse(PLUGIN.managed_binary().exists())
+
+    def test_release_binary_rejects_pre_codex_release(self):
+        with mock.patch.object(PLUGIN, "fetch") as fetch:
+            with self.assertRaisesRegex(RuntimeError, "predates Codex Responses support"):
+                PLUGIN.install_release_binary("v0.3.4")
+        fetch.assert_not_called()
+
     def test_update_check_is_read_only(self):
         args = type("Args", (), {"check": True, "install": False})()
-        completed = mock.Mock(returncode=0, stdout="update_available=false\n", stderr="")
-        with mock.patch.object(PLUGIN, "shared_installer", return_value=Path(__file__)), \
-             mock.patch.object(PLUGIN.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(PLUGIN, "latest_release_tag", return_value="v1.2.3"), \
+             mock.patch.object(PLUGIN, "find_binary", return_value=None), \
+             mock.patch.object(PLUGIN, "install_release_binary") as install:
             self.assertEqual(PLUGIN.update(args), 0)
-        self.assertEqual(run.call_args.args[0][-1], "--check-latest")
-        self.assertNotIn("CONTEXT_GURU_UPGRADE", run.call_args.kwargs["env"])
+        install.assert_not_called()
 
     def test_reset_dry_run_changes_nothing(self):
         PLUGIN.write_profile(8791)
@@ -157,11 +211,11 @@ screen_reader_detection_done = true
 
     def test_explicit_update_sets_upgrade_gate(self):
         args = type("Args", (), {"check": False, "install": True})()
-        completed = mock.Mock(returncode=1, stdout="result=error\n", stderr="")
-        with mock.patch.object(PLUGIN, "shared_installer", return_value=Path(__file__)), \
-             mock.patch.object(PLUGIN.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(PLUGIN, "latest_release_tag", return_value="v1.2.3"), \
+             mock.patch.object(PLUGIN, "find_binary", return_value=None), \
+             mock.patch.object(PLUGIN, "install_release_binary",
+                               side_effect=RuntimeError("download failed")):
             self.assertEqual(PLUGIN.update(args), 1)
-        self.assertEqual(run.call_args.kwargs["env"]["CONTEXT_GURU_UPGRADE"], "1")
 
 
 if __name__ == "__main__":

@@ -2,19 +2,26 @@
 """Install and operate context-guru's isolated Codex profile."""
 
 import argparse
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.request
 
 MARKER = "# Managed by the context-guru Codex plugin."
 CONFIG_MARKER = "# Managed by the context-guru Codex plugin."
+RELEASE_REPO = "rossoctl/context-guru"
+MINIMUM_CODEX_RELEASE = (0, 4, 0)
 
 
 def codex_home():
@@ -32,6 +39,10 @@ def profile():
 
 def proxy_config():
     return state_dir() / "proxy.yaml"
+
+
+def managed_binary():
+    return state_dir() / "bin/context-guru-proxy"
 
 
 def facts(**values):
@@ -71,14 +82,94 @@ def find_binary():
     found = shutil.which(os.environ.get("CONTEXT_GURU_BIN", "context-guru-proxy"))
     if found:
         return str(Path(found).resolve())
+    if managed_binary().is_file() and os.access(managed_binary(), os.X_OK):
+        return str(managed_binary().resolve())
     candidate = Path(__file__).resolve().parents[4] / "bin/context-guru-proxy"
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     return None
 
 
-def shared_installer():
-    return Path(__file__).resolve().parents[4] / "context-guru-plugin/scripts/install.sh"
+def release_platform():
+    systems = {"Darwin": "darwin", "Linux": "linux"}
+    machines = {"x86_64": "amd64", "AMD64": "amd64",
+                "arm64": "arm64", "aarch64": "arm64"}
+    try:
+        return systems[platform.system()], machines[platform.machine()]
+    except KeyError as error:
+        raise RuntimeError(f"unsupported release platform: {platform.system()}/{platform.machine()}") from error
+
+
+def latest_release_tag():
+    request = urllib.request.Request(
+        f"https://github.com/{RELEASE_REPO}/releases/latest", method="HEAD")
+    with urllib.request.urlopen(request, timeout=15) as response:
+        tag = response.geturl().rstrip("/").rsplit("/", 1)[-1]
+    if not tag or tag == "latest":
+        raise RuntimeError("could not resolve the latest context-guru release")
+    return tag
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return response.read()
+
+
+def release_version(tag):
+    value = tag.removeprefix("v").split("-", 1)[0]
+    try:
+        parts = tuple(int(part) for part in value.split("."))
+    except ValueError as error:
+        raise RuntimeError(f"unrecognized context-guru release tag: {tag}") from error
+    if len(parts) != 3:
+        raise RuntimeError(f"unrecognized context-guru release tag: {tag}")
+    return parts
+
+
+def install_release_binary(version=None):
+    version = version or os.environ.get("CONTEXT_GURU_VERSION") or latest_release_tag()
+    if release_version(version) < MINIMUM_CODEX_RELEASE:
+        raise RuntimeError(
+            f"release {version} predates Codex Responses support; v0.4.0 or newer is required")
+    os_name, arch = release_platform()
+    number = version.removeprefix("v")
+    archive_name = f"context-guru_{number}_{os_name}_{arch}.tar.gz"
+    base = f"https://github.com/{RELEASE_REPO}/releases/download/{version}"
+    archive = fetch(f"{base}/{archive_name}")
+    checksums = fetch(f"{base}/checksums.txt").decode("utf-8")
+    expected = None
+    for line in checksums.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[-1].lstrip("*") == archive_name:
+            expected = fields[0].lower()
+            break
+    if not expected:
+        raise RuntimeError(f"release checksum does not list {archive_name}")
+    actual = hashlib.sha256(archive).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"release checksum mismatch for {archive_name}")
+
+    destination = managed_binary()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+        matches = [member for member in bundle.getmembers()
+                   if member.isfile() and Path(member.name).name == "context-guru-proxy"]
+        if len(matches) != 1:
+            raise RuntimeError("release archive does not contain exactly one context-guru-proxy")
+        source = bundle.extractfile(matches[0])
+        if source is None:
+            raise RuntimeError("could not read context-guru-proxy from release archive")
+        fd, temporary_name = tempfile.mkstemp(prefix="context-guru-proxy.",
+                                               dir=destination.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                shutil.copyfileobj(source, output)
+            temporary.chmod(0o755)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return str(destination.resolve()), version
 
 
 def install_escape_hatch():
@@ -201,20 +292,24 @@ requires_openai_auth = {str(bool(provider.get("requires_openai_auth", True))).lo
 
 
 def setup(_args):
-    executable = find_binary()
-    if not executable:
-        facts(result="missing_binary", detail="install context-guru-proxy on PATH or run make build")
-        return 2
     path = profile()
     if path.exists() and not path.read_text().startswith(MARKER):
         facts(result="profile_conflict", profile=path, detail="refusing to overwrite unmanaged profile")
         return 2
-    provider = base_provider()
     try:
         write_proxy_config()
     except Exception as error:
         facts(result="config_conflict", config=proxy_config(), detail=error)
         return 2
+    executable = find_binary()
+    if not executable:
+        try:
+            executable, version = install_release_binary()
+            facts(binary="installed", binary_version=version, binary_path=executable)
+        except Exception as error:
+            facts(result="binary_install_failed", detail=error)
+            return 2
+    provider = base_provider()
     existing = read_record()
     port = int(existing.get("port", 0))
     if port and healthy(port):
@@ -308,6 +403,8 @@ def stop_owned(record):
             ["ps", "-p", str(pid), "-o", "command="], text=True).strip()
     except subprocess.CalledProcessError:
         return "gone"
+    except OSError:
+        return "not_owned"
     expected = record.get("binary", "")
     if not expected or not command.startswith(expected + " "):
         return "not_owned"
@@ -319,27 +416,32 @@ def stop_owned(record):
 
 
 def update(args):
-    installer = shared_installer()
-    if not installer.is_file():
-        facts(result="error", reason="shared_installer_missing", path=installer)
+    try:
+        latest = latest_release_tag()
+    except Exception as error:
+        facts(result="error", reason="release_check_failed", detail=error)
         return 1
-    command = [str(installer), "--check-latest"] if args.check else [str(installer)]
-    env = os.environ.copy()
-    if args.install:
-        env["CONTEXT_GURU_UPGRADE"] = "1"
-    else:
-        env.pop("CONTEXT_GURU_UPGRADE", None)
-    completed = subprocess.run(command, env=env, text=True, capture_output=True)
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.returncode or args.check:
-        return completed.returncode
+    executable = find_binary()
+    installed = "unknown"
+    if executable:
+        completed = subprocess.run([executable, "--version"], text=True, capture_output=True)
+        if completed.returncode == 0:
+            fields = completed.stdout.split()
+            if len(fields) >= 2:
+                installed = fields[1]
+    available = installed.removeprefix("v") != latest.removeprefix("v")
+    if args.check:
+        facts(result="checked", installed_version=installed, latest_version=latest,
+              update_available=str(available).lower())
+        return 0
+    try:
+        executable, version = install_release_binary(latest)
+    except Exception as error:
+        facts(result="error", reason="binary_install_failed", detail=error)
+        return 1
     record = read_record()
     port = int(record.get("port", 0))
     stopped = stop_owned(record)
-    executable = find_binary()
     if stopped == "not_owned" or not port or not executable:
         facts(restart="skipped", reason=stopped if stopped == "not_owned" else "incomplete_record")
         return 1
@@ -349,7 +451,7 @@ def update(args):
         return 1
     record.update(pid=process.pid, binary=executable)
     (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
-    facts(restart="completed", port=port)
+    facts(result="updated", version=version, restart="completed", port=port)
     return 0
 
 

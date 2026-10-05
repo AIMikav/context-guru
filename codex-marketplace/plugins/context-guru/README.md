@@ -3,12 +3,10 @@
 This is the Codex plugin bundle for context-guru. It installs a dedicated Codex profile, starts a
 loopback proxy, exposes health and statistics skills, and can remove only the state it owns.
 
-Clone, build the proxy, then register and install the marketplace:
+Register the GitHub marketplace and install the plugin:
 
 ```sh
-git clone --depth 1 https://github.com/rossoctl/context-guru.git
-make -C context-guru build
-codex plugin marketplace add ./context-guru/codex-marketplace
+codex plugin marketplace add rossoctl/context-guru
 codex plugin add context-guru@context-guru
 ```
 
@@ -24,8 +22,10 @@ without trimming. Cache keep-alive is enabled by default: eligible OpenAI Respon
 refreshed shortly before their 30-minute cache lifetime ends. You can opt into content reduction
 separately after verifying the routed setup.
 
-The plugin requires `context-guru-proxy` on `PATH`, or a binary built at
-`bin/context-guru-proxy` in this checkout.
+During setup, the plugin downloads the latest `context-guru-proxy` release for the current platform,
+verifies it against the release's SHA-256 checksums, and installs it into its private state directory.
+An existing `context-guru-proxy` on `PATH` is reused instead. Codex requires proxy release v0.4.0
+or newer.
 
 Setup copies a standalone recovery command to
 `~/.local/state/context-guru-codex/context-guru-reset`. Use it from an ordinary, unrouted shell if
