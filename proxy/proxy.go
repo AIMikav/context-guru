@@ -1925,6 +1925,12 @@ func (h *Handler) doUpstream(r *http.Request, up upstream, body []byte) (*http.R
 	}
 	copyHeaders(req.Header, r.Header)
 	setUpstreamAuth(req.Header, up)
+	// We have to read this response ourselves (streamed usage-sniffing, keep-alive
+	// accounting), so do not let it arrive compressed — see proxy.go:482 for the same
+	// pattern on the Bob-profile fetch. Dropping it lets http.Transport add its own
+	// Accept-Encoding and auto-decompress resp.Body transparently, for both the
+	// client-forward path and the usage sniffer, which read the identical byte stream.
+	req.Header.Del("Accept-Encoding")
 	return h.client.Do(req)
 }
 
