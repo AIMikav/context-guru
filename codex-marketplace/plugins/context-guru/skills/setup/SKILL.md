@@ -5,12 +5,16 @@ description: Set up context-guru for Codex CLI. Use when asked to install, enabl
 
 # Set up context-guru for Codex
 
-Explain that this routes model traffic (prompts, source and tool output) through a loopback proxy,
-and obtain explicit consent before changing configuration.
+First run `python3 ../../scripts/codex_plugin.py setup --plan` from this skill directory. It writes
+nothing. Read and relay its `consent_question=` as one explicit yes/no question. A missing or
+ambiguous answer is no.
 
-Run `python3 ../../scripts/codex_plugin.py setup` from this skill directory. It creates a dedicated
-`$CODEX_HOME/context-guru.config.toml` profile and does not edit the main Codex configuration.
+Explain that setup changes the default provider in `$CODEX_HOME/config.toml`, so every new Codex
+session routes through the local proxy. Explain that the current session cannot change transport,
+and name the standalone reset path printed by setup. Only after explicit consent, run
+`python3 ../../scripts/codex_plugin.py setup --i-consent-to-traffic-interception`.
 
 If the binary is missing, setup downloads the matching published release and verifies its SHA-256
 checksum before installing it into plugin-owned state. On success, report the emitted `launch=`
-command. Routing starts in a new Codex process; it cannot change the transport of the current session.
+command. Routing starts in the next ordinary `codex` process; it cannot change the transport of the
+current session.

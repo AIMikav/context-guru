@@ -8,7 +8,7 @@
       "name": "context-guru",
       "source": {
         "source": "local",
-        "path": "./plugins/context-guru"
+        "path": "./codex-marketplace/plugins/context-guru"
       },
       "policy": {
         "installation": "AVAILABLE",

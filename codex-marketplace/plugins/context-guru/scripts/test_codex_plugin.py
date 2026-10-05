@@ -17,12 +17,13 @@ SPEC.loader.exec_module(PLUGIN)
 
 
 class CodexPluginTest(unittest.TestCase):
-    def test_session_start_hook_is_async(self):
+    def test_session_start_hook_uses_plugin_root_and_is_synchronous(self):
         hooks_path = MODULE_PATH.parent.parent / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
         handler = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        self.assertEqual(handler["command"], "python3 ./scripts/codex_plugin.py serve")
-        self.assertIs(handler["async"], True)
+        self.assertEqual(handler["command"],
+                         'python3 "${PLUGIN_ROOT}/scripts/codex_plugin.py" ensure')
+        self.assertIs(handler["async"], False)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -38,25 +39,22 @@ class CodexPluginTest(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def test_profile_is_isolated_and_uses_responses_wire_api(self):
-        PLUGIN.write_profile(8791)
-        text = PLUGIN.profile().read_text()
-        self.assertTrue(text.startswith(PLUGIN.MARKER))
-        self.assertIn('base_url = "http://127.0.0.1:8791/openai/v1"', text)
-        self.assertIn('wire_api = "responses"', text)
-        self.assertFalse((PLUGIN.codex_home() / "config.toml").exists())
-
     def test_profile_and_proxy_preserve_custom_provider_route(self):
         provider = {
             "base_url": "https://gateway.example.test/",
             "requires_openai_auth": False,
             "experimental_bearer_token": "test-token",
         }
-        PLUGIN.write_profile(8791, provider)
-        text = PLUGIN.profile().read_text()
+        PLUGIN.main_config().parent.mkdir(parents=True)
+        PLUGIN.main_config().write_text('model_provider = "gateway"\n\n[model_providers.gateway]\n'
+                                        'base_url = "https://gateway.example.test/"\n'
+                                        'requires_openai_auth = false\n'
+                                        'experimental_bearer_token = "test-token"\n')
+        PLUGIN.install_default_route(PLUGIN.main_config(), PLUGIN.routing_state(), 8791, provider)
+        text = PLUGIN.main_config().read_text()
         self.assertIn('experimental_bearer_token = "test-token"', text)
         self.assertIn("requires_openai_auth = false", text)
-        self.assertEqual(PLUGIN.profile().stat().st_mode & 0o777, 0o600)
+        self.assertEqual(PLUGIN.main_config().stat().st_mode & 0o777, 0o600)
         command = PLUGIN.proxy_command("/proxy", 8791, provider["base_url"])
         self.assertEqual(command[3:5], ["--config", str(PLUGIN.proxy_config())])
         self.assertEqual(command[-2:], ["--openai-upstream", "https://gateway.example.test"])
@@ -92,25 +90,27 @@ screen_reader_detection_done = true
             "experimental_bearer_token": "secret",
         })
 
-    def test_refuses_unmanaged_profile(self):
-        PLUGIN.profile().parent.mkdir(parents=True)
-        PLUGIN.profile().write_text("model = 'mine'\n")
-        with self.assertRaisesRegex(RuntimeError, "unmanaged profile"):
-            PLUGIN.write_profile(8791)
-
     def test_setup_bootstraps_release_when_binary_is_missing(self):
-        args = type("Args", (), {})()
+        args = type("Args", (), {"plan": False, "i_consent_to_traffic_interception": True})()
         process = mock.Mock(pid=4321)
         with mock.patch.object(PLUGIN, "find_binary", return_value=None), \
              mock.patch.object(PLUGIN, "install_release_binary",
                                return_value=("/managed/context-guru-proxy", "v1.2.3")) as install, \
              mock.patch.object(PLUGIN, "first_free_port", return_value=8791), \
              mock.patch.object(PLUGIN, "start_proxy", return_value=process), \
+             mock.patch.object(PLUGIN, "install_default_route") as route, \
              mock.patch.object(PLUGIN, "install_escape_hatch", return_value=Path("/reset")):
             self.assertEqual(PLUGIN.setup(args), 0)
         install.assert_called_once_with()
+        route.assert_called_once()
         record = json.loads((PLUGIN.state_dir() / "install.json").read_text())
         self.assertEqual(record["binary"], "/managed/context-guru-proxy")
+
+    def test_setup_refuses_without_explicit_consent(self):
+        args = type("Args", (), {"plan": False, "i_consent_to_traffic_interception": False})()
+        with mock.patch.object(PLUGIN, "install_release_binary") as install:
+            self.assertEqual(PLUGIN.setup(args), 2)
+        install.assert_not_called()
 
     def test_uninstall_keeps_unmanaged_profile_and_unowned_process(self):
         PLUGIN.profile().parent.mkdir(parents=True)
@@ -132,6 +132,35 @@ screen_reader_detection_done = true
         self.assertEqual(target, PLUGIN.state_dir() / "context-guru-reset")
         self.assertTrue(os.access(target, os.X_OK))
         self.assertIn("Managed by the context-guru Codex plugin", target.read_text())
+        self.assertTrue((PLUGIN.state_dir() / "config_route.py").is_file())
+
+    def test_default_route_preserves_and_restores_original_provider(self):
+        path = PLUGIN.main_config()
+        path.parent.mkdir(parents=True)
+        original = ('model = "gpt-test"\nmodel_provider = "gateway"\n\n'
+                    '[model_providers.gateway]\nbase_url = "https://gateway.test/v1"\n')
+        path.write_text(original)
+        provider = {"base_url": "https://gateway.test/v1", "requires_openai_auth": False}
+        PLUGIN.install_default_route(path, PLUGIN.routing_state(), 8791, provider)
+        routed = path.read_text()
+        self.assertIn('model_provider = "context-guru"', routed)
+        self.assertIn('base_url = "http://127.0.0.1:8791/openai/v1"', routed)
+        self.assertIn('[model_providers.gateway]', routed)
+        self.assertTrue(PLUGIN.is_routed(path))
+        self.assertEqual(PLUGIN.restore_default_route(PLUGIN.routing_state()), "restored")
+        self.assertEqual(path.read_text(), original)
+
+    def test_restore_does_not_overwrite_a_later_provider_choice(self):
+        path = PLUGIN.main_config()
+        path.parent.mkdir(parents=True)
+        path.write_text('model_provider = "gateway"\n')
+        PLUGIN.install_default_route(path, PLUGIN.routing_state(), 8791, {})
+        path.write_text(path.read_text().replace('model_provider = "context-guru"',
+                                                 'model_provider = "new-choice"'))
+        self.assertEqual(PLUGIN.restore_default_route(PLUGIN.routing_state()),
+                         "routing_already_changed")
+        self.assertIn('model_provider = "new-choice"', path.read_text())
+        self.assertNotIn(PLUGIN.CONFIG_MARKER, path.read_text())
 
     def test_release_binary_is_checksum_verified_and_installed_privately(self):
         payload = b"released proxy"
@@ -180,7 +209,9 @@ screen_reader_detection_done = true
         install.assert_not_called()
 
     def test_reset_dry_run_changes_nothing(self):
-        PLUGIN.write_profile(8791)
+        PLUGIN.main_config().parent.mkdir(parents=True)
+        PLUGIN.main_config().write_text('model_provider = "openai"\n')
+        PLUGIN.install_default_route(PLUGIN.main_config(), PLUGIN.routing_state(), 8791, {})
         PLUGIN.write_proxy_config()
         PLUGIN.state_dir().mkdir(parents=True, exist_ok=True)
         record = PLUGIN.state_dir() / "install.json"
@@ -192,13 +223,16 @@ screen_reader_detection_done = true
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("result=planned", completed.stdout)
-        self.assertTrue(PLUGIN.profile().exists())
+        self.assertTrue(PLUGIN.is_routed(PLUGIN.main_config()))
         self.assertTrue(PLUGIN.proxy_config().exists())
         self.assertTrue(record.exists())
 
     def test_reset_backup_is_private(self):
-        PLUGIN.write_profile(8791, {"experimental_bearer_token": "secret"})
+        PLUGIN.main_config().parent.mkdir(parents=True)
+        PLUGIN.main_config().write_text('model_provider = "openai"\n')
+        PLUGIN.install_default_route(PLUGIN.main_config(), PLUGIN.routing_state(), 8791, {})
         PLUGIN.write_proxy_config()
+        PLUGIN.install_escape_hatch()
         completed = subprocess.run(
             ["sh", str(Path(__file__).with_name("reset.sh")), "--yes"],
             env=os.environ.copy(), text=True, capture_output=True,
@@ -207,6 +241,7 @@ screen_reader_detection_done = true
         backups = list((PLUGIN.state_dir() / "recovery").iterdir())
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertFalse(PLUGIN.is_routed(PLUGIN.main_config()))
         self.assertFalse(PLUGIN.proxy_config().exists())
 
     def test_explicit_update_sets_upgrade_gate(self):
@@ -216,6 +251,46 @@ screen_reader_detection_done = true
              mock.patch.object(PLUGIN, "install_release_binary",
                                side_effect=RuntimeError("download failed")):
             self.assertEqual(PLUGIN.update(args), 1)
+
+    def test_configure_preset_preserves_cache_and_restarts(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("off", False)
+        args = type("Args", (), {"show": False, "preset": "high", "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy", return_value=True) as restart:
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.read_proxy_options(), ("high", False))
+        restart.assert_called_once()
+
+    def test_configure_cache_preserves_preset(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("medium", False)
+        args = type("Args", (), {"show": False, "preset": None,
+                                  "cache_strategy": "30-min-ping"})()
+        with mock.patch.object(PLUGIN, "restart_proxy", return_value=True):
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.read_proxy_options(), ("medium", True))
+
+    def test_configure_refuses_unmanaged_options(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.proxy_config().write_text("preset: mine\n")
+        args = type("Args", (), {"show": False, "preset": "off", "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy") as restart:
+            self.assertEqual(PLUGIN.configure(args), 2)
+        restart.assert_not_called()
+
+    def test_configure_show_is_read_only(self):
+        PLUGIN.routing_state().parent.mkdir(parents=True)
+        PLUGIN.routing_state().write_text("{}")
+        PLUGIN.save_proxy_options("xhigh", True)
+        before = PLUGIN.proxy_config().read_bytes()
+        args = type("Args", (), {"show": True, "preset": None, "cache_strategy": None})()
+        with mock.patch.object(PLUGIN, "restart_proxy") as restart:
+            self.assertEqual(PLUGIN.configure(args), 0)
+        self.assertEqual(PLUGIN.proxy_config().read_bytes(), before)
+        restart.assert_not_called()
 
 
 if __name__ == "__main__":
