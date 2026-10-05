@@ -77,6 +77,34 @@ class CodexPluginTest(unittest.TestCase):
         self.assertEqual(path.read_text(),
                          f"{PLUGIN.CONFIG_MARKER}\npreset: off\ncache:\n  keepalive: true\n")
 
+    def test_linux_proxy_is_started_by_user_service_not_child_process(self):
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.subprocess, "check_output", return_value="4321\n"), \
+             mock.patch.object(PLUGIN.subprocess, "Popen") as popen, \
+             mock.patch.object(PLUGIN, "healthy", return_value=True):
+            process = PLUGIN.start_proxy("/opt/context guru/proxy", 8791)
+        self.assertEqual(process.pid, 4321)
+        popen.assert_not_called()
+        unit = PLUGIN.systemd_unit()
+        self.assertTrue(unit.read_text().startswith(PLUGIN.CONFIG_MARKER))
+        self.assertIn('ExecStart="/opt/context guru/proxy"', unit.read_text())
+        self.assertIn(["systemctl", "--user", "enable", "--now", unit.name],
+                      [call.args[0] for call in run.call_args_list])
+
+    def test_stop_owned_service_does_not_trust_recorded_pid(self):
+        unit = PLUGIN.systemd_unit()
+        unit.parent.mkdir(parents=True)
+        unit.write_text(PLUGIN.CONFIG_MARKER + "\n[Service]\n")
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.os, "kill") as kill:
+            self.assertEqual(PLUGIN.stop_owned({"service": "systemd", "pid": 22}), "stopped")
+        kill.assert_not_called()
+        self.assertFalse(unit.exists())
+        self.assertIn(["systemctl", "--user", "disable", "--now", unit.name],
+                      [call.args[0] for call in run.call_args_list])
+
     def test_refuses_unmanaged_proxy_config(self):
         PLUGIN.proxy_config().parent.mkdir(parents=True)
         PLUGIN.proxy_config().write_text("preset: mine\n")

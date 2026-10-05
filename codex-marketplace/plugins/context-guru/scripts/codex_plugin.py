@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import shutil
 import signal
 import socket
@@ -17,6 +18,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config_route import install as install_default_route
@@ -55,6 +57,15 @@ def proxy_config():
 
 def managed_binary():
     return state_dir() / "bin/context-guru-proxy"
+
+
+def systemd_unit():
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "systemd/user/context-guru-codex.service"
+
+
+def launchd_plist():
+    return Path.home() / "Library/LaunchAgents/io.rossoctl.context-guru-codex.plist"
 
 
 def facts(**values):
@@ -262,6 +273,7 @@ def restart_proxy(record):
     if process is None:
         return False
     record["pid"] = process.pid
+    record["service"] = "systemd" if platform.system() == "Linux" else "launchd"
     (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
     return True
 
@@ -291,21 +303,75 @@ def configure(args):
     return 0 if restarted else 1
 
 
+def service_command(executable, port, upstream=None):
+    return proxy_command(executable, port, upstream)
+
+
+def _systemd_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def start_proxy(executable, port, upstream=None):
+    """Start through the host user service manager, never as a sandbox child."""
     root = state_dir()
     root.mkdir(parents=True, exist_ok=True)
-    log = open(root / "proxy.log", "ab", buffering=0)
-    process = subprocess.Popen(
-        proxy_command(executable, port, upstream),
-        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
-    )
+    command = service_command(executable, port, upstream)
+    system = platform.system()
+    if system == "Linux":
+        unit = systemd_unit()
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(
+            f"{CONFIG_MARKER}\n[Unit]\nDescription=context-guru for Codex\n\n"
+            "[Service]\nType=simple\n"
+            f"ExecStart={' '.join(_systemd_quote(item) for item in command)}\n"
+            "Restart=on-failure\nRestartSec=1\n"
+            f"StandardOutput=append:{root / 'proxy.log'}\n"
+            f"StandardError=append:{root / 'proxy.log'}\n\n"
+            "[Install]\nWantedBy=default.target\n")
+        unit.chmod(0o600)
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True,
+                           capture_output=True, text=True)
+            subprocess.run(["systemctl", "--user", "enable", "--now", unit.name], check=True,
+                           capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        pid_command = ["systemctl", "--user", "show", "--property", "MainPID", "--value",
+                       unit.name]
+    elif system == "Darwin":
+        plist = launchd_plist()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        with open(plist, "wb") as handle:
+            plistlib.dump({"Label": "io.rossoctl.context-guru-codex",
+                           "ProgramArguments": command, "RunAtLoad": True,
+                           "KeepAlive": True, "ProcessType": "Background",
+                           "StandardOutPath": str(root / "proxy.log"),
+                           "StandardErrorPath": str(root / "proxy.log")}, handle)
+        plist.chmod(0o600)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", domain + "/io.rossoctl.context-guru-codex"],
+                       capture_output=True)
+        try:
+            subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
+                           capture_output=True, text=True)
+            subprocess.run(["launchctl", "kickstart", "-k",
+                            domain + "/io.rossoctl.context-guru-codex"], check=True,
+                           capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        pid_command = ["launchctl", "print", domain + "/io.rossoctl.context-guru-codex"]
+    else:
+        return None
     for _ in range(40):
         if healthy(port):
-            return process
-        if process.poll() is not None:
-            return None
+            pid = 0
+            if system == "Linux":
+                try:
+                    pid = int(subprocess.check_output(pid_command, text=True).strip())
+                except (OSError, ValueError, subprocess.CalledProcessError):
+                    pass
+            return SimpleNamespace(pid=pid)
         time.sleep(0.1)
-    process.terminate()
     return None
 
 
@@ -424,7 +490,8 @@ def setup(args):
     if old_profile.exists() and old_profile.read_text().startswith(MARKER):
         old_profile.unlink()
     record = {"port": port, "pid": process.pid, "binary": executable,
-              "config": str(main_config()), "upstream": upstream, "provider": provider}
+              "config": str(main_config()), "upstream": upstream, "provider": provider,
+              "service": "systemd" if platform.system() == "Linux" else "launchd"}
     (root / "install.json").write_text(json.dumps(record, indent=2) + "\n")
     facts(result="installed", port=port, config=main_config(), reset=reset, launch="codex")
     return 0
@@ -443,6 +510,7 @@ def ensure(_args):
         facts(result="start_failed", log=state_dir() / "proxy.log")
         return 0
     record["pid"] = process.pid
+    record["service"] = "systemd" if platform.system() == "Linux" else "launchd"
     (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
     facts(result="restarted", port=port)
     return 0
@@ -484,6 +552,30 @@ def status(_args):
 
 
 def stop_owned(record):
+    service = record.get("service")
+    if service == "systemd" or (service is None and systemd_unit().exists()):
+        unit = systemd_unit()
+        try:
+            subprocess.run(["systemctl", "--user", "disable", "--now", unit.name], check=True,
+                           capture_output=True, text=True)
+            if unit.exists() and unit.read_text().startswith(CONFIG_MARKER):
+                unit.unlink()
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=False,
+                               capture_output=True)
+            return "stopped"
+        except (OSError, subprocess.CalledProcessError):
+            return "not_owned"
+    if service == "launchd" or (service is None and launchd_plist().exists()):
+        plist = launchd_plist()
+        try:
+            subprocess.run(["launchctl", "bootout",
+                            f"gui/{os.getuid()}/io.rossoctl.context-guru-codex"], check=False,
+                           capture_output=True)
+            if plist.exists():
+                plist.unlink()
+            return "stopped"
+        except OSError:
+            return "not_owned"
     pid = record.get("pid")
     if not isinstance(pid, int):
         return "gone"
@@ -539,6 +631,7 @@ def update(args):
         facts(restart="failed", port=port)
         return 1
     record.update(pid=process.pid, binary=executable)
+    record["service"] = "systemd" if platform.system() == "Linux" else "launchd"
     (state_dir() / "install.json").write_text(json.dumps(record, indent=2) + "\n")
     facts(result="updated", version=version, restart="completed", port=port)
     return 0
