@@ -839,5 +839,70 @@ type NopEmitter struct{}
 func (NopEmitter) Component(Report) {}
 func (NopEmitter) Run(RunReport)    {}
 
+// KeepAliveReport is the per-ping result the host-level idle keep-alive mechanism
+// (proxy/keepalive.go) reports — independent of any particular sink. It carries what that
+// mechanism itself knows and prices about one ping: who it was for, what the ping's own
+// usage tiers were, what it cost, and how it went.
+//
+// Most of this mirrors Report's shape deliberately (tokens by tier, cost, status, duration)
+// because the keep-alive IS a component in every sense except the one that matters for
+// Pipeline.Run: it fires between requests, with nothing on the wire to hook (see
+// keepalive.go's package comment, "Why it is host-level and not a component"). This type
+// lets it still report through the same Emitter a host already has, instead of reaching
+// into a concrete sink directly the way it used to.
+//
+// Agent, Preset, StopReason, Strategy, FreshInput, CacheWrite1h and MaxTokens go beyond the
+// fields issue #382 sketched. They are here because dropping them would be a real behavior
+// change for the one sink that exists today: cmd/context-guru-proxy's dashEmitter writes a
+// dash.Event carrying all of them (the agent and preset the dashboard groups by, the
+// strategy a manager-controlled policy resolved, the stop reason and output-token budget an
+// operator reads off the row, the usage tiers beyond cache-read/cache-write/output), and
+// dropping any one would silently blank a column on every keep-alive row a dashboarded
+// deployment has always shown. If this drifts from what docs/proposals/cortex-integration.md
+// §5 implies, that doc is the one to correct, not this.
+type KeepAliveReport struct {
+	Tenant, Session, Model, Provider, Route string
+	Pings                                   int
+	CacheRead, CacheWrite, Output           int64
+	CostUSD                                 float64
+	Status                                  int
+	DurationMs                              float64
+	// TS is when this ping was recorded (the keeper's own clock, which production reads from
+	// time.Now but a replay/test may inject), in epoch milliseconds — not derivable from
+	// anything else here, and a sink that timestamps its own row from wall-clock-at-receipt
+	// would disagree with a keeper running on an injected clock.
+	TS int64
+	// Agent, Preset, StopReason and Strategy are copied verbatim from the kaEntry that
+	// established this ping — see keepalive.go's record1 — so a sink that mirrors the
+	// pre-existing dash.Event can reproduce every column it wrote before this type existed.
+	// Strategy is the manager-controlled keep-alive strategy id that resolved this ping's
+	// policy, "" when none did (account config or a session override supplied it instead).
+	Agent, Preset, StopReason, Strategy string
+	// FreshInput and CacheWrite1h are the ping's own usage tiers beyond CacheRead/CacheWrite/
+	// Output, carried for the same reason.
+	FreshInput, CacheWrite1h int64
+	// MaxTokens is what the ping itself asked for (see keepalive.go's pingOutputBudget), so a
+	// sink can record what was requested rather than reading as a request with no output
+	// budget at all.
+	MaxTokens int
+}
+
+// KeepAliveEmitter is an OPTIONAL capability an Emitter implementation may add. Most Emitter
+// implementations don't care about keep-alive specifically, so this is a separate interface
+// rather than a new required method on Emitter — adding a required method would break every
+// existing implementer the next time this type is embedded or asserted against. The keeper
+// type-asserts for this and no-ops if absent, the same pattern used elsewhere in this
+// codebase for optional capabilities (e.g. store.Stasher, FilterStatsSink above).
+//
+// It exists so the host-level keep-alive mechanism — which cannot be a Component (see its
+// package comment) and therefore never runs through Pipeline.Run — can still report through
+// whatever Emitter the host already configured, instead of calling a concrete sink (dash)
+// directly from the keeper itself. That direct call was the one piece of host-specific
+// machinery wired into the keeper, and it is what blocked exporting the keeper as a
+// host-agnostic package (docs/proposals/cortex-integration.md §5; issue #382).
+type KeepAliveEmitter interface {
+	KeepAlivePing(KeepAliveReport)
+}
+
 // clock is injectable in tests; production uses time.Now.
 var clock = time.Now

@@ -259,6 +259,14 @@ func main() {
 	}
 
 	agg := metrics.NewAggregator()
+	// kaKeepAlive is the keep-alive mechanism's own sink (components.KeepAliveEmitter): it
+	// writes the dash.Event record1 used to build inline before issue #382 moved that call
+	// behind the Emitter interface. Constructed empty and filled in below, once its two
+	// dependencies exist — the recorder opens further down, and the price table once
+	// `windows` is resolved — rather than reordering boot around a Recorder nothing else here
+	// needs yet. A pointer, so the SAME object threaded into `emitter` right now keeps
+	// working once both fields are set.
+	kaKeepAlive := &dashEmitter{}
 	// metrics.Slog is deliberately NOT wired in here any more. It emitted one line per
 	// component plus one per run, at INFO, with no tenant and no session on any of them —
 	// so a busy proxy buried its own request lifecycle, and none of it could be correlated
@@ -266,16 +274,21 @@ func main() {
 	// attached, and with the gate histogram that says WHY a component declined. The type
 	// stays exported for a library host that wants the GenAI-semconv vocabulary.
 	//
-	// Still a Tee of one: Tee is what satisfies components.FilterStatsSink for the
-	// pipeline's own type assertion, so collapsing it to the bare aggregator would
-	// quietly drop cmdfilter's per-family ledger.
-	emitter := metrics.Tee{agg}
+	// Tee also carries kaKeepAlive: Tee is what satisfies components.FilterStatsSink for the
+	// pipeline's own type assertion (so collapsing it to the bare aggregator would quietly
+	// drop cmdfilter's per-family ledger), and now components.KeepAliveEmitter for the same
+	// reason — see Tee.KeepAlivePing.
+	emitter := metrics.Tee{agg, kaKeepAlive}
 	pipe, err := cfg.Build(emitter)
 	if err != nil {
 		log.Fatalf("build pipeline: %v", err)
 	}
 
 	windows := modelWindows()
+	// Priced the moment the resolver chain exists, which is the SAME chain priced into
+	// proxy.Options.Prices below (priceResolver(windows)) — so the keep-alive dashboard row's
+	// cost column can never disagree with what the request path used to decide anything.
+	kaKeepAlive.prices = priceResolver(windows)
 
 	// Cold storage, verified at boot: a remote that cannot be reached should be a log
 	// line now, not a stream of "archiving failed" hours later with no hint that the
@@ -348,6 +361,11 @@ func main() {
 		}
 		rec = r
 		defer rec.Close()
+		// Wire the keep-alive sink to the same recorder every other dash write already uses.
+		// Until --dashboard runs this block, kaKeepAlive.rec stays nil and KeepAlivePing is a
+		// no-op — matching the keeper's own "no audit sink, no retention" gate, which already
+		// means no ping ever reaches this far without --dashboard on.
+		kaKeepAlive.rec = rec
 		// Recover which sessions were live before this restart. Without it every conversation
 		// in flight reports a cold start on its next turn — and that flag also decides whether
 		// a cache hit counts as our saving, so a restart handed out one bonus credit per live
@@ -781,6 +799,64 @@ func spendChecker(rec *dash.Recorder) proxy.SpendChecker {
 		return nil
 	}
 	return rec.DB()
+}
+
+// dashEmitter implements components.KeepAliveEmitter for the standalone proxy: it builds the
+// exact dash.Event record1 (proxy/keepalive.go) used to construct and call k.h.rec.Record on
+// directly, before issue #382 moved that call behind the Emitter interface. A host embedding
+// context-guru that does not want dash's SQLite dependency pulled in simply never constructs
+// one of these — see components.KeepAliveEmitter's doc comment for why the capability is
+// optional rather than a new required Emitter method.
+//
+// Both fields are set after construction (see where kaKeepAlive is built, above) because this
+// value is threaded into `emitter` before its two dependencies — the recorder and the price
+// resolver — exist yet. KeepAlivePing is nil-safe on an unset rec, so nothing can observe the
+// gap: the keeper's own retention gate already refuses to hold anything (and so never pings)
+// until --dashboard has opened one.
+type dashEmitter struct {
+	rec    *dash.Recorder
+	prices modelinfo.Pricer
+}
+
+// Component and Run are no-ops: dashEmitter exists only to be tee'd in for its
+// KeepAlivePing capability (components.Emitter requires both, the same reason NopEmitter
+// carries them). The per-component/per-run dashboard rows are already written elsewhere,
+// through the request path's own capture — not through this Emitter.
+func (d *dashEmitter) Component(components.Report) {}
+func (d *dashEmitter) Run(components.RunReport)    {}
+
+func (d *dashEmitter) KeepAlivePing(r components.KeepAliveReport) {
+	if d.rec == nil {
+		return
+	}
+	var price modelinfo.Price
+	priced := false
+	if d.prices != nil && r.Model != "" {
+		price, priced = d.prices.Price(context.Background(), r.Model)
+	}
+	ev := &dash.Event{
+		TS: r.TS, TenantID: r.Tenant, Model: r.Model,
+		Provider: r.Provider, Route: r.Route, Preset: r.Preset,
+		Status: r.Status, KeepAlive: true,
+		// Which manager-controlled strategy resolved this ping's policy, "" when none did —
+		// tagged on the ping's own row, never on the real request it later rescues.
+		KeepAliveStrategyID: r.Strategy,
+	}
+	ev.SessionID = r.Session
+	ev.Agent = dash.AgentFor(r.Agent)
+	ev.FreshInput, ev.CacheRead = r.FreshInput, r.CacheRead
+	ev.CacheWrite, ev.OutputTokens = r.CacheWrite, r.Output
+	ev.CacheWrite1h = r.CacheWrite1h
+	ev.StopReason = r.StopReason
+	ev.UpstreamMs = r.DurationMs
+	// What the ping actually asked for, so the row says it rather than reading as a request
+	// with no output budget.
+	ev.MaxTokens = r.MaxTokens
+	// Reproduces dash.Event.Price's own gate exactly (see proxy/keepalive.go's record1, which
+	// computes the SAME cost independently for its own bookkeeping): no cost without a usable
+	// rate, and no cost claimed for a ping whose usage reported nothing at all.
+	ev.Price(price, priced && (r.CacheRead > 0 || r.CacheWrite > 0 || r.Output > 0))
+	d.rec.Record(ev)
 }
 
 // tenantMetrics adapts the recorder's per-tenant rollup for the Prometheus exporter.

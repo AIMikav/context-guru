@@ -49,6 +49,18 @@ func (t Tee) FilterMiss(selector string) {
 	}
 }
 
+// KeepAlivePing forwards to whichever tee'd emitters implement components.KeepAliveEmitter.
+// Mirrors FilterAct/FilterMiss's optional-capability forwarding above: not every Emitter
+// cares about keep-alive specifically, so Tee itself satisfies KeepAliveEmitter only in the
+// sense of relaying to the members that do.
+func (t Tee) KeepAlivePing(r components.KeepAliveReport) {
+	for _, e := range t {
+		if ka, ok := e.(components.KeepAliveEmitter); ok {
+			ka.KeepAlivePing(r)
+		}
+	}
+}
+
 // Slog logs each component and run in the GenAI semantic-convention vocabulary.
 //
 // At DEBUG, not INFO. These are per-component records — several per request — so at
