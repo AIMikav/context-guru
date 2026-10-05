@@ -61,6 +61,14 @@ Choose your setup. Each button opens only the instructions for that path.
   </tbody>
 </table>
 
+For local Codex use, register only the marketplace paths Codex needs; cloning the whole monorepo
+can exceed Codex's marketplace timeout:
+
+```sh
+codex plugin marketplace add rossoctl/context-guru --sparse .agents --sparse codex-marketplace
+codex plugin add context-guru@context-guru
+```
+
 ## Presets
 
 It's an effort ladder — each tier is everything in the one before it, plus more:
@@ -109,6 +117,11 @@ proxy binary, which the update command above already covers. To refresh the plug
 | Claude Code | Codex (experimental) |
 |---|---|
 | `/plugin marketplace update rossoctl/context-guru`<br>`/reload-plugins` | `codex plugin marketplace upgrade context-guru`<br>Then restart Codex. |
+
+Codex remembers the sparse paths from marketplace registration and reuses them during upgrade;
+the `upgrade` command does not take separate `--sparse` flags. For an older registration that was
+created without sparse paths and now times out, follow the one-time re-registration steps in the
+[Codex troubleshooting guide](codex-marketplace/plugins/context-guru/README.md#operations-and-troubleshooting).
 
 More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#upgrading).
 
