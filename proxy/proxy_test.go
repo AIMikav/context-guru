@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1205,5 +1206,114 @@ func TestOpenAISSEStreamsThrough(t *testing.T) {
 	stresp.Body.Close()
 	if snap.SSEStreamed != 1 || snap.SSEBuffered != 0 {
 		t.Fatalf("want one streamed, zero buffered: %+v", snap)
+	}
+}
+
+// gzipSSE compresses an Anthropic-shaped SSE stream the way api.anthropic.com actually
+// does on a direct (no-gateway) upstream — real byte-for-byte gzip, not a header-only
+// fixture, so a fix that merely strips the response header rather than fixing the
+// request would still fail this test.
+func gzipSSE(t *testing.T, plain string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestGzipUpstreamResponseIsDecompressedAndUsageParsed is the regression test for #391: a
+// direct-to-api.anthropic.com upstream (the documented no-API-key / subscription-login
+// setup) gzips its streaming /v1/messages responses. Forwarding the client's own
+// Accept-Encoding header upstream verbatim (the bug) means Go's http.Transport never
+// auto-decompresses, so resp.Body is raw gzip for BOTH the client-forward path and the
+// usage sniffer — usage silently reports usageMissAbsent (classified benign, so nothing
+// alerts) on every request against that upstream, which in turn means keep-alive's
+// pingable() gate (keyed off CacheRead+CacheWrite) never passes either.
+//
+// Before the fix (doUpstream forwarding Accept-Encoding as-is) this test fails on BOTH
+// assertions: the client reads raw gzip bytes instead of the SSE text, and usage reports
+// zero. The fix — stripping Accept-Encoding before the upstream call, letting Transport
+// add its own and auto-decompress transparently — fixes both at once because h.stream
+// reads resp.Body once, into both sinks, with no tee and no separate buffer.
+func TestGzipUpstreamResponseIsDecompressedAndUsageParsed(t *testing.T) {
+	const wantText = "the upstream said this, compressed"
+	plain := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"," +
+		"\"usage\":{\"input_tokens\":11,\"output_tokens\":1,\"cache_read_input_tokens\":9000," +
+		"\"cache_creation_input_tokens\":1500}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0," +
+		"\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0," +
+		"\"delta\":{\"type\":\"text_delta\",\"text\":\"" + wantText + "\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	gzipped := gzipSSE(t, plain)
+
+	var sawAcceptEncoding string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Anthropic itself decides to gzip based on what WE sent it — recording this is
+		// what makes the test fail honestly if the fix regresses rather than passing by
+		// coincidence (an upstream that only gzips when asked).
+		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(gzipped)
+	}))
+	defer upstream.Close()
+
+	h, _ := buildHandler(t, "pipeline: []\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "no markers in this request at all")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if sawAcceptEncoding == "" {
+		t.Fatal("fixture bug: the upstream never saw an Accept-Encoding header at all, so " +
+			"this test cannot distinguish 'the proxy stripped it' from 'nobody ever sent one'")
+	}
+
+	// The client-visible symptom: readable SSE text, not raw gzip bytes relayed verbatim.
+	if !strings.Contains(string(got), wantText) {
+		t.Fatalf("client did not receive readable, decompressed content; got %q", got)
+	}
+	if bytes.HasPrefix(got, []byte{0x1f, 0x8b}) {
+		t.Fatalf("client received raw gzip bytes (magic number 0x1f8b) instead of decompressed "+
+			"SSE text: %q", got)
+	}
+
+	// The silent symptom: usage parsed correctly off the SAME byte stream.
+	var snap metrics.Snapshot
+	stresp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(stresp.Body).Decode(&snap); err != nil {
+		t.Fatal(err)
+	}
+	stresp.Body.Close()
+	if snap.CacheReadTokens != 9000 {
+		t.Errorf("cache_read_tokens = %d, want 9000 — usage parsing against a gzip-compressed "+
+			"stream silently reports usageMissAbsent (classified benign, no alert) rather than "+
+			"failing loudly, which is exactly the bug #391 was filed for", snap.CacheReadTokens)
+	}
+	if snap.CacheWriteTokens != 1500 {
+		t.Errorf("cache_write_tokens = %d, want 1500", snap.CacheWriteTokens)
+	}
+	if snap.OutputTokens != 42 {
+		t.Errorf("output_tokens = %d, want 42 (the message_delta figure, not message_start's "+
+			"initial 1)", snap.OutputTokens)
 	}
 }

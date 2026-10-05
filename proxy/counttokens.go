@@ -84,6 +84,11 @@ func (h *Handler) countTokens(static upstream) http.HandlerFunc {
 		}
 		copyHeaders(req.Header, r.Header)
 		setUpstreamAuth(req.Header, up)
+		// Same gap as doUpstream (proxy.go): this route builds its own request rather
+		// than going through doUpstream, so it needs the same strip. h.stream below
+		// relays resp.Body byte for byte to the caller, and a gzip Content-Encoding
+		// forwarded verbatim would only "work" by accident, same as the chat path.
+		req.Header.Del("Accept-Encoding")
 
 		resp, err := h.client.Do(req)
 		if err != nil {
