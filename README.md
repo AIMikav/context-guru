@@ -98,6 +98,9 @@ it any time with the command for your client:
 |---|---|
 | `/context-guru:update` | `$context-guru-update` |
 
+Codex does **not** check or install proxy updates automatically. Codex users should run
+`$context-guru-update` periodically; it checks first and asks before installing anything.
+
 **The plugin itself** (skills, hooks, scripts) rarely needs updating — most releases only touch the
 proxy binary, which the update command above already covers. To refresh the plugin itself:
 

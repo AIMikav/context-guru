@@ -68,6 +68,10 @@ that predate user-service supervision retain the guarded recorded-process cleanu
 | Plan removal and show instructions | `$context-guru-uninstall` |
 | Remove routing and stop the proxy | `~/.local/state/context-guru-codex/context-guru-reset --yes` from an ordinary shell |
 
+Proxy updates are not automatic on Codex. Run `$context-guru-update` periodically; it reports
+whether a newer release exists and asks before downloading or restarting the service. Updating the
+Codex plugin bundle is separate and uses the marketplace command below.
+
 Codex may ask permission when these skills need to access the local proxy, write configuration or
 state under your home directory, download an update, or restart the proxy. A sandboxed command can
 be blocked from `127.0.0.1` even when the proxy is healthy; status and insights therefore retry

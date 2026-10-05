@@ -5,6 +5,9 @@ description: Check for and install a newer context-guru proxy binary. Use when t
 
 # Update the proxy binary
 
+Codex does not run this check automatically. Tell the user to invoke `$context-guru-update`
+periodically if they want to stay current; do not claim there is a background update check.
+
 Run `python3 ../../scripts/codex_plugin.py update --check` from this skill directory first. This is
 read-only and reports the installed and latest versions. If the check fails, say the version is
 unknown rather than claiming it is current. If it fails because the command sandbox blocks the
