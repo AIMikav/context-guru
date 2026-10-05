@@ -29,6 +29,11 @@ Setup asks before routing model traffic, preserves the currently selected provid
 upstream, and updates `~/.codex/config.toml`. The change takes effect in the next session; after
 that, start Codex normally with `codex`.
 
+The proxy runs as a user service—`systemd --user` on Linux or a LaunchAgent on macOS—rather than as
+a child of a Codex command. This lets it survive command-sandbox teardown and restart independently
+after a failure or login. Proxy lifecycle does not depend on a `SessionStart` hook because Codex
+hooks cannot request the permissions needed to escape their command sandbox.
+
 Codex uses OpenAI's Responses API. Content reduction defaults to `off`, so requests are forwarded
 without trimming. Cache keep-alive is enabled by default: eligible OpenAI Responses sessions are
 refreshed shortly before their 30-minute cache lifetime ends. You can opt into content reduction
@@ -51,8 +56,8 @@ or newer.
 Setup copies a standalone recovery command to
 `~/.local/state/context-guru-codex/context-guru-reset`. Use it from an ordinary, unrouted shell if
 the proxy is down and Codex cannot start. It restores the previous default provider, removes only
-the marked provider block, and signals only the recorded process whose command still names the
-recorded binary.
+the marked provider block, and removes only context-guru's owned user service. Older installations
+that predate user-service supervision retain the guarded recorded-process cleanup as a fallback.
 
 ## Operations and troubleshooting
 
@@ -60,8 +65,18 @@ recorded binary.
 |---|---|
 | Check routing and proxy health | `$context-guru-status` |
 | Update the proxy binary | `$context-guru-update` |
-| Remove routing from a healthy session | `$context-guru-uninstall` |
-| Recover when routed sessions cannot run | `~/.local/state/context-guru-codex/context-guru-reset` |
+| Plan removal and show instructions | `$context-guru-uninstall` |
+| Remove routing and stop the proxy | `~/.local/state/context-guru-codex/context-guru-reset --yes` from an ordinary shell |
+
+Codex may ask permission when these skills need to access the local proxy, write configuration or
+state under your home directory, download an update, or restart the proxy. A sandboxed command can
+be blocked from `127.0.0.1` even when the proxy is healthy; status and insights therefore retry
+their read-only health checks with permission instead of reporting a false outage.
+
+Do not perform removal from a routed Codex session. Codex selects its transport when the session
+starts; stopping the proxy strands that session and it cannot recover even after routing is
+restored. `$context-guru-uninstall` therefore performs only a dry-run and directs you to the
+standalone command above. Exit Codex, run it, then start a new session.
 
 The uninstall skill and recovery script restore the provider that was selected before setup. They
 do not remove the Codex plugin registration. To remove that too, from an ordinary shell:

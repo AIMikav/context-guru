@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tarfile
 import tempfile
@@ -17,13 +18,24 @@ SPEC.loader.exec_module(PLUGIN)
 
 
 class CodexPluginTest(unittest.TestCase):
-    def test_session_start_hook_uses_plugin_root_and_is_synchronous(self):
+    def test_proxy_lifecycle_does_not_depend_on_a_sandboxed_session_hook(self):
         hooks_path = MODULE_PATH.parent.parent / "hooks.json"
         hooks = json.loads(hooks_path.read_text())
-        handler = hooks["hooks"]["SessionStart"][0]["hooks"][0]
-        self.assertEqual(handler["command"],
-                         'python3 "${PLUGIN_ROOT}/scripts/codex_plugin.py" ensure')
-        self.assertIs(handler["async"], False)
+        self.assertEqual(hooks, {"hooks": {}})
+
+    def test_skills_cover_sandbox_boundaries(self):
+        skills = MODULE_PATH.parent.parent / "skills"
+        for name in ("status", "insights", "insights-capabilities",
+                     "insights-components", "insights-idle"):
+            text = (skills / name / "SKILL.md").read_text()
+            self.assertIn('sandbox_permissions="require_escalated"', text, name)
+            self.assertIn("unverified", text, name)
+        for name in ("setup", "preset-picker", "cache-strategy-picker", "update"):
+            text = (skills / name / "SKILL.md").read_text()
+            self.assertIn('sandbox_permissions="require_escalated"', text, name)
+        uninstall = (skills / "uninstall" / "SKILL.md").read_text()
+        self.assertIn("Do not run the mutating uninstall command from inside Codex", uninstall)
+        self.assertIn("context-guru-reset --yes", uninstall)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -64,6 +76,58 @@ class CodexPluginTest(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(path.read_text(),
                          f"{PLUGIN.CONFIG_MARKER}\npreset: off\ncache:\n  keepalive: true\n")
+
+    def test_linux_proxy_is_started_by_user_service_not_child_process(self):
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.subprocess, "check_output", return_value="4321\n"), \
+             mock.patch.object(PLUGIN.subprocess, "Popen") as popen, \
+             mock.patch.object(PLUGIN, "healthy", return_value=True):
+            process = PLUGIN.start_proxy("/opt/context guru/proxy", 8791)
+        self.assertEqual(process.pid, 4321)
+        popen.assert_not_called()
+        unit = PLUGIN.systemd_unit()
+        self.assertTrue(unit.read_text().startswith(PLUGIN.CONFIG_MARKER))
+        self.assertIn('ExecStart="/opt/context guru/proxy"', unit.read_text())
+        self.assertIn(["systemctl", "--user", "enable", "--now", str(unit)],
+                      [call.args[0] for call in run.call_args_list])
+
+    def test_stop_owned_service_does_not_trust_recorded_pid(self):
+        unit = PLUGIN.systemd_unit()
+        unit.parent.mkdir(parents=True)
+        unit.write_text(PLUGIN.CONFIG_MARKER + "\n[Service]\n")
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.os, "kill") as kill:
+            self.assertEqual(PLUGIN.stop_owned({"service": "systemd", "pid": 22}), "stopped")
+        kill.assert_not_called()
+        self.assertFalse(unit.exists())
+        self.assertIn(["systemctl", "--user", "disable", "--now", unit.name],
+                      [call.args[0] for call in run.call_args_list])
+
+    def test_macos_proxy_is_started_by_launch_agent(self):
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Darwin"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run, \
+             mock.patch.object(PLUGIN.subprocess, "Popen") as popen, \
+             mock.patch.object(PLUGIN, "healthy", return_value=True):
+            process = PLUGIN.start_proxy("/opt/context guru/proxy", 8791)
+        self.assertEqual(process.pid, 0)
+        popen.assert_not_called()
+        with open(PLUGIN.launchd_plist(), "rb") as handle:
+            data = plistlib.load(handle)
+        self.assertEqual(data["ProgramArguments"][0], "/opt/context guru/proxy")
+        self.assertTrue(data["KeepAlive"])
+        self.assertIn("bootstrap", [part for call in run.call_args_list for part in call.args[0]])
+
+    def test_refuses_to_overwrite_unmanaged_user_service(self):
+        unit = PLUGIN.systemd_unit()
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/mine\n")
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run:
+            self.assertIsNone(PLUGIN.start_proxy("/proxy", 8791))
+        self.assertEqual(unit.read_text(), "[Service]\nExecStart=/mine\n")
+        run.assert_not_called()
 
     def test_refuses_unmanaged_proxy_config(self):
         PLUGIN.proxy_config().parent.mkdir(parents=True)

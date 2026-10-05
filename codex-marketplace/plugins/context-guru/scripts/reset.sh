@@ -22,6 +22,9 @@ PROXY_CONFIG="$STATE_DIR/proxy.yaml"
 ROUTING_STATE="$STATE_DIR/routing.json"
 ROUTING_HELPER="$STATE_DIR/config_route.py"
 RECORD="$STATE_DIR/install.json"
+CONFIG_BASE=${XDG_CONFIG_HOME:-"$HOME/.config"}
+SYSTEMD_UNIT="$CONFIG_BASE/systemd/user/context-guru-codex.service"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/io.rossoctl.context-guru-codex.plist"
 MARKER='# Managed by the context-guru Codex plugin.'
 
 owned=0
@@ -66,9 +69,27 @@ if [ "$config_owned" = 1 ]; then
   echo "proxy_config_removed=true"
 fi
 
-# Read only integer PID and path-shaped binary fields; never eval record content.
+# Stop the host-managed service first. Unlike a detached child, this service survives the Codex
+# command sandbox that created it. Remove only definitions at our exact private paths.
 process_state=gone
-if [ -f "$RECORD" ] && command -v python3 >/dev/null 2>&1; then
+if [ -f "$SYSTEMD_UNIT" ] && [ "$(sed -n '1p' "$SYSTEMD_UNIT")" = "$MARKER" ] && command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user disable --now context-guru-codex.service >/dev/null 2>&1; then
+    rm "$SYSTEMD_UNIT"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    process_state=stopped
+    echo "proxy_stopped=true"
+  else
+    process_state=not_owned
+    echo "proxy_stopped=false"
+    echo "reason=service_stop_failed"
+  fi
+elif [ -f "$LAUNCHD_PLIST" ] && command -v launchctl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
+     python3 -c 'import plistlib,sys; sys.exit(0 if plistlib.load(open(sys.argv[1], "rb")).get("ContextGuruManaged") is True else 1)' "$LAUNCHD_PLIST" 2>/dev/null; then
+  launchctl bootout "gui/$(id -u)/io.rossoctl.context-guru-codex" >/dev/null 2>&1 || true
+  rm "$LAUNCHD_PLIST"
+  process_state=stopped
+  echo "proxy_stopped=true"
+elif [ -f "$RECORD" ] && command -v python3 >/dev/null 2>&1; then
   pid=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("pid", ""))' "$RECORD" 2>/dev/null || true)
   bin=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("binary", ""))' "$RECORD" 2>/dev/null || true)
   case "$pid" in ''|*[!0-9]*) pid= ;; esac
