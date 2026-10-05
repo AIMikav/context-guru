@@ -852,10 +852,14 @@ func (d *dashEmitter) KeepAlivePing(r components.KeepAliveReport) {
 	// What the ping actually asked for, so the row says it rather than reading as a request
 	// with no output budget.
 	ev.MaxTokens = r.MaxTokens
-	// Reproduces dash.Event.Price's own gate exactly (see proxy/keepalive.go's record1, which
-	// computes the SAME cost independently for its own bookkeeping): no cost without a usable
-	// rate, and no cost claimed for a ping whose usage reported nothing at all.
+	// ev.Price still has to run: it is what fills TokenAccounting, BilledTokenFactor,
+	// BaselineCostUSD, CachesplitSavedUSD and KeepAliveSavedUSD, none of which the report
+	// carries. But r.CostUSD is already the authoritative figure — record1 computed it,
+	// priced the same way, to drive the keeper's OWN bookkeeping (e.spent, k.spentUSD) — so
+	// overwrite Price's recomputation with it afterward rather than trusting a second
+	// derivation of the same number from the same inputs to agree by construction.
 	ev.Price(price, priced && (r.CacheRead > 0 || r.CacheWrite > 0 || r.Output > 0))
+	ev.CostUSD = r.CostUSD
 	d.rec.Record(ev)
 }
 

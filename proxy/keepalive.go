@@ -1048,15 +1048,9 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt t
 	// usable rate, and no cost claimed for a ping whose usage reported nothing at all.
 	var cost float64
 	if priced && !price.Zero() && (u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
-		cost = price.Cost(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output)
-		// The one-hour write premium. Price.Cost knows a single write rate — the 5-minute one,
-		// at 1.25x base input — so tokens the provider billed at the 1-hour tier (2.0x) are
-		// short by the difference. See dash.Event.Price, whose formula this mirrors exactly.
-		if u.CacheWrite1h > 0 {
-			if premium := 2*price.Input - price.CacheWrite; premium > 0 {
-				cost += float64(u.CacheWrite1h) * premium
-			}
-		}
+		// See modelinfo.Price.CostWithCacheWrite1h for the one-hour write premium this folds
+		// in — the same helper dash.Event.Price uses, so the two cannot drift apart again.
+		cost = price.CostWithCacheWrite1h(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output, u.CacheWrite1h)
 	}
 	k.mu.Lock()
 	e.spent += cost

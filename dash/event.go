@@ -653,17 +653,8 @@ func (e *Event) Price(p modelinfo.Price, accountingComplete bool) {
 	// It multiplies counterfactual token counts only — never a provider-reported count, so
 	// CostUSD below is untouched.
 	e.BilledTokenFactor, e.BilledTokenFactorMeasured = tokens.BilledDeltaFactor(e.Model)
-	e.CostUSD = p.Cost(e.FreshInput, e.CacheRead, e.CacheWrite, e.OutputTokens)
-	// The one-hour write premium. Price.Cost knows a single write rate — the 5-minute one, at
-	// 1.25x base input — so the tokens the provider billed at the 1-hour tier (2.0x) are short
-	// by the difference. Derived from the documented multiplier rather than from a second
-	// configured rate, because no gateway publishes one: 2.0x input, minus whatever the 5m
-	// write rate is, on exactly the tokens the response says were written at 1h.
-	if e.CacheWrite1h > 0 {
-		if premium := 2*p.Input - p.CacheWrite; premium > 0 {
-			e.CostUSD += float64(e.CacheWrite1h) * premium
-		}
-	}
+	// See Price.CostWithCacheWrite1h for the one-hour write premium this folds in.
+	e.CostUSD = p.CostWithCacheWrite1h(e.FreshInput, e.CacheRead, e.CacheWrite, e.OutputTokens, e.CacheWrite1h)
 	e.BaselineCostUSD = e.CostUSD + e.baselineDeltaUSD(p)
 	// What the PROVIDER's prompt cache saved on this request: every cache-read token was
 	// billed at the read rate instead of the fresh rate it would have cost with no cache at
