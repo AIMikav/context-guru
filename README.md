@@ -61,12 +61,6 @@ Choose your setup. Each button opens only the instructions for that path.
 
 ## Presets
 
-Change what gets trimmed with:
-
-```
-/context-guru:preset-picker
-```
-
 It's an effort ladder — each tier is everything in the one before it, plus more:
 
 | Preset | What it adds | Spends on its own |
@@ -77,9 +71,15 @@ It's an effort ladder — each tier is everything in the one before it, plus mor
 | `high` | `medium` plus a summarizer that compacts older turns once the context window is nearly full | yes |
 | `xhigh` | `high` plus a periodic deep-adjudication sweep over turns whose prompt cache has gone cold — the deepest cut | yes |
 
-Run the picker above any time to switch tiers — it explains each one before asking which to set.
-A restart is required — it takes effect at the next proxy start, not the current session; run
-`/context-guru:status` afterward to confirm it stuck. Full pipelines:
+Run the picker any time to switch tiers—it explains each one before asking which to set:
+
+| Claude Code | Codex (experimental) |
+|---|---|
+| `/context-guru:preset-picker` | `$context-guru-preset-picker` |
+
+Claude Code applies the change at the next proxy start; Codex restarts its owned proxy after the
+selection. Confirm the result with `/context-guru:status` on Claude Code or
+`$context-guru-status` on Codex. Full pipelines:
 [docs/reference/presets.md](docs/reference/presets.md).
 
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
