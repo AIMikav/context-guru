@@ -10,6 +10,15 @@ codex plugin marketplace add rossoctl/context-guru
 codex plugin add context-guru@context-guru
 ```
 
+The first command clones and registers the GitHub marketplace. On the first run it can take a
+minute or more, depending on GitHub/network speed and local disk performance, and may be quiet
+while it downloads. Let it finish before running the second command.
+
+Run marketplace registration from an ordinary shell. You can install the plugin afterward either
+with the second command above or from `/plugins` inside Codex. Asking an existing Codex session to
+run the shell commands is possible, but provides no advantage: Codex only loads newly installed
+plugin skills in a new session, so you must restart Codex either way.
+
 Start Codex and invoke the setup skill:
 
 ```text
