@@ -22,6 +22,7 @@ PROXY_CONFIG="$STATE_DIR/proxy.yaml"
 ROUTING_STATE="$STATE_DIR/routing.json"
 ROUTING_HELPER="$STATE_DIR/config_route.py"
 RECORD="$STATE_DIR/install.json"
+MANAGED_BINARY="$STATE_DIR/bin/context-guru-proxy"
 CONFIG_BASE=${XDG_CONFIG_HOME:-"$HOME/.config"}
 SYSTEMD_UNIT="$CONFIG_BASE/systemd/user/context-guru-codex.service"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/io.rossoctl.context-guru-codex.plist"
@@ -37,6 +38,7 @@ echo "config=$MAIN_CONFIG"
 echo "proxy_config=$PROXY_CONFIG"
 echo "proxy_config_owned=$config_owned"
 [ -f "$RECORD" ] && echo "record=$RECORD" || echo "record=(none)"
+[ -f "$MANAGED_BINARY" ] && echo "managed_binary=$MANAGED_BINARY" || echo "managed_binary=(none)"
 
 if [ "$DRY" = 1 ]; then echo "result=planned"; exit 0; fi
 if [ "$YES" != 1 ]; then
@@ -102,5 +104,10 @@ elif [ -f "$RECORD" ] && command -v python3 >/dev/null 2>&1; then
   fi
 fi
 [ "$process_state" = not_owned ] || rm -f "$RECORD"
+if [ "$process_state" != not_owned ] && [ -f "$MANAGED_BINARY" ]; then
+  rm "$MANAGED_BINARY"
+  rmdir "$STATE_DIR/bin" 2>/dev/null || true
+  echo "binary_removed=true"
+fi
 echo "result=removed"
 echo "recovery=$STATE_DIR/recovery"

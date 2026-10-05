@@ -56,14 +56,17 @@ or newer.
 Setup copies a standalone recovery command to
 `~/.local/state/context-guru-codex/context-guru-reset`. Use it from an ordinary, unrouted shell if
 the proxy is down and Codex cannot start. It restores the previous default provider, removes only
-the marked provider block, and removes only context-guru's owned user service. Older installations
-that predate user-service supervision retain the guarded recorded-process cleanup as a fallback.
+the marked provider block, removes only context-guru's owned user service, and deletes the proxy
+binary downloaded into the plugin's private state directory. A proxy binary reused from `PATH` is
+never removed. Older installations that predate user-service supervision retain the guarded
+recorded-process cleanup as a fallback.
 
 ## Operations and troubleshooting
 
 | Task | Command |
 |---|---|
 | Check routing and proxy health | `$context-guru-status` |
+| Print raw proxy statistics JSON | `$context-guru-status --stats` |
 | Check for a proxy update | `$context-guru-update` |
 | Install a proxy update | `~/.local/state/context-guru-codex/context-guru-update` from an ordinary shell |
 | Plan removal and show instructions | `$context-guru-uninstall` |

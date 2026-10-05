@@ -59,6 +59,18 @@ def managed_binary():
     return state_dir() / "bin/context-guru-proxy"
 
 
+def remove_managed_binary():
+    binary = managed_binary()
+    if not binary.exists():
+        return False
+    binary.unlink()
+    try:
+        binary.parent.rmdir()
+    except OSError:
+        pass
+    return True
+
+
 def systemd_unit():
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "systemd/user/context-guru-codex.service"
@@ -550,9 +562,20 @@ def serve(_args):
     os.execv(executable, proxy_command(executable, port, record.get("upstream")))
 
 
-def status(_args):
+def status(args):
     record = read_record()
     port = int(record.get("port", 0))
+    if getattr(args, "stats", False):
+        if not port:
+            print("context-guru status --stats: no installed proxy", file=sys.stderr)
+            return 1
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/stats", timeout=2) as response:
+                sys.stdout.write(response.read().decode("utf-8"))
+            return 0
+        except Exception as error:
+            print(f"context-guru status --stats: {error}", file=sys.stderr)
+            return 1
     up = bool(port and healthy(port))
     configured = is_routed(main_config())
     values = {"result": "ok" if up and configured else "not_ready", "config": main_config(),
@@ -678,6 +701,8 @@ def uninstall(args):
     install = state_dir() / "install.json"
     if install.exists() and process_result != "not_owned":
         install.unlink()
+    if process_result != "not_owned":
+        facts(binary_removed=str(remove_managed_binary()).lower())
     facts(result="removed")
     return 0
 
@@ -688,7 +713,8 @@ def main():
     install = commands.add_parser("setup")
     install.add_argument("--plan", action="store_true")
     install.add_argument("--i-consent-to-traffic-interception", action="store_true")
-    commands.add_parser("status")
+    status_parser = commands.add_parser("status")
+    status_parser.add_argument("--stats", action="store_true")
     commands.add_parser("ensure")
     commands.add_parser("serve")
     upgrade = commands.add_parser("update")

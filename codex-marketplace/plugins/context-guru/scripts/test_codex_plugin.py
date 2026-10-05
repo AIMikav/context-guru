@@ -9,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("codex_plugin.py")
@@ -41,6 +42,10 @@ class CodexPluginTest(unittest.TestCase):
         uninstall = (skills / "uninstall" / "SKILL.md").read_text()
         self.assertIn("Do not run the mutating uninstall command from inside Codex", uninstall)
         self.assertIn("context-guru-reset --yes", uninstall)
+        status = (skills / "status" / "SKILL.md").read_text()
+        self.assertIn("status --stats", status)
+        self.assertIn("stdout verbatim", status)
+        self.assertIn("no narration", status)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -196,6 +201,64 @@ screen_reader_detection_done = true
         self.assertTrue(PLUGIN.profile().exists())
         self.assertTrue((PLUGIN.state_dir() / "install.json").exists())
 
+    def test_uninstall_removes_managed_binary_after_safe_cleanup(self):
+        binary = PLUGIN.managed_binary()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"proxy")
+        PLUGIN.state_dir().joinpath("install.json").write_text("{}")
+        args = type("Args", (), {"dry_run": False})()
+        with mock.patch.object(PLUGIN, "stop_owned", return_value="gone"):
+            self.assertEqual(PLUGIN.uninstall(args), 0)
+        self.assertFalse(binary.exists())
+        self.assertFalse(binary.parent.exists())
+
+    def test_uninstall_preserves_managed_binary_when_process_is_not_owned(self):
+        binary = PLUGIN.managed_binary()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"proxy")
+        PLUGIN.state_dir().joinpath("install.json").write_text("{}")
+        args = type("Args", (), {"dry_run": False})()
+        with mock.patch.object(PLUGIN, "stop_owned", return_value="not_owned"):
+            self.assertEqual(PLUGIN.uninstall(args), 0)
+        self.assertTrue(binary.exists())
+
+    def test_status_stats_prints_exact_response_body(self):
+        PLUGIN.state_dir().mkdir(parents=True)
+        PLUGIN.state_dir().joinpath("install.json").write_text('{"port": 8791}')
+        body = b'{"requests":3,"tokens_saved":17}\n'
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = type("Args", (), {"stats": True})()
+        with mock.patch.object(PLUGIN.urllib.request, "urlopen",
+                               return_value=io.BytesIO(body)) as fetch, \
+             mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            self.assertEqual(PLUGIN.status(args), 0)
+        fetch.assert_called_once_with("http://127.0.0.1:8791/stats", timeout=2)
+        self.assertEqual(stdout.getvalue(), body.decode())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_status_stats_without_install_keeps_stdout_empty(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = type("Args", (), {"stats": True})()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            self.assertEqual(PLUGIN.status(args), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("no installed proxy", stderr.getvalue())
+
+    def test_status_stats_fetch_failure_keeps_stdout_empty(self):
+        PLUGIN.state_dir().mkdir(parents=True)
+        PLUGIN.state_dir().joinpath("install.json").write_text('{"port": 8791}')
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = type("Args", (), {"stats": True})()
+        error = urllib.error.URLError("connection refused")
+        with mock.patch.object(PLUGIN.urllib.request, "urlopen", side_effect=error), \
+             mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            self.assertEqual(PLUGIN.status(args), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("connection refused", stderr.getvalue())
+
     def test_escape_hatch_is_installed_outside_plugin(self):
         target = PLUGIN.install_escape_hatch()
         self.assertEqual(target, PLUGIN.state_dir() / "context-guru-reset")
@@ -314,6 +377,36 @@ screen_reader_detection_done = true
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
         self.assertFalse(PLUGIN.is_routed(PLUGIN.main_config()))
         self.assertFalse(PLUGIN.proxy_config().exists())
+
+    def test_reset_removes_managed_binary(self):
+        binary = PLUGIN.managed_binary()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"proxy")
+        completed = subprocess.run(
+            ["sh", str(Path(__file__).with_name("reset.sh")), "--yes"],
+            env=os.environ.copy(), text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("binary_removed=true", completed.stdout)
+        self.assertFalse(binary.exists())
+        self.assertFalse(binary.parent.exists())
+
+    def test_reset_preserves_managed_binary_when_recorded_process_is_not_owned(self):
+        binary = PLUGIN.managed_binary()
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"proxy")
+        PLUGIN.state_dir().joinpath("install.json").write_text(json.dumps({
+            "pid": os.getpid(), "binary": "/definitely/not/this/test-process"
+        }))
+        completed = subprocess.run(
+            ["sh", str(Path(__file__).with_name("reset.sh")), "--yes"],
+            env=os.environ.copy(), text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("reason=process_not_owned", completed.stdout)
+        self.assertNotIn("binary_removed=true", completed.stdout)
+        self.assertTrue(binary.exists())
+        self.assertTrue(PLUGIN.state_dir().joinpath("install.json").exists())
 
     def test_explicit_update_sets_upgrade_gate(self):
         args = type("Args", (), {"check": False, "install": True})()
