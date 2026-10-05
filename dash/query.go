@@ -474,11 +474,11 @@ type SessionRow struct {
 	// TenantID names the account. A session id is unique per account, so under a
 	// manager's service-wide scope this is what makes the list attributable — and a
 	// comma-joined value is the honest answer when two accounts share an id.
-	TenantID        string  `json:"tenant_id"`
-	Turns           int64   `json:"turns"`
-	Start           int64   `json:"start"`
-	End             int64   `json:"end"`
-	Models          string  `json:"models"`
+	TenantID string `json:"tenant_id"`
+	Turns    int64  `json:"turns"`
+	Start    int64  `json:"start"`
+	End      int64  `json:"end"`
+	Models   string `json:"models"`
 	// PrimaryModel is the single model that did the most output work in this session —
 	// the model with the highest summed output_tokens for this session_id — not just
 	// whichever string GROUP_CONCAT(DISTINCT ...) happened to list first. A session
