@@ -89,7 +89,7 @@ class CodexPluginTest(unittest.TestCase):
         unit = PLUGIN.systemd_unit()
         self.assertTrue(unit.read_text().startswith(PLUGIN.CONFIG_MARKER))
         self.assertIn('ExecStart="/opt/context guru/proxy"', unit.read_text())
-        self.assertIn(["systemctl", "--user", "enable", "--now", unit.name],
+        self.assertIn(["systemctl", "--user", "enable", "--now", str(unit)],
                       [call.args[0] for call in run.call_args_list])
 
     def test_stop_owned_service_does_not_trust_recorded_pid(self):

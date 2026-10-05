@@ -332,7 +332,7 @@ def start_proxy(executable, port, upstream=None):
         try:
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True,
                            capture_output=True, text=True)
-            subprocess.run(["systemctl", "--user", "enable", "--now", unit.name], check=True,
+            subprocess.run(["systemctl", "--user", "enable", "--now", str(unit)], check=True,
                            capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError):
             return None
