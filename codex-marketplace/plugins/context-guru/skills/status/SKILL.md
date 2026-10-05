@@ -5,6 +5,12 @@ description: Check Codex default routing, context-guru proxy health, and measure
 
 # Check context-guru for Codex
 
+If invoked with `--stats`, run `python3 ../../scripts/codex_plugin.py status --stats` and print its
+stdout verbatim—no narration, interpretation, health summary, or additional formatting. If
+loopback access is blocked, retry that same read-only command with
+`sandbox_permissions="require_escalated"`; never replace unavailable raw output with invented or
+previously cached statistics.
+
 Run `python3 ../../scripts/codex_plugin.py status` from this skill directory. Report the config,
 port, proxy health, and whether default routing is configured. A healthy proxy alone does not
 prove that this session uses it. Summarize `stats_json` without inventing savings.

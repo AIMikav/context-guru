@@ -136,7 +136,9 @@ script un-routes every settings file the plugin edited. Codex routing is user-wi
 standalone reset restores the previously selected default provider. Do not stop the proxy from a
 routed Codex session: that session cannot change transport and its remaining turns will be
 stranded. `$context-guru-uninstall` only plans the removal and shows the shell command. Neither
-client's removal flow removes the marketplace registration or plugin package itself.
+client's removal flow removes the marketplace registration or plugin package itself. Codex reset
+does remove a proxy binary downloaded into its private state directory; it never removes a binary
+that setup reused from `PATH`.
 
 More:
 [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#removing-it-uninstall-or-reset).
