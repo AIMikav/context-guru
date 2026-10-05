@@ -83,7 +83,8 @@ if [ -f "$SYSTEMD_UNIT" ] && [ "$(sed -n '1p' "$SYSTEMD_UNIT")" = "$MARKER" ] &&
     echo "proxy_stopped=false"
     echo "reason=service_stop_failed"
   fi
-elif [ -f "$LAUNCHD_PLIST" ] && command -v launchctl >/dev/null 2>&1; then
+elif [ -f "$LAUNCHD_PLIST" ] && command -v launchctl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
+     python3 -c 'import plistlib,sys; sys.exit(0 if plistlib.load(open(sys.argv[1], "rb")).get("ContextGuruManaged") is True else 1)' "$LAUNCHD_PLIST" 2>/dev/null; then
   launchctl bootout "gui/$(id -u)/io.rossoctl.context-guru-codex" >/dev/null 2>&1 || true
   rm "$LAUNCHD_PLIST"
   process_state=stopped

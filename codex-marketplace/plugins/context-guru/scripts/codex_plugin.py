@@ -320,13 +320,15 @@ def start_proxy(executable, port, upstream=None):
     if system == "Linux":
         unit = systemd_unit()
         unit.parent.mkdir(parents=True, exist_ok=True)
+        if unit.exists() and not unit.read_text().startswith(CONFIG_MARKER):
+            return None
         unit.write_text(
             f"{CONFIG_MARKER}\n[Unit]\nDescription=context-guru for Codex\n\n"
             "[Service]\nType=simple\n"
             f"ExecStart={' '.join(_systemd_quote(item) for item in command)}\n"
             "Restart=on-failure\nRestartSec=1\n"
-            f"StandardOutput=append:{root / 'proxy.log'}\n"
-            f"StandardError=append:{root / 'proxy.log'}\n\n"
+            f"StandardOutput={_systemd_quote('append:' + str(root / 'proxy.log'))}\n"
+            f"StandardError={_systemd_quote('append:' + str(root / 'proxy.log'))}\n\n"
             "[Install]\nWantedBy=default.target\n")
         unit.chmod(0o600)
         try:
@@ -341,8 +343,16 @@ def start_proxy(executable, port, upstream=None):
     elif system == "Darwin":
         plist = launchd_plist()
         plist.parent.mkdir(parents=True, exist_ok=True)
+        if plist.exists():
+            try:
+                with open(plist, "rb") as handle:
+                    if plistlib.load(handle).get("ContextGuruManaged") is not True:
+                        return None
+            except (OSError, ValueError, plistlib.InvalidFileException):
+                return None
         with open(plist, "wb") as handle:
             plistlib.dump({"Label": "io.rossoctl.context-guru-codex",
+                           "ContextGuruManaged": True,
                            "ProgramArguments": command, "RunAtLoad": True,
                            "KeepAlive": True, "ProcessType": "Background",
                            "StandardOutPath": str(root / "proxy.log"),
@@ -569,6 +579,9 @@ def stop_owned(record):
     if service == "launchd" or (service is None and launchd_plist().exists()):
         plist = launchd_plist()
         try:
+            with open(plist, "rb") as handle:
+                if plistlib.load(handle).get("ContextGuruManaged") is not True:
+                    return "not_owned"
             subprocess.run(["launchctl", "bootout",
                             f"gui/{os.getuid()}/io.rossoctl.context-guru-codex"], check=False,
                            capture_output=True)

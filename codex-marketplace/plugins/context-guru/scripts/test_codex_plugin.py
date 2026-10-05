@@ -120,6 +120,16 @@ class CodexPluginTest(unittest.TestCase):
         self.assertTrue(data["KeepAlive"])
         self.assertIn("bootstrap", [part for call in run.call_args_list for part in call.args[0]])
 
+    def test_refuses_to_overwrite_unmanaged_user_service(self):
+        unit = PLUGIN.systemd_unit()
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/mine\n")
+        with mock.patch.object(PLUGIN.platform, "system", return_value="Linux"), \
+             mock.patch.object(PLUGIN.subprocess, "run") as run:
+            self.assertIsNone(PLUGIN.start_proxy("/proxy", 8791))
+        self.assertEqual(unit.read_text(), "[Service]\nExecStart=/mine\n")
+        run.assert_not_called()
+
     def test_refuses_unmanaged_proxy_config(self):
         PLUGIN.proxy_config().parent.mkdir(parents=True)
         PLUGIN.proxy_config().write_text("preset: mine\n")
