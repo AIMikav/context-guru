@@ -30,10 +30,12 @@ class CodexPluginTest(unittest.TestCase):
             text = (skills / name / "SKILL.md").read_text()
             self.assertIn('sandbox_permissions="require_escalated"', text, name)
             self.assertIn("unverified", text, name)
-        for name in ("setup", "preset-picker", "cache-strategy-picker",
-                     "update", "uninstall"):
+        for name in ("setup", "preset-picker", "cache-strategy-picker", "update"):
             text = (skills / name / "SKILL.md").read_text()
             self.assertIn('sandbox_permissions="require_escalated"', text, name)
+        uninstall = (skills / "uninstall" / "SKILL.md").read_text()
+        self.assertIn("Do not run the mutating uninstall command from inside Codex", uninstall)
+        self.assertIn("context-guru-reset --yes", uninstall)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

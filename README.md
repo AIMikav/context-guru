@@ -120,16 +120,18 @@ Prefer recovery over an in-session uninstall when the session is stuck: a dead p
 request that would invoke the uninstall skill. More troubleshooting: [Claude Code](docs/how-to/install-plugin.md#troubleshooting)
 or [Codex](codex-marketplace/plugins/context-guru/README.md#operations-and-troubleshooting).
 
-For a healthy session, remove context-guru routing with:
+Remove context-guru routing with:
 
 | Claude Code | Codex (experimental) |
 |---|---|
-| `/context-guru:uninstall` | `$context-guru-uninstall` |
+| `/context-guru:uninstall` | Exit Codex, then run `~/.local/state/context-guru-codex/context-guru-reset --yes` in an ordinary shell. |
 
 On Claude Code, uninstall affects the install routing the current project, while the recovery
 script un-routes every settings file the plugin edited. Codex routing is user-wide, so its
-uninstall and recovery paths both restore the previously selected default provider. Neither
-removes the marketplace registration or plugin package itself.
+standalone reset restores the previously selected default provider. Do not stop the proxy from a
+routed Codex session: that session cannot change transport and its remaining turns will be
+stranded. `$context-guru-uninstall` only plans the removal and shows the shell command. Neither
+client's removal flow removes the marketplace registration or plugin package itself.
 
 More:
 [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#removing-it-uninstall-or-reset).
