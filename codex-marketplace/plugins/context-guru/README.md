@@ -44,3 +44,29 @@ Setup copies a standalone recovery command to
 the proxy is down and Codex cannot start. It restores the previous default provider, removes only
 the marked provider block, and signals only the recorded process whose command still names the
 recorded binary.
+
+## Operations and troubleshooting
+
+| Task | Command |
+|---|---|
+| Check routing and proxy health | `$context-guru-status` |
+| Update the proxy binary | `$context-guru-update` |
+| Remove routing from a healthy session | `$context-guru-uninstall` |
+| Recover when routed sessions cannot run | `~/.local/state/context-guru-codex/context-guru-reset` |
+
+The uninstall skill and recovery script restore the provider that was selected before setup. They
+do not remove the Codex plugin registration. To remove that too, from an ordinary shell:
+
+```sh
+codex plugin remove context-guru@context-guru
+codex plugin marketplace remove context-guru
+```
+
+To refresh the plugin code without removing it:
+
+```sh
+codex plugin marketplace upgrade context-guru
+```
+
+Restart Codex after installing or refreshing plugin code. Routing or proxy changes made by setup
+take effect for model traffic in the next Codex process.

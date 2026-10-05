@@ -88,49 +88,51 @@ config reference — is in **[docs/design.md](docs/design.md)** and
 
 ## Updating
 
-The proxy **binary** is what matters and what changes often. A routed session checks for a newer
-release every 5 minutes and tells you once, with three answers: update now, always update
-automatically, or do nothing for that release. Update it any time with:
+The proxy **binary** is what matters and what changes often. Claude Code checks for a newer release
+in routed sessions and offers update choices; Codex checks when you invoke its update skill. Update
+it any time with the command for your client:
 
-```
-/context-guru:update
-```
+| Claude Code | Codex (experimental) |
+|---|---|
+| `/context-guru:update` | `$context-guru-update` |
 
 **The plugin itself** (skills, hooks, scripts) rarely needs updating — most releases only touch the
-proxy binary, which `/context-guru:update` already covers. If you do want the latest plugin code:
+proxy binary, which the update command above already covers. To refresh the plugin itself:
 
-```
-/plugin marketplace update rossoctl/context-guru
-/reload-plugins
-```
+| Claude Code | Codex (experimental) |
+|---|---|
+| `/plugin marketplace update rossoctl/context-guru`<br>`/reload-plugins` | `codex plugin marketplace upgrade context-guru`<br>Then restart Codex. |
 
 More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#upgrading).
 
 ## Troubleshooting
 
-**If something breaks and Claude can't fix it**, run the recovery script — no session, no proxy,
-no network needed:
+**If a routed session cannot start or answer**, run the client-specific recovery script from an
+ordinary shell. It needs no working agent session, proxy, or network:
 
-```
-~/.local/state/context-guru/context-guru-reset
-```
+| Claude Code | Codex (experimental) |
+|---|---|
+| `~/.local/state/context-guru/context-guru-reset` | `~/.local/state/context-guru-codex/context-guru-reset` |
 
-Prefer it over `/context-guru:uninstall` or `/plugin uninstall context-guru@context-guru` when a
-session is actually stuck: a dead proxy fails every request, including the ones an uninstall
-command would need. More: [docs/how-to/install-plugin.md#troubleshooting](docs/how-to/install-plugin.md#troubleshooting).
+Prefer recovery over an in-session uninstall when the session is stuck: a dead proxy prevents the
+request that would invoke the uninstall skill. More troubleshooting: [Claude Code](docs/how-to/install-plugin.md#troubleshooting)
+or [Codex](codex-marketplace/plugins/context-guru/README.md#operations-and-troubleshooting).
 
-**The two are not the same, though.** `/context-guru:uninstall` undoes **one** install — the one
-routing the project you run it in — and leaves any other alone; the recovery script un-routes
-**every** settings file the plugin edited, machine-wide one included.
+For a healthy session, remove context-guru routing with:
 
-```
-/context-guru:uninstall
-```
+| Claude Code | Codex (experimental) |
+|---|---|
+| `/context-guru:uninstall` | `$context-guru-uninstall` |
+
+On Claude Code, uninstall affects the install routing the current project, while the recovery
+script un-routes every settings file the plugin edited. Codex routing is user-wide, so its
+uninstall and recovery paths both restore the previously selected default provider. Neither
+removes the marketplace registration or plugin package itself.
 
 More:
 [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#removing-it-uninstall-or-reset).
 
-## Upgrading from project level to user level
+## Upgrading Claude Code from project level to user level
 
 Installed in one project and now want it everywhere? Install again with `--global` and keep both —
 each gets its own port, and a project you later reset falls back to the machine-wide one.
@@ -141,6 +143,9 @@ each gets its own port, and a project you later reset falls back to the machine-
 
 More:
 [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#upgrading-from-project-level-to-user-level).
+
+Codex does not have this project/user routing split: `$context-guru-setup` configures the user's
+default provider for ordinary Codex sessions.
 
 ## License
 
