@@ -427,10 +427,15 @@ a tenth of the price, and shows a truncated view of each output — so it is cou
 (`sweep_fallback_used`). It still asks the **request's** model: the reason that model was chosen is
 faithful quoting, not caching.
 
-`block_fallback: true` declines instead, forgoing the yield rather than paying for it.
+`block_fallback: true` declines instead, forgoing the yield rather than paying for it. Left unset, a
+process running at `CG_LOG_LEVEL=debug` behaves as if it were set — the fallback's failure reason is
+otherwise recorded only on the decline branch, and debug is precisely the mode reached for to see it.
+Setting `block_fallback: false` explicitly opts back out of that.
 
 Note what neither mode can undo: the fresh read that already happened on the call that missed. The
-counter is what tells an operator the window is mistimed.
+counter is what tells an operator the window is mistimed. Either way, a failed prefix ask is now also
+logged at WARN with the session and the gate it raised, so the reason is never visible only inside a
+rejection string that the default path never writes.
 
 ### The model is not a free choice here
 
@@ -479,7 +484,7 @@ net; the model does not get to hear about it.
 | `evidence` | `false` | Add the co-reference index's record to each inventory line. It is **evidence the model weighs, never a filter** over the candidates — a pre-filter left about one candidate per request, collapsing a bulk arm into the per-output shape refuted at 6% live-kept. Also adds a paragraph teaching how to read the counters; counters with no explanation invite an invented reading. |
 | `econ_trigger` | `false` | Add the **economic** trigger alongside the pre-expiry window, so a live cached prefix can be swept when the saving outruns the cache-write it forces. The two are OR'd and neither contains the other: pre-expiry fires on the clock and cannot reach a session whose cache keeps being refreshed — the long run with the most to save — while econ fires on mass and cannot know how much time is left. |
 | `econ_ignore_ask_cost` | `false` | Restore the econ trigger's original break-even, which charged the cache-write and **not** the adjudication that reads it. Left out, that authorised 9 asks in 9 on iteration 025's pre-flight, six of which removed nothing: $0.4339 spent against $0.0017 of value. Set true only to attribute a run's difference to the change. |
-| `block_fallback` | `false` | Decline instead of falling back to a content-carrying completion when the cache read did not happen. |
+| `block_fallback` | `false`; `true` under `CG_LOG_LEVEL=debug` unless set explicitly | Decline instead of falling back to a content-carrying completion when the cache read did not happen. Unset tracks the process log level because the fallback's failure reason is only recorded on the decline branch — leaving the default on under debug discarded exactly the evidence debug exists to show. Writing `false` explicitly is not the same as leaving it unset: an explicit value, either way, overrides the debug default. The prefix-ask failure is now also logged at WARN regardless of this setting. |
 | `marker_mode` | `full` | `full` is the only mode that keeps a removal recoverable. |
 
 Every other key is a **config error naming its reason**, not an ignored one. `strategy`, `rewrite`,

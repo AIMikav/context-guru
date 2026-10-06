@@ -59,6 +59,10 @@ type ExtractSweep struct {
 	minInventory int
 	// blockFallback refuses the content-copying fallback. See extractSweepConfig.BlockFallback.
 	blockFallback bool
+	// blockFallbackSet is true when the operator wrote `block_fallback` explicitly (either value).
+	// It gates the debug override in effectiveBlockFallback: an explicit value always wins, and only
+	// the UNSET case defers to the process log level.
+	blockFallbackSet bool
 	// preExpiry is how long before the prompt cache's believed expiry the sweep may fire. See
 	// sweeping() for why the window is where it is, and why its WIDTH is the one number here that
 	// no measurement settles.
@@ -210,6 +214,13 @@ type extractSweepConfig struct {
 	// declined to act. But the fallback pays fresh for content the cached path reads for a tenth of
 	// the price, which is where this component's predecessor lost money. Default on the side of
 	// working; switch it off where the bill matters more than the yield. Counted either way.
+	//
+	// UNSET defers to the process log level: at CG_LOG_LEVEL=debug the effective value is true, same
+	// as writing it explicitly — see ExtractSweep.effectiveBlockFallback. The provider's failure text
+	// lands in r.rec.Rejection only on the decline branch, so leaving the default fallback running
+	// under debug was exactly the mode built to show why a call did what it did, with that evidence
+	// discarded. Writing `block_fallback: false` is NOT the same as leaving it unset: an explicit
+	// value, either way, always wins over the debug default.
 	BlockFallback bool `yaml:"block_fallback"`
 	// MarkerMode is how a removed output is referenced. `full`, the default, is the only mode that
 	// keeps the removal recoverable.
@@ -298,6 +309,12 @@ var sweepBannedKeys = []struct {
 func newExtractSweep(raw []byte) (components.Component, error) {
 	// The banned keys FIRST, before components.Decode's KnownFields rejects them with a generic
 	// yaml message. The whole point is that the error names the reason.
+	//
+	// The same probe also answers whether `block_fallback` was WRITTEN at all, which
+	// extractSweepConfig.BlockFallback cannot: its zero value is indistinguishable from an operator
+	// who typed `block_fallback: false`. effectiveBlockFallback needs that distinction to let an
+	// explicit value override the debug default rather than be overridden by it.
+	blockFallbackSet := false
 	if len(raw) > 0 {
 		var probe map[string]yaml.Node
 		if err := yaml.Unmarshal(raw, &probe); err == nil {
@@ -306,6 +323,7 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 					return nil, fmt.Errorf("extract_llm_sweep: %s does not apply here: %s", b.key, b.why)
 				}
 			}
+			_, blockFallbackSet = probe["block_fallback"]
 		}
 	}
 	cfg := extractSweepConfig{}
@@ -341,7 +359,7 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 	return &ExtractSweep{
 		minTokens: cfg.MinTokens, minInventory: cfg.MinInventory,
 		preExpiry: pre, mode: parseMarkerMode(cfg.MarkerMode),
-		blockFallback: cfg.BlockFallback, econTrigger: cfg.EconTrigger,
+		blockFallback: cfg.BlockFallback, blockFallbackSet: blockFallbackSet, econTrigger: cfg.EconTrigger,
 		evidence: cfg.Evidence, ignoreAskCost: cfg.EconIgnoreAskCost,
 		minLaterTurns: cfg.MinLaterTurns, minPressure: cfg.MinPressure,
 		rewardPremium: cfg.RewardPremium, keepRecheckTurns: cfg.KeepRecheckTurns,
@@ -354,6 +372,21 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 
 func (*ExtractSweep) Name() string                 { return "extract_llm_sweep" }
 func (*ExtractSweep) Enabled(*components.Ctx) bool { return true }
+
+// effectiveBlockFallback is the runtime answer to "decline instead of falling back?" An explicit
+// `block_fallback` (either value) always wins. Left UNSET, debug logging stands in for it: debug is
+// the mode an operator reaches for specifically to see why a call did what it did, and the
+// fallback's own provider error is recorded on the rejection ONLY when block_fallback is set (see
+// the "prefix ask failed and block_fallback is set" rejections below) — so leaving the default off
+// under debug was losing the one piece of evidence debug exists to show. See the WARN logged on
+// every failed prefix ask, below, for the other half of that fix: the error is no longer lost even
+// when this returns false.
+func (e *ExtractSweep) effectiveBlockFallback(c *components.Ctx) bool {
+	if e.blockFallbackSet {
+		return e.blockFallback
+	}
+	return logging.Debugging(c.Ctx)
+}
 
 // sweeping reports whether this turn falls in the PRE-EXPIRY WINDOW: the prompt cache still exists,
 // and it is close enough to expiring that invalidating it costs little.
@@ -1340,7 +1373,7 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		// No asker at all: a non-Anthropic route, or no incoming client. Not a failure of the ask —
 		// there was nothing to ask through — so it takes the same fork as a missed read.
 		r.gate("sweep_no_asker")
-		if e.blockFallback {
+		if e.effectiveBlockFallback(c) {
 			r.gate("sweep_fallback_blocked")
 			r.rec.Rejection = "no prefix asker on this route and block_fallback is set"
 			return nil, r
@@ -1405,8 +1438,15 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			r.gate("sweep_no_prefix")
 		} else {
 			r.gate("sweep_ask_failed")
+			// The provider's error text otherwise survives only in r.rec.Rejection, which is set
+			// below ONLY when block_fallback declines — on the default path the error is folded
+			// into a fresh-priced fallback and never logged anywhere. Always WARN it: this is a
+			// degrade-but-keep-serving case (we fell open to the fallback, or declined), the
+			// vocabulary this codebase's logging doc reserves for WARN.
+			logging.From(c.Ctx).Warn("cg.sweep.ask_failed", "session", c.Session,
+				"gate", "sweep_ask_failed", "err", err)
 		}
-		if e.blockFallback {
+		if e.effectiveBlockFallback(c) {
 			r.gate("sweep_fallback_blocked")
 			r.rec.Rejection = "prefix ask failed and block_fallback is set: " + err.Error()
 			return nil, r
@@ -1448,7 +1488,7 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		if usage.CacheRead == 0 {
 			r.gate("sweep_prefix_cache_read_ZERO")
 		}
-		if e.blockFallback {
+		if e.effectiveBlockFallback(c) {
 			r.gate("sweep_fallback_blocked")
 			// SAY WHICH FAILURE THIS WAS. The condition above now admits a partial hit that WROTE,
 			// and on such a call "read nothing from cache" is simply false -- CacheRead can be 39,805.
@@ -1865,7 +1905,7 @@ func init() {
 		{Key: "pre_expiry_seconds", Type: components.FieldInt, Default: int(defaultPreExpiry / time.Second),
 			Hint: "How long before the prompt cache's believed expiry the sweep may fire. The window is where BOTH halves are cheap: the ask still reads a live cache, and the prefix it invalidates has little life left. The TTL itself is read from the request, never assumed. This WIDTH is the component's one unmeasured number — wider fires more often and invalidates more remaining TTL, narrower fires rarely, and nothing measures either side."},
 		{Key: "block_fallback", Type: components.FieldBool,
-			Hint: "Decline instead of falling back when the prefix ask could not read the cache. Unset = FALSE: the fallback asks again with a bounded sample of each output copied into the prompt, which keeps the component working on a session's first turn and whenever a cache entry has gone — but pays fresh for content the cached path reads for a tenth of the price. Set true where the bill matters more than the removal. The miss is counted either way."},
+			Hint: "Decline instead of falling back when the prefix ask could not read the cache. Unset defers to the process log level: at CG_LOG_LEVEL=debug the effective value is true (the fallback's failure reason is otherwise only recorded when declining, which made debug lose the one piece of evidence it exists to show); below debug, unset = FALSE and the fallback asks again with a bounded sample of each output copied into the prompt, keeping the component working on a session's first turn and whenever a cache entry has gone — but paying fresh for content the cached path reads for a tenth of the price. Writing `false` explicitly is NOT the same as leaving it unset: an explicit value, either way, always wins over the debug default. Set true where the bill matters more than the removal. The miss is counted either way, and now also logged at WARN regardless of this setting."},
 		{Key: "evidence", Type: components.FieldBool,
 			Hint: "Add the co-reference index's record (novel/refs/ref_age/used_frac/later_turns and the index's own verdict) to each candidate's inventory line. Unset = FALSE. It is EVIDENCE the model weighs, never a filter over the candidates: a co-reference PRE-FILTER left about one candidate per request, which silently turned a bulk arm into the per-output shape refuted at 6% live-kept and meant the model only ever saw what the index had already judged spent — destroying the veto on the index's blind spot that the mechanism exists to provide. Enabling this also adds a paragraph to the adjudication contract teaching how to read the counters; a prompt carrying counters it never explains is worse than one carrying neither."},
 		{Key: "econ_trigger", Type: components.FieldBool,

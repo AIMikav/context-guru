@@ -1,9 +1,11 @@
 package offload
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 )
@@ -169,6 +172,17 @@ func preExpiryCtx(session string, asker components.PrefixAsker, st store.Store) 
 		// would decline for lack of a model rather than for the reason under test.
 		Model: components.ModelSpec{Incoming: fallbackModel, Static: fallbackModel},
 	}
+}
+
+// debugLogCtx attaches a logger at DEBUG level to the context, writing to buf, so a test can both
+// (a) exercise effectiveBlockFallback's debug-implies-block_fallback default, which reads
+// logging.Debugging(c.Ctx) rather than any field a test could set directly, and (b) assert on what
+// was actually logged. Built on logging.New/logging.With rather than a hand-rolled handler, so the
+// level check this test depends on is the SAME code path Setup() wires up in production.
+func debugLogCtx(buf *bytes.Buffer, session string, asker components.PrefixAsker, st store.Store) *components.Ctx {
+	c := preExpiryCtx(session, asker, st)
+	c.Ctx = logging.With(c.Ctx, slog.New(logging.New(buf, slog.LevelDebug, false)))
+	return c
 }
 
 // fallbackModel answers the self-contained fallback prompt, and records what it was shown so a test
@@ -356,6 +370,118 @@ func TestBlockFallbackDeclinesInsteadOfPaying(t *testing.T) {
 	}
 	if schema.MessageText(req.Input[1]) != original {
 		t.Fatal("content was removed in a mode that declined to act")
+	}
+}
+
+// DEBUG LOGGING IMPLIES block_fallback: true, UNLESS THE OPERATOR WROTE IT EXPLICITLY.
+//
+// Debug is the mode reached for specifically to see why a call did what it did, and the prefix ask's
+// own error only survives into r.rec.Rejection on the decline branch — so the default fallback was
+// quietly discarding exactly the evidence debug exists to show (see effectiveBlockFallback). This
+// pins the three cases that matter: debug + unset blocks, debug + explicit `false` still falls back
+// (an explicit value always wins), and no debug + unset falls back same as always.
+func TestSweepDebugImpliesBlockFallbackUnlessExplicit(t *testing.T) {
+	askFailed := errors.New("upstream 500")
+
+	t.Run("debug and unset: blocks", func(t *testing.T) {
+		var buf bytes.Buffer
+		asker := &fakeAsker{err: askFailed}
+		before := atomic.LoadInt64(&fallbackModel.calls)
+		e := newSweepSmall(t, "")
+		// rep.Component set exactly as pipeline.go's runOne sets it, so the declined row clears
+		// the `call.rec.Component != ""` guard and the Rejection string is actually published —
+		// see TestBlockFallbackDecliningAWritePublishesTheCorrectRejection for why that matters.
+		rep := &components.Report{Component: "extract_llm_sweep"}
+		if _, err := e.Offload(sweepReq(), rep,
+			debugLogCtx(&buf, "s", asker, store.NewMemory(store.Options{}))); err != nil {
+			t.Fatal(err)
+		}
+		if rep.Gates["sweep_fallback_blocked"] != 1 {
+			t.Fatalf("debug level did not imply block_fallback (gates: %v)", rep.Gates)
+		}
+		if n := atomic.LoadInt64(&fallbackModel.calls) - before; n != 0 {
+			t.Fatalf("debug level blocked but still paid for %d fallback completions", n)
+		}
+		if len(rep.Calls) != 1 {
+			t.Fatalf("expected the declined call to be published, got %d rows", len(rep.Calls))
+		}
+		if rej := rep.Calls[0].Rejection; rej == "" || !strings.Contains(rej, askFailed.Error()) {
+			t.Errorf("the decline did not preserve the provider's error, which is the whole point "+
+				"of blocking under debug: %q", rej)
+		}
+	})
+
+	t.Run("debug but block_fallback explicitly false: falls back anyway", func(t *testing.T) {
+		var buf bytes.Buffer
+		asker := &fakeAsker{err: askFailed}
+		before := atomic.LoadInt64(&fallbackModel.calls)
+		e := newSweepSmall(t, "block_fallback: false\n")
+		rep := &components.Report{}
+		if _, err := e.Offload(sweepReq(), rep,
+			debugLogCtx(&buf, "s", asker, store.NewMemory(store.Options{}))); err != nil {
+			t.Fatal(err)
+		}
+		if rep.Gates["sweep_fallback_blocked"] != 0 {
+			t.Fatalf("an explicit block_fallback: false was overridden by the debug default "+
+				"(gates: %v)", rep.Gates)
+		}
+		if rep.Events["sweep_fallback_used"] != 1 {
+			t.Fatalf("explicit false did not fall back under debug (gates: %v)", rep.Gates)
+		}
+		if n := atomic.LoadInt64(&fallbackModel.calls) - before; n != 1 {
+			t.Fatalf("explicit false under debug made %d fallback completions, want 1", n)
+		}
+	})
+
+	t.Run("no debug and unset: falls back as always", func(t *testing.T) {
+		asker := &fakeAsker{err: askFailed}
+		before := atomic.LoadInt64(&fallbackModel.calls)
+		e := newSweepSmall(t, "")
+		rep := &components.Report{}
+		if _, err := e.Offload(sweepReq(), rep,
+			preExpiryCtx("s", asker, store.NewMemory(store.Options{}))); err != nil {
+			t.Fatal(err)
+		}
+		if rep.Gates["sweep_fallback_blocked"] != 0 {
+			t.Fatalf("non-debug, unset block_fallback still blocked (gates: %v)", rep.Gates)
+		}
+		if n := atomic.LoadInt64(&fallbackModel.calls) - before; n != 1 {
+			t.Fatalf("non-debug default made %d fallback completions, want 1", n)
+		}
+	})
+}
+
+// THE FAILURE IS LOGGED AT WARN REGARDLESS OF block_fallback, so the cause is never lost to a
+// rejection string the default path never writes. Exercised at both settings: the gate and session
+// must appear on the line whether the call then falls back or declines.
+func TestSweepAskFailureIsLoggedAtWarn(t *testing.T) {
+	askFailed := errors.New("upstream 500: context deadline-ish failure")
+	for _, tc := range []struct {
+		name, extraYAML string
+	}{
+		{"falls back", ""},
+		{"blocked", "block_fallback: true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			asker := &fakeAsker{err: askFailed}
+			e := newSweepSmall(t, tc.extraYAML)
+			rep := &components.Report{}
+			if _, err := e.Offload(sweepReq(), rep,
+				debugLogCtx(&buf, "sess-warn-1", asker, store.NewMemory(store.Options{}))); err != nil {
+				t.Fatal(err)
+			}
+			out := buf.String()
+			if !strings.Contains(out, "WARN") {
+				t.Errorf("the ask failure was not logged at WARN: %s", out)
+			}
+			if !strings.Contains(out, "sweep_ask_failed") {
+				t.Errorf("the WARN line does not name the gate it raised: %s", out)
+			}
+			if !strings.Contains(out, "sess-warn-1") {
+				t.Errorf("the WARN line does not carry the session: %s", out)
+			}
+		})
 	}
 }
 
