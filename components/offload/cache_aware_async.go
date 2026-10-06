@@ -53,12 +53,49 @@ func CacheAwareAsyncStats() (started, committed, refused, panics int64) {
 		atomic.LoadInt64(&cacheAwareAsyncPanics)
 }
 
+// summaryCaller is how a commission actually reaches a model, built ONCE in Offload on the
+// request's own goroutine and then carried, opaquely, through every path that may dispatch it
+// later (the detached async path, the cold-turn deferral, the keep-alive substitute). It has
+// exactly two implementations, both in Offload: a MessagesModel sent the whole conversation plus
+// one appended instruction, or — on a route whose client has no MessagesModel at all, which is
+// every Anthropic incoming-model request today (#275: internal/cheapmodel.Anthropic implements
+// only Complete) — a components.PrefixAsker appending one question to the provider's own cached
+// prefix (the previous turn's SENT body, held by the host). Everything downstream of Offload
+// neither knows nor needs to know which one it is holding; both record cache_read/cache_write
+// into the ambient cheapmodel sink identically (CompleteMessages and PrefixAsker.Ask's underlying
+// CompletePrefixed/CompletePrefixedResponses both call cheapmodel.recordUsageCache), so
+// deferUsage/takeDeferredUsage and commissionSync's own sink read work unmodified either way.
+type summaryCaller func(ctx context.Context) (string, error)
+
+// classifyCallErr counts and, for a genuine failure, WARN-logs a summaryCaller's error — shared
+// by every path that invokes one. ErrNoPrefix is NOT a failure: it is what a PrefixAsker-backed
+// caller returns on a session's first turn, when there is nothing stashed yet to append to, and
+// counting or logging that as a failure would make the ordinary, once-per-session case read as
+// something wrong. A MessagesModel-backed caller can never return it, so this is unconditionally
+// safe to call either way.
+//
+// The WARN is the fix for the exact gap found live on this deployment's extract_llm_sweep
+// (sweep_ask_failed, cause not recorded): a provider error folded into a silent decline is a
+// clue an operator reaching for CG_LOG_LEVEL=debug specifically wants and could not get.
+func classifyCallErr(ctx context.Context, session string, err error) {
+	if errors.Is(err, components.ErrNoPrefix) {
+		atomic.AddInt64(&cacheAwareNoPrefix, 1)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		atomic.AddInt64(&cacheAwareTimeouts, 1)
+	} else {
+		atomic.AddInt64(&cacheAwareErrors, 1)
+	}
+	logging.From(ctx).Warn("cg.cache_aware_summarizer.call_failed", "session", session, "err", err)
+}
+
 // startAsyncSummary commissions the summary and returns a gate name when it declined to, so the
 // caller can file it. Everything the goroutine needs is read HERE, on the request's goroutine —
 // reading c.Store or calling effectiveMode from inside the goroutine would put a concurrent read
 // on a struct the request owns, which is the shape a review already caught once in summarize.
-func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, mm components.MessagesModel,
-	ask, span []bschemas.ChatMessage, coveredCount int) string {
+func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summaryCaller,
+	span []bschemas.ChatMessage, coveredCount int) string {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
 		return "summary_already_in_flight"
@@ -79,8 +116,6 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, mm component
 	logging.From(c.Ctx).Info("cache_aware_summarizer: commissioned a detached summary",
 		"session", c.Session, "covered_messages", coveredCount)
 
-	askCopy := make([]bschemas.ChatMessage, len(ask))
-	copy(askCopy, ask)
 	spanCopy := make([]bschemas.ChatMessage, len(span))
 	copy(spanCopy, span)
 	session, st, mode := c.Session, c.Store, effectiveMode(c, s.mode)
@@ -113,16 +148,12 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, mm component
 		// replay. Detaching makes the attribution single-valued.
 		ctx, callSink := cheapmodel.WithDetachedSink(ctx)
 		atomic.AddInt64(&cacheAwareCalls, 1)
-		out, err := mm.CompleteMessages(ctx, "", askCopy)
+		out, err := call(ctx)
 		// Deferred BEFORE the error check: a call that timed out may still have been billed for its
 		// input, and a cost we incurred is a cost we report.
 		deferUsage(st, session, callSink)
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				atomic.AddInt64(&cacheAwareTimeouts, 1)
-			} else {
-				atomic.AddInt64(&cacheAwareErrors, 1)
-			}
+			classifyCallErr(ctx, session, err)
 			return
 		}
 		if strings.TrimSpace(out) == "" {
@@ -190,8 +221,8 @@ type KeepAliveSummaryResult struct {
 // duplicating either: a session has, at most, one commission in flight at a time regardless of
 // which caller started it, and the two callers racing to summarize the same span would otherwise
 // write the same checkpoint twice.
-func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, mm components.MessagesModel,
-	ask, span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
+func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCaller,
+	span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
 		return KeepAliveSummaryResult{}
@@ -220,7 +251,7 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, mm components.M
 	// path's own goroutine — see its comment on why a chained sink would double-charge.
 	ctx, callSink := cheapmodel.WithDetachedSink(ctx)
 	atomic.AddInt64(&cacheAwareCalls, 1)
-	out, err := mm.CompleteMessages(ctx, "", ask)
+	out, err := call(ctx)
 	// Deferred BEFORE the error check, and READ before being deferred: a call that timed out may
 	// still have been billed for its input, and the result the keeper books is the same figures
 	// deferUsage is about to replay onto this session's next real turn — the keeper's ping ledger
@@ -231,11 +262,7 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, mm components.M
 		FreshInput: int(in), Output: int(outTok), CacheWrite: int(cw), CacheRead: int(cr)}
 	deferUsage(st, session, callSink)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			atomic.AddInt64(&cacheAwareTimeouts, 1)
-		} else {
-			atomic.AddInt64(&cacheAwareErrors, 1)
-		}
+		classifyCallErr(ctx, session, err)
 		return res
 	}
 	if strings.TrimSpace(out) == "" {

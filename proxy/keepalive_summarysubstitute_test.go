@@ -46,12 +46,21 @@ func (m *fakeSummaryModel) CompleteMessages(context.Context, string, []bschemas.
 // single-flight/concurrency bound admits the call.
 func kaCandidate(t *testing.T, session string, st store.Store, model components.MessagesModel) {
 	t.Helper()
+	kaCandidateWithCacheState(t, session, st, model, "", 0)
+}
+
+// kaCandidateWithCacheState is kaCandidate plus control over KeepAliveCandidateInfo, for the
+// tests specifically about the `cache_state: pre_expiry` phase check in fireSummarySubstitute.
+func kaCandidateWithCacheState(t *testing.T, session string, st store.Store, model components.MessagesModel,
+	cacheState string, preExpirySeconds int) {
+	t.Helper()
 	msg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
 	schema.SetMessageText(&msg, "fix the failing tests, there is a lot of context here")
 	span := []bschemas.ChatMessage{msg}
 	ask := append([]bschemas.ChatMessage(nil), span...)
 	ask = append(ask, bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser})
-	offload.RegisterKeepAliveCandidateForTest(session, st, model, ask, span, 1)
+	call := func(ctx context.Context) (string, error) { return model.CompleteMessages(ctx, "", ask) }
+	offload.RegisterKeepAliveCandidateForTest(session, st, call, span, 1, cacheState, preExpirySeconds)
 	// The registry is a package GLOBAL in offload, keyed by session — and "sess-1" is the shared
 	// session name every other test in this file's testKeeper/recordOne helpers uses. Left
 	// registered, a candidate from this test silently hijacks an unrelated LATER test's ping into
@@ -168,5 +177,63 @@ func TestKeepAliveSubstituteRespectsTheCostCapAndFallsBackToAPing(t *testing.T) 
 	}
 	if k.summarySubstituted.Load() != 0 {
 		t.Error("summarySubstituted was incremented despite the cost cap")
+	}
+}
+
+// A `cache_state: pre_expiry` candidate must only be substituted when THIS ping actually lands
+// inside the component's own pre-expiry window — not merely whenever the keeper decides to ping
+// at all. HeadTTL1h gives the entry a one-hour cache lifetime while kaPolicy's Idle (280s) still
+// makes the keeper ping it in under five minutes, so the ping is nowhere near pre-expiry by the
+// component's own (default 60s) reckoning: a real divergence between "the keeper is due" and
+// "the candidate's window is live", not a contrived one.
+func TestKeepAliveSubstituteRespectsPreExpiryPhaseNotJustKeeperTiming(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>should not be used yet</summary>"}
+	kaCandidateWithCacheState(t, "sess-1", st, model, "pre_expiry", 60)
+
+	pol := kaPolicy()
+	pol.HeadTTL1h = true
+	recordOne(t, k, pol, kaBody, clock.now(), upstream{base: "http://up", path: "/v1/messages"})
+	k.sweep(clock.advance(281 * time.Second))
+	waitPings(t, k, 1)
+	if fs.n() != 1 {
+		t.Fatalf("sent %d ordinary pings, want 1 — a pre_expiry candidate must not be substituted "+
+			"on a ping that lands nowhere near its own pre-expiry window", fs.n())
+	}
+	if model.calls.Load() != 0 {
+		t.Errorf("the summarizer's model was called %d times — a phase-mismatched substitute must "+
+			"never be dispatched", model.calls.Load())
+	}
+	if k.summarySubstitutePhaseMismatch.Load() != 1 {
+		t.Error("the phase mismatch was not counted")
+	}
+	if k.summarySubstituted.Load() != 0 {
+		t.Error("summarySubstituted was incremented despite the phase mismatch")
+	}
+}
+
+// The same `pre_expiry` candidate DOES substitute once the ping actually lands inside its
+// window — proving the test above is a real gate and not a permanent refusal.
+func TestKeepAliveSubstituteFiresOncePreExpiryPhaseIsLive(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>fires inside the window</summary>"}
+	kaCandidateWithCacheState(t, "sess-1", st, model, "pre_expiry", 60)
+
+	// Default 5-minute TTL (no HeadTTL1h): a ping at 280s idle has 20s of a 5-minute lifetime
+	// left, which is inside the default 60s pre-expiry window.
+	recordOne(t, k, kaPolicy(), kaBody, clock.now(), upstream{base: "http://up", path: "/v1/messages"})
+	k.sweep(clock.advance(281 * time.Second))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && k.summarySubstituted.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if k.summarySubstituted.Load() != 1 {
+		t.Fatalf("summarySubstituted = %d, want 1 once the ping lands inside the pre-expiry window",
+			k.summarySubstituted.Load())
+	}
+	if fs.n() != 0 {
+		t.Errorf("sent %d ordinary pings — the substitute should have replaced it", fs.n())
 	}
 }

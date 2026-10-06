@@ -313,7 +313,7 @@ func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenCacheStateDeclines(t *tes
 		t.Fatalf("this turn must have been declined by cache_state for the test to mean anything "+
 			"(gates: %v)", rep.Gates)
 	}
-	dispatch, ok := KeepAliveSubstitute(ctx.Session)
+	dispatch, _, ok := KeepAliveSubstitute(ctx.Session)
 	if !ok {
 		t.Fatal("no keep-alive candidate was registered for a turn with real commission material")
 	}
@@ -330,7 +330,7 @@ func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenCacheStateDeclines(t *tes
 
 	// Once a checkpoint exists, the candidate must no longer be offered: the next real turn will
 	// splice the checkpoint for free, so spending another call here would be pure waste.
-	if _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("a candidate was still offered after a checkpoint was written")
 	}
 }
@@ -346,11 +346,11 @@ func TestClearKeepAliveCandidateDropsAStaleRegistration(t *testing.T) {
 	ctx := caGatedCtx("ca-ka-clear", st, "warm", 0, false, 0)
 	var rep components.Report
 	s.Offload(req, &rep, ctx)
-	if _, ok := KeepAliveSubstitute(ctx.Session); !ok {
+	if _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
 		t.Fatal("precondition: no candidate was registered")
 	}
 	ClearKeepAliveCandidate(ctx.Session)
-	if _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("ClearKeepAliveCandidate did not drop the registration")
 	}
 }
@@ -370,7 +370,7 @@ func TestCacheAwareDoesNotRegisterAKeepAliveCandidateWhenNotBigEnough(t *testing
 	if rep.Gates["below_request_trigger"] == 0 {
 		t.Fatalf("precondition: want below_request_trigger (gates: %v)", rep.Gates)
 	}
-	if _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("a candidate was registered for a turn that was never big enough to summarize")
 	}
 }

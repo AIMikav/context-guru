@@ -27,8 +27,8 @@ import (
 type coldDeferral struct {
 	s            *CacheAwareSummarizer
 	ctx          *components.Ctx // minimal: Session, Store, Ctx — see deferColdSummary
-	mm           components.MessagesModel
-	ask, span    []bschemas.ChatMessage
+	call         summaryCaller
+	span         []bschemas.ChatMessage
 	coveredCount int
 	timer        *time.Timer
 }
@@ -82,12 +82,11 @@ func CacheAwareColdDeferralStats() (started, resolved, fallbackFired, dropped in
 // discipline startAsyncSummary already follows and for the same reason: this goroutine's caller
 // (the fallback timer, or ResolveDeferredCacheAwareSummary) runs long after the request that
 // built it has returned.
-func (s *CacheAwareSummarizer) deferColdSummary(c *components.Ctx, mm components.MessagesModel,
-	ask, span []bschemas.ChatMessage, coveredCount int) {
+func (s *CacheAwareSummarizer) deferColdSummary(c *components.Ctx, call summaryCaller,
+	span []bschemas.ChatMessage, coveredCount int) {
 	if c == nil || c.Session == "" {
 		return
 	}
-	askCopy := append([]bschemas.ChatMessage(nil), ask...)
 	spanCopy := append([]bschemas.ChatMessage(nil), span...)
 	// A minimal Ctx: startAsyncSummary reads only Session, Store and Ctx off it (see its own
 	// comment on why those three are read on the request's goroutine rather than from inside the
@@ -95,7 +94,7 @@ func (s *CacheAwareSummarizer) deferColdSummary(c *components.Ctx, mm components
 	// detaches it from cancellation anyway, inside startAsyncSummary — so holding onto it here is
 	// safe even though the request itself has long since returned by the time this resolves.
 	lite := &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}
-	d := &coldDeferral{s: s, ctx: lite, mm: mm, ask: askCopy, span: spanCopy, coveredCount: coveredCount}
+	d := &coldDeferral{s: s, ctx: lite, call: call, span: spanCopy, coveredCount: coveredCount}
 
 	coldDeferredMu.Lock()
 	if len(coldDeferred) >= maxColdDeferred && coldDeferred[c.Session] == nil {
@@ -105,7 +104,7 @@ func (s *CacheAwareSummarizer) deferColdSummary(c *components.Ctx, mm components
 		// compaction, or the memory bound, entirely.
 		coldDeferredMu.Unlock()
 		atomic.AddInt64(&cacheAwareColdDeferredDropped, 1)
-		s.startAsyncSummary(lite, mm, askCopy, spanCopy, coveredCount)
+		s.startAsyncSummary(lite, call, spanCopy, coveredCount)
 		return
 	}
 	if prev, ok := coldDeferred[c.Session]; ok && prev.timer != nil {
@@ -140,7 +139,7 @@ func (s *CacheAwareSummarizer) resolveFallback(session string) {
 		return // already resolved via the proxy hook
 	}
 	atomic.AddInt64(&cacheAwareColdDeferredFallbackFired, 1)
-	d.s.startAsyncSummary(d.ctx, d.mm, d.ask, d.span, d.coveredCount)
+	d.s.startAsyncSummary(d.ctx, d.call, d.span, d.coveredCount)
 }
 
 // ResolveDeferredCacheAwareSummary dispatches a cold-commissioned summary once the triggering
@@ -163,5 +162,5 @@ func ResolveDeferredCacheAwareSummary(session string) {
 		return
 	}
 	atomic.AddInt64(&cacheAwareColdDeferredResolved, 1)
-	d.s.startAsyncSummary(d.ctx, d.mm, d.ask, d.span, d.coveredCount)
+	d.s.startAsyncSummary(d.ctx, d.call, d.span, d.coveredCount)
 }

@@ -22,15 +22,31 @@ import (
 // one output token.
 //
 // The registration happens in Offload, on the request's own goroutine, every turn that reaches
-// the point of having real commission material (ask/span/model all resolved) — regardless of
+// the point of having real commission material (a resolved summaryCaller plus a span) — regardless of
 // whether the cache-state gate let it actually fire THIS turn. See cache_aware_summarizer.go's
 // own comment at the call site for why registering unconditionally is safe.
 type keepAliveCandidate struct {
 	s            *CacheAwareSummarizer
 	ctx          *components.Ctx // minimal: Session, Store, Ctx
-	mm           components.MessagesModel
-	ask, span    []bschemas.ChatMessage
+	call         summaryCaller
+	span         []bschemas.ChatMessage
 	coveredCount int
+	// cacheState/preExpirySeconds are the component's OWN trigger.cache_state and
+	// trigger.pre_expiry_seconds, carried so the keeper can tell whether ITS idea of "due for a
+	// ping right now" also satisfies what THIS candidate was configured to wait for — see
+	// KeepAliveCandidateInfo.
+	cacheState       string
+	preExpirySeconds int
+}
+
+// KeepAliveCandidateInfo is what a registered candidate asked for, surfaced so the keeper can
+// decide whether ITS OWN notion of "due" also satisfies the candidate's cache_state — a
+// `pre_expiry` candidate must not be substituted on a ping the keeper is sending for some other
+// reason (e.g. a strategy-driven K>1 schedule, or simply because Idle has elapsed on a session
+// whose cache is still warm by the component's own, possibly narrower, pre_expiry_seconds).
+type KeepAliveCandidateInfo struct {
+	CacheState       string
+	PreExpirySeconds int
 }
 
 var (
@@ -52,15 +68,17 @@ const maxKeepAliveCandidates = 2048
 // substitute, replacing any earlier registration for the session (always safe to replace: the
 // stored copy is only ever read later, between requests, and a newer turn's conversation is a
 // strict superset of an older one's for the same session).
-func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, mm components.MessagesModel,
-	ask, span []bschemas.ChatMessage, coveredCount int) {
-	if c == nil || c.Session == "" || mm == nil {
+func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, call summaryCaller,
+	span []bschemas.ChatMessage, coveredCount int) {
+	if c == nil || c.Session == "" || call == nil {
 		return
 	}
 	cand := &keepAliveCandidate{
-		s: s, ctx: &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}, mm: mm,
-		ask: append([]bschemas.ChatMessage(nil), ask...), span: append([]bschemas.ChatMessage(nil), span...),
-		coveredCount: coveredCount,
+		s: s, ctx: &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}, call: call,
+		span:             append([]bschemas.ChatMessage(nil), span...),
+		coveredCount:     coveredCount,
+		cacheState:       s.trigger.CacheState,
+		preExpirySeconds: s.trigger.PreExpirySeconds,
 	}
 	keepAliveCandMu.Lock()
 	if _, exists := keepAliveCand[c.Session]; !exists && len(keepAliveCand) >= maxKeepAliveCandidates {
@@ -102,19 +120,23 @@ func ClearKeepAliveCandidate(session string) {
 // Dispatch BLOCKS until the call resolves (or the given timeout elapses) and runs the real model
 // call — the keeper's caller must therefore run it off its own goroutine, exactly as it already
 // does for an ordinary ping.
-func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, ok bool) {
+//
+// info is returned alongside ok=true so the caller can additionally check cache_state against
+// its OWN timing before deciding to dispatch — see KeepAliveCandidateInfo.
+func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, info KeepAliveCandidateInfo, ok bool) {
 	keepAliveCandMu.Lock()
 	cand, exists := keepAliveCand[session]
 	keepAliveCandMu.Unlock()
 	if !exists {
-		return nil, false
+		return nil, KeepAliveCandidateInfo{}, false
 	}
 	if _, has := loadCheckpoint(cand.ctx); has {
-		return nil, false
+		return nil, KeepAliveCandidateInfo{}, false
 	}
+	info = KeepAliveCandidateInfo{CacheState: cand.cacheState, PreExpirySeconds: cand.preExpirySeconds}
 	return func(timeout time.Duration) KeepAliveSummaryResult {
-		return cand.s.commissionSync(cand.ctx, cand.mm, cand.ask, cand.span, cand.coveredCount, timeout)
-	}, true
+		return cand.s.commissionSync(cand.ctx, cand.call, cand.span, cand.coveredCount, timeout)
+	}, info, true
 }
 
 // RegisterKeepAliveCandidateForTest installs commission material directly, for proxy's keeper
@@ -123,9 +145,22 @@ func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) K
 // register a candidate that was not produced by an actual commission, which is why this is the
 // one function in this file that does not require a *CacheAwareSummarizer the registry built
 // itself — it builds the minimal receiver inline.
-func RegisterKeepAliveCandidateForTest(session string, st store.Store, mm components.MessagesModel,
-	ask, span []bschemas.ChatMessage, coveredCount int) {
-	(&CacheAwareSummarizer{mode: markerFull}).registerKeepAliveCandidate(
+//
+// call takes the plain, unnamed function shape rather than the package-private summaryCaller
+// type, so a test in another package (proxy's keeper tests) can build one from either a mocked
+// MessagesModel or a mocked PrefixAsker without needing to see that type at all — Go's
+// assignability rules let an unnamed function literal satisfy a named parameter of the identical
+// underlying type regardless of which package declared it.
+//
+// cacheState/preExpirySeconds let a test drive KeepAliveCandidateInfo's values without
+// constructing a real component through its registered constructor — "" behaves as `any`,
+// matching a component whose trigger never set cache_state at all.
+func RegisterKeepAliveCandidateForTest(session string, st store.Store,
+	call func(ctx context.Context) (string, error), span []bschemas.ChatMessage, coveredCount int,
+	cacheState string, preExpirySeconds int) {
+	(&CacheAwareSummarizer{mode: markerFull,
+		trigger: components.Trigger{CacheState: cacheState, PreExpirySeconds: preExpirySeconds},
+	}).registerKeepAliveCandidate(
 		&components.Ctx{Session: session, Store: st, Ctx: context.Background()},
-		mm, ask, span, coveredCount)
+		call, span, coveredCount)
 }

@@ -1,6 +1,7 @@
 package offload
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -43,12 +44,26 @@ var summarizerProfilesYAML []byte
 // Judge this component on the backend's own telemetry (vllm:prefix_cache_hits_total, or
 // usage.cache_read_input_tokens, which the OpenAI client records) — never on a savings percentage.
 //
-// ⛔ IT NEEDS A components.MessagesModel AND DECLINES WITHOUT ONE. A plain Model flattens the
-// conversation to one string, which is exactly the prefix-destroying shape this exists to avoid,
-// so a client without the capability makes the component skip. A silent fallback would report
-// this method's latency while paying the old method's cost. Because a declining arm compacts
-// nothing and is byte-identical to `off` on every other metric, the decline is COUNTED: read
-// CacheAwareSummarizerDeclined before believing any delta from this arm.
+// ⛔ IT NEEDS EITHER A components.MessagesModel OR A components.PrefixAsker, AND DECLINES WITHOUT
+// BOTH. A plain Model flattens the conversation to one string, which is exactly the
+// prefix-destroying shape this exists to avoid, so a client without either capability makes the
+// component skip. A silent fallback would report this method's latency while paying the old
+// method's cost. Because a declining arm compacts nothing and is byte-identical to `off` on every
+// other metric, the decline is COUNTED: read CacheAwareSummarizerDeclined before believing any
+// delta from this arm.
+//
+// THE PREFIXASKER PATH EXISTS BECAUSE THE MESSAGESMODEL ONE IS UNREACHABLE ON THIS DEPLOYMENT'S
+// OWN TRAFFIC (#275). On Anthropic incoming-model requests — `model.source: incoming`, the
+// default — the host wraps the request's own client as internal/cheapmodel.Anthropic, which
+// implements Complete but not CompleteMessages; only internal/cheapmodel/openai.go does. Without
+// a second path this component ran only on an OpenAI-shaped `model.source: config` deployment and
+// declined every turn of Anthropic-only traffic — exactly `off`, invisibly, for the one route the
+// feature was built for. Ctx.PrefixAsk completes one question against the PREVIOUS turn's SENT
+// body (components.PrefixAsker's own docstring explains why that body, not the incoming one), so
+// it is the SAME cache-reading shape as the MessagesModel path, just a different wire mechanism —
+// one appended user-role message, no system-role option, since PrefixAsker always sends it as a
+// trailing user turn (see summaryCaller in cache_aware_async.go for where the two converge, and
+// CacheAwareSummarizerPrefixAskUsed for which one actually ran).
 //
 // Span selection, kept-verbatim repair and orphan repair all come from summarize_pairing.go —
 // the same functions `summarize` uses, not a second implementation. A tool exchange is atomic
@@ -240,16 +255,34 @@ var (
 	cacheAwareProfileFallbacks int64
 	cacheAwareUnverifiedSystem int64
 	cacheAwareTooLarge         int64
+	// cacheAwareNoPrefix counts a PrefixAsker-backed call's FIRST-TURN case (components.ErrNoPrefix):
+	// nothing stashed yet to append to. Not a failure — every session hits this once — and counted
+	// apart from cacheAwareErrors for the same reason extract_llm_sweep's sweep_no_prefix is
+	// separate from sweep_ask_failed: the two mean "nothing to attend" and "the read failed",
+	// which call for opposite attention.
+	cacheAwareNoPrefix int64
+	// cacheAwarePrefixAskUsed counts turns that reached the model step via components.PrefixAsker
+	// rather than a components.MessagesModel — i.e. every turn that activated on a route whose
+	// client has no MessagesModel at all, which on this deployment IS the Anthropic
+	// incoming-model path (#275). Zero here on a deployment running Anthropic-only traffic means
+	// this component is still measuring `off`, whatever CacheAwareSummarizerDeclined says.
+	cacheAwarePrefixAskUsed int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
 func CacheAwareSummarizerTimeouts() int64 { return atomic.LoadInt64(&cacheAwareTimeouts) }
 func CacheAwareSummarizerErrors() int64   { return atomic.LoadInt64(&cacheAwareErrors) }
+func CacheAwareSummarizerNoPrefix() int64 { return atomic.LoadInt64(&cacheAwareNoPrefix) }
+func CacheAwareSummarizerPrefixAskUsed() int64 {
+	return atomic.LoadInt64(&cacheAwarePrefixAskUsed)
+}
 
-// CacheAwareSummarizerDeclined counts turns that reached the model step and stopped because no
-// components.MessagesModel was available. That is the ONLY reason it counts — a role the backend
-// rejects returns an error and lands in Errors, not here. Non-zero means this arm is not
-// measuring cache-reuse compaction; it is measuring `off`.
+// CacheAwareSummarizerDeclined counts turns that reached the model step and stopped because
+// NEITHER a components.MessagesModel NOR a components.PrefixAsker was available. A role the
+// backend rejects returns an error and lands in Errors, not here. Non-zero means this arm is not
+// measuring cache-reuse compaction on those turns; it is measuring `off` — though a deployment
+// may still be compacting plenty of OTHER turns via PrefixAsk (CacheAwareSummarizerPrefixAskUsed)
+// at the same time, which this counter alone cannot distinguish from total inertness.
 func CacheAwareSummarizerDeclined() int64 { return atomic.LoadInt64(&cacheAwareDeclined) }
 
 // CacheAwareSummarizerEmpty counts calls that were PAID FOR and returned nothing usable. It is
@@ -553,13 +586,23 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	if model == nil {
 		model = c.Model.For(s.modelSource)
 	}
-	if model == nil {
-		return declineButReplayStale()
+	var mm components.MessagesModel
+	if model != nil {
+		mm, _ = model.(components.MessagesModel)
 	}
-	mm, okModel := model.(components.MessagesModel)
-	if !okModel {
-		atomic.AddInt64(&cacheAwareDeclined, 1)
-		rep.Gate("no_messages_model")
+	// usePrefixAsk is the fallback for every route whose client has no MessagesModel at all —
+	// which on this deployment's own traffic is every Anthropic incoming-model request (#275).
+	// Checked independently of `model`: Ctx.PrefixAsk is a SEPARATE client the host resolves for
+	// itself (the previous turn's stashed sent body + the caller's own credential), not something
+	// derived from model.source, so it can be usable even when `model` resolved to nil.
+	usePrefixAsk := mm == nil && c.PrefixAsk != nil
+	if mm == nil && !usePrefixAsk {
+		if model != nil {
+			// A model WAS resolved and simply cannot take a message array — the configured
+			// client's own capability gap, distinct from "nothing configured at all".
+			atomic.AddInt64(&cacheAwareDeclined, 1)
+			rep.Gate("no_messages_model")
+		}
 		return declineButReplayStale()
 	}
 	// Don't pay for a summary the store cannot keep: a full marker promises the span is
@@ -579,8 +622,14 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	profiles := s.resolveProfiles()
 	// The pinned-system guard, at the point of use. Declining costs this arm its compaction;
 	// proceeding would risk a summary that is really the model's next turn, which no metric here
-	// would reveal.
+	// would reveal. Moot on the PrefixAsk path, which can never send a system-role instruction at
+	// all (see the role resolution below) — an operator who pinned `system` while this turn can
+	// only reach the model via PrefixAsk is told so explicitly rather than silently downgraded.
 	if s.explicitSystem {
+		if usePrefixAsk {
+			rep.Gate("system_role_unsupported_via_prefix_ask")
+			return declineButReplayStale()
+		}
 		if r, matched := profiles.roleFor(s.modelID); !matched || r != bschemas.ChatMessageRoleSystem {
 			atomic.AddInt64(&cacheAwareUnverifiedSystem, 1)
 			rep.Gate("unverified_system_role")
@@ -591,14 +640,43 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	if s.roleAuto && s.profilesPath != "" {
 		role, _ = profiles.roleFor(s.modelID)
 	}
+	if usePrefixAsk {
+		// components.PrefixAsker always appends the question as a trailing USER message (see its
+		// own docstring) — there is no channel for a system-role instruction through this path.
+		// Overridden HERE rather than at `role`'s own resolution above, because that resolution
+		// also has to stay correct for a deployment that later gets a MessagesModel on the same
+		// config.
+		role = bschemas.ChatMessageRoleUser
+	}
 	instruction := bschemas.ChatMessage{Role: role}
 	schema.SetMessageText(&instruction, profiles.prompt(role))
 
-	// [conversation..., instruction]. The conversation is passed UNMODIFIED and in order: any
-	// edit changes the rendered prefix and forfeits the match this component exists for.
-	ask := make([]bschemas.ChatMessage, 0, len(msgs)+1)
-	ask = append(ask, msgs...)
-	ask = append(ask, instruction)
+	// Build the ONE call this commission will make, whichever path it takes — see summaryCaller
+	// in cache_aware_async.go. Built HERE, on the request's own goroutine, and not a moment later:
+	// everything it closes over (askCopy, or the asker/session/instruction trio) must be read
+	// before this function returns, the same discipline startAsyncSummary's own copy used to
+	// enforce for `ask` directly.
+	var call summaryCaller
+	if usePrefixAsk {
+		atomic.AddInt64(&cacheAwarePrefixAskUsed, 1)
+		asker, session, instructionText := c.PrefixAsk, c.Session, schema.MessageText(instruction)
+		call = func(ctx context.Context) (string, error) {
+			reply, _, err := asker.Ask(ctx, session, instructionText)
+			// usage is NOT read here: PrefixAsker.Ask's underlying CompletePrefixed/
+			// CompletePrefixedResponses already records cache_read/cache_write into the ambient
+			// cheapmodel sink (recordUsageCache) exactly as CompleteMessages does, so every
+			// caller of `call` that reads usage off a WithDetachedSink-scoped ctx (both
+			// startAsyncSummary and commissionSync do) gets it identically either way.
+			return reply, err
+		}
+	} else {
+		// [conversation..., instruction]. The conversation is passed UNMODIFIED and in order: any
+		// edit changes the rendered prefix and forfeits the match this component exists for.
+		ask := make([]bschemas.ChatMessage, 0, len(msgs)+1)
+		ask = append(ask, msgs...)
+		ask = append(ask, instruction)
+		call = func(ctx context.Context) (string, error) { return mm.CompleteMessages(ctx, "", ask) }
+	}
 
 	// Register this turn's commission material as the idle keep-alive's substitute for a bare
 	// cache-read ping, REGARDLESS of `phased` below. A turn the cache-state gate just declined
@@ -609,7 +687,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// fired (so the registry's own single-flight check in commissionSummary refuses a second
 	// dispatch and the keeper falls back to an ordinary ping) or deferred for cold (same check).
 	// See cache_aware_keepalive.go.
-	s.registerKeepAliveCandidate(c, mm, ask, span, end-start)
+	s.registerKeepAliveCandidate(c, call, span, end-start)
 
 	if !phased {
 		return declineButReplayStale()
@@ -628,7 +706,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// double-rewrite to avoid guarding against; Warm and PreExpiry mean the prefix the forwarded
 	// request is about to send is itself still live, so the side call already reads it.
 	if phase == components.CachePhaseCold {
-		s.deferColdSummary(c, mm, ask, span, end-start)
+		s.deferColdSummary(c, call, span, end-start)
 		rep.Event("cold_commission_deferred")
 		rep.Skipped = true
 		return nil, nil
@@ -638,7 +716,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// running it inline would stall the triggering turn by minutes — billed against the agent's own
 	// timeout. summarize_async.go exists for exactly this reason. So this turn forwards UNTOUCHED
 	// and the next eligible turn finds the checkpoint and splices; see cache_aware_async.go.
-	if gate := s.startAsyncSummary(c, mm, ask, span, end-start); gate != "" {
+	if gate := s.startAsyncSummary(c, call, span, end-start); gate != "" {
 		rep.Gate(gate)
 	}
 	rep.Skipped = true

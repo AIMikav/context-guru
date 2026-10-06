@@ -323,6 +323,47 @@ func (e *kaEntry) due(now time.Time) bool {
 		!now.Before(e.startedAt.Add(e.pol.Idle))
 }
 
+// cachePhaseAt classifies the cache phase of an entry last touched at prevStartedAt, for a
+// `cache_state: pre_expiry` keep-alive-substitute candidate to check against (see
+// fireSummarySubstitute) — the keeper's own "due for a ping" timing is a DIFFERENT question from
+// "is this candidate's configured pre-expiry window live right now", and the two can diverge (a
+// manager strategy's K>1 schedule, or a component configured with a narrower pre_expiry_seconds
+// than the keeper's own Idle).
+//
+// prevStartedAt, NOT e.startedAt: by the time fire() runs, sweep has already overwritten
+// e.startedAt with this ping's own (not yet sent) start — reading it here would answer "how long
+// until THIS ping's refresh expires" (always nearly the full TTL) instead of "how close was the
+// ENTRY to expiring before this ping". See pingJob.prevStartedAt.
+//
+// Deliberately NOT Ctx.CachePhase itself: that function also handles CacheTTLMinimum and an
+// unknown idle time, neither of which arises here — a live kaEntry always knows its own idle
+// time exactly (now - prevStartedAt, never "unknown"), and the keeper derives the TTL tier from
+// the one policy field that controls it (pol.HeadTTL1h) rather than reading it off a request. A
+// narrower function is simpler and cannot drift from a case this call site never reaches.
+func cachePhaseAt(prevStartedAt, now time.Time, headTTL1h bool, preExpiry time.Duration) components.CachePhase {
+	ttl := 5 * time.Minute
+	if headTTL1h {
+		ttl = time.Hour
+	}
+	remaining := ttl - now.Sub(prevStartedAt)
+	if remaining <= 0 {
+		return components.CachePhaseCold
+	}
+	if remaining <= preExpiry {
+		return components.CachePhasePreExpiry
+	}
+	return components.CachePhaseWarm
+}
+
+// preExpiryFor resolves a candidate's configured pre_expiry_seconds (0 = the component's own
+// default), mirroring components.Trigger.PreExpiry without needing a Trigger value here.
+func preExpiryFor(seconds int) time.Duration {
+	if seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return components.DefaultPreExpiry
+}
+
 // pingable reports whether this session is worth holding state for at all. Every condition is
 // known when the request finishes, which is why it is checked there.
 //
@@ -454,6 +495,11 @@ type keeper struct {
 	// summarySubstituteOverBudget counts a substitute attempt refused BEFORE being dispatched
 	// because its projected cost exceeded the keep-alive per-ping $ cap.
 	summarySubstituteOverBudget atomic.Int64
+	// summarySubstitutePhaseMismatch counts a `cache_state: pre_expiry` candidate declined
+	// because THIS ping is not actually in the component's own pre-expiry window — routine
+	// (every strategy-driven K>1 schedule and every narrower pre_expiry_seconds than the
+	// keeper's own Idle produces some of these), not a failure.
+	summarySubstitutePhaseMismatch atomic.Int64
 }
 
 // keepAliveDisabled is the operator's kill switch, read once at construction. A single
@@ -899,6 +945,7 @@ func (k *keeper) sweep(now time.Time) int {
 		// lifetime runs from request start, so the next deadline is this instant plus X. It
 		// also makes the entry not-due for the rest of this sweep, so a slow ping cannot be
 		// started twice.
+		prevStartedAt := e.startedAt
 		e.startedAt = now
 		e.pings++
 		auth := make([]maskedHeader, len(e.auth))
@@ -910,7 +957,8 @@ func (k *keeper) sweep(now time.Time) int {
 		raw := append([]byte(nil), e.body...)
 		xorMask(raw)
 		due = append(due, pingJob{e: e, raw: raw, hdr: e.hdr.Clone(), auth: auth, up: e.up,
-			tenant: e.tenant, session: e.session, st: e.st, emitter: e.emitter, ping: e.pings})
+			tenant: e.tenant, session: e.session, st: e.st, emitter: e.emitter, ping: e.pings,
+			prevStartedAt: prevStartedAt})
 	}
 	k.mu.Unlock()
 
@@ -942,6 +990,13 @@ type pingJob struct {
 	// job runs on its own goroutine and must hold a copy rather than reach back into the entry.
 	emitter components.Emitter
 	ping    int
+	// prevStartedAt is e.startedAt as it stood BEFORE this sweep tick overwrote it with `now` —
+	// i.e. when the cache entry this ping is about to refresh was last written or read. Needed
+	// for fireSummarySubstitute's own cache-phase check: by the time fire() runs, e.startedAt is
+	// already this ping's own (not-yet-sent) start, so reading it there would compute "how long
+	// until this ping expires" instead of "how close was this ENTRY to expiring" — answering a
+	// different, always-nearly-full-TTL question.
+	prevStartedAt time.Time
 }
 
 // fire sends one ping and accounts for it. Always fails open and quietly: the agent is not
@@ -1030,14 +1085,25 @@ func (k *keeper) fire(j pingJob) {
 // Fail open throughout, by construction: nothing here can leave this ping unset for the idle
 // span it was due for, because every "no" falls through to the code fire() already runs.
 func (k *keeper) fireSummarySubstitute(j pingJob) bool {
-	dispatch, ok := offload.KeepAliveSubstitute(j.session)
+	dispatch, info, ok := offload.KeepAliveSubstitute(j.session)
 	if !ok {
 		return false
 	}
 	e := j.e
 	k.mu.Lock()
-	model, prefix, ceiling := e.model, e.prefix, e.pol.Ceiling()
+	model, prefix, ceiling, headTTL1h := e.model, e.prefix, e.pol.Ceiling(), e.pol.HeadTTL1h
 	k.mu.Unlock()
+	phase := cachePhaseAt(j.prevStartedAt, k.now(), headTTL1h, preExpiryFor(info.PreExpirySeconds))
+	// A `pre_expiry` candidate asked to spend only when ITS OWN notion of the pre-expiry window
+	// is live, not merely whenever the keeper happens to be sending a ping — the two can diverge
+	// (a manager strategy's K>1 schedule, or a component configured with a narrower
+	// pre_expiry_seconds than the keeper's own Idle). `any` has no such condition. Checked against
+	// the SAME phase arithmetic Ctx.CachePhase itself uses (cachePhaseLocked), computed from this
+	// entry's own startedAt/pol rather than approximated from timing alone.
+	if info.CacheState == components.CacheStatePreExpiry && phase != components.CachePhasePreExpiry {
+		k.summarySubstitutePhaseMismatch.Add(1)
+		return false
+	}
 	// Respect the keep-alive $ cap on a PROJECTION, before spending anything.
 	if estimate := k.projectedSummaryUSD(model, prefix); estimate > ceiling {
 		k.summarySubstituteOverBudget.Add(1)
@@ -1420,6 +1486,9 @@ type KeepAliveStats struct {
 	SummarySubstituted          int64 `json:"keepalive_summary_substituted"`
 	SummarySubstituteFailed     int64 `json:"keepalive_summary_substitute_failed"`
 	SummarySubstituteOverBudget int64 `json:"keepalive_summary_substitute_over_budget"`
+	// SummarySubstitutePhaseMismatch counts a routine `pre_expiry` candidate declined because
+	// this particular ping did not land inside the component's own pre-expiry window.
+	SummarySubstitutePhaseMismatch int64 `json:"keepalive_summary_substitute_phase_mismatch"`
 }
 
 // PendingPings reports how many tracked sessions still have a ping scheduled ahead of them.
@@ -1479,9 +1548,10 @@ func (k *keeper) Stats() KeepAliveStats {
 	return KeepAliveStats{Live: live, Pings: k.pings.Load(), Skipped: k.skipped.Load(),
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
 		SpentUSD:                    math.Float64frombits(k.spentUSD.Load()),
-		SummarySubstituted:          k.summarySubstituted.Load(),
-		SummarySubstituteFailed:     k.summarySubstituteFailed.Load(),
-		SummarySubstituteOverBudget: k.summarySubstituteOverBudget.Load(),
+		SummarySubstituted:             k.summarySubstituted.Load(),
+		SummarySubstituteFailed:        k.summarySubstituteFailed.Load(),
+		SummarySubstituteOverBudget:    k.summarySubstituteOverBudget.Load(),
+		SummarySubstitutePhaseMismatch: k.summarySubstitutePhaseMismatch.Load(),
 	}
 }
 
