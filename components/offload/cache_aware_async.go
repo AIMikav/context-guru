@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -163,4 +164,86 @@ func (s *CacheAwareSummarizer) commitAsyncSummary(mode markerMode, session strin
 		st.Put(store.SumPrefix+session, b)
 		atomic.AddInt64(&cacheAwareAsyncCommitted, 1)
 	}
+}
+
+// KeepAliveSummaryResult is what one keep-alive-substituted summary call cost and produced, read
+// straight off the model call's own usage sink so the keeper can book it exactly as it would a
+// ping — see cache_aware_keepalive.go.
+type KeepAliveSummaryResult struct {
+	Model                                     string
+	FreshInput, Output, CacheWrite, CacheRead int
+	// Committed is false either because the call could not be started (another commission —
+	// async or keep-alive — is already in flight for this session, or the global concurrency
+	// bound is full), or because it ran and produced nothing usable (error, timeout, empty
+	// reply). Either way the caller's answer is the same: fall back to an ordinary ping.
+	Committed bool
+}
+
+// commissionSync runs the whole commission call INLINE and blocks until it resolves, for the one
+// caller that cannot use the detached startAsyncSummary path: the idle keep-alive substitution,
+// which needs to know whether a usable summary landed before it decides to fall back to an
+// ordinary ping (see cache_aware_keepalive.go). It is called from the keeper's own ping goroutine,
+// which is already off the request path and already budgets its own timeout — unlike
+// startAsyncSummary there is no request here to avoid stalling.
+//
+// It shares startAsyncSummary's single-flight registry and global concurrency bound rather than
+// duplicating either: a session has, at most, one commission in flight at a time regardless of
+// which caller started it, and the two callers racing to summarize the same span would otherwise
+// write the same checkpoint twice.
+func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, mm components.MessagesModel,
+	ask, span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
+	j, ok := inFlight.begin(c.Session)
+	if !ok {
+		return KeepAliveSummaryResult{}
+	}
+	defer inFlight.finish(c.Session, j)
+	select {
+	case summarySlots <- struct{}{}:
+	default:
+		atomic.AddInt64(&cacheAwareAsyncRefused, 1)
+		return KeepAliveSummaryResult{}
+	}
+	defer func() { <-summarySlots }()
+	atomic.AddInt64(&cacheAwareAsyncStarted, 1)
+	logging.From(c.Ctx).Info("cache_aware_summarizer: commissioned a keep-alive-substitute summary",
+		"session", c.Session, "covered_messages", coveredCount)
+	defer logging.From(c.Ctx).Info("cache_aware_summarizer: keep-alive-substitute summary resolved",
+		"session", c.Session)
+
+	session, st, mode := c.Session, c.Store, effectiveMode(c, s.mode)
+	if timeout <= 0 {
+		timeout = cacheAwareTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.Ctx, timeout)
+	defer cancel()
+	// A DETACHED sink: this call is not attributed to any one request either, same as the async
+	// path's own goroutine — see its comment on why a chained sink would double-charge.
+	ctx, callSink := cheapmodel.WithDetachedSink(ctx)
+	atomic.AddInt64(&cacheAwareCalls, 1)
+	out, err := mm.CompleteMessages(ctx, "", ask)
+	// Deferred BEFORE the error check, and READ before being deferred: a call that timed out may
+	// still have been billed for its input, and the result the keeper books is the same figures
+	// deferUsage is about to replay onto this session's next real turn — the keeper's ping ledger
+	// and the ordinary LLM-cost ledger are two different books of the SAME spend, not two spends.
+	_, in, outTok := callSink.Totals()
+	cw, cr := callSink.CacheTotals()
+	res := KeepAliveSummaryResult{Model: callSink.Model(),
+		FreshInput: int(in), Output: int(outTok), CacheWrite: int(cw), CacheRead: int(cr)}
+	deferUsage(st, session, callSink)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			atomic.AddInt64(&cacheAwareTimeouts, 1)
+		} else {
+			atomic.AddInt64(&cacheAwareErrors, 1)
+		}
+		return res
+	}
+	if strings.TrimSpace(out) == "" {
+		atomic.AddInt64(&cacheAwareEmpty, 1)
+		return res
+	}
+	committedBefore := atomic.LoadInt64(&cacheAwareAsyncCommitted)
+	s.commitAsyncSummary(mode, session, st, span, out, coveredCount)
+	res.Committed = atomic.LoadInt64(&cacheAwareAsyncCommitted) != committedBefore
+	return res
 }

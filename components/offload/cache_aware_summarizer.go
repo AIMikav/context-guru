@@ -283,7 +283,7 @@ func CacheAwareSummarizerTooLarge() int64 { return atomic.LoadInt64(&cacheAwareT
 func CacheAwareSummarizerCallTimeout() time.Duration { return cacheAwareTimeout }
 
 func init() {
-	components.RegisterFields("cache_aware_summarizer", cacheAwareSummarizerConfig{}, append([]components.Field{
+	f := []components.Field{
 		{Key: "keep_last_turns", Type: components.FieldInt, Default: 10, Min: 0,
 			Hint: "Messages kept verbatim at the tail. The default matches summarize's tuned tail " +
 				"so the two are comparable; it is a chosen starting point, not a measured optimum."},
@@ -312,7 +312,68 @@ func init() {
 				"which changes the forwarded prefix every turn and forfeits the cache stability " +
 				"this component exists for."},
 		markerModeField(),
-	}, append(modelFields("model"), components.TriggerFields("trigger")...)...))
+	}
+	f = append(f, modelFields("model")...)
+	// The shared trigger descriptors, with the two defaults this component's constructor
+	// (applyCacheAwareTriggerDefaults) actually installs — mirroring summarize's own override of
+	// the same two keys and for the same reason: Field.Default documents what an ABSENT key means
+	// to THIS component, and form.go's normalize() writes an enum's Default back into the saved
+	// document for an unset value, so a wrong one here would persist a cache_state this component
+	// never chose.
+	tf := components.TriggerFields("trigger")
+	for i := range tf {
+		switch tf[i].Key {
+		case "trigger.cache_state":
+			tf[i].Default = cacheAwareDefaultCacheState
+		case "trigger.min_request_frac":
+			tf[i].Default = cacheAwareDefaultRequestFrac
+		}
+	}
+	components.RegisterFields("cache_aware_summarizer", cacheAwareSummarizerConfig{}, append(f, tf...))
+}
+
+// cacheAwareDefaultRequestFrac and cacheAwareDefaultCacheState mirror summarize's own trigger
+// defaults (summarizeDefaultRequestFrac/summarizeDefaultCacheState) for the first half of the same
+// reason: a zero components.Trigger fires on every request carrying more than ~11 messages and a
+// 500-token span (components/trigger.go:20,266), which is far more aggressive than the measured,
+// defensible 0.9-of-C threshold summarize ships, and nothing about this component's own mechanism
+// changes that argument — it still ties up a model call and a stash slot on every eligible turn.
+//
+// The default is `any`, not `pre_expiry`, even though THIS component is the one whose call
+// actually needs a live prefix (see summarizeDefaultCacheState's retraction of `pre_expiry` for
+// `summarize`, and the comment above it explaining why `pre_expiry` is honoured here instead of
+// being inert). Two things make `any` the safer SHIPPED default rather than `pre_expiry`:
+//
+//   - `pre_expiry`'s window is seconds wide by design (DefaultPreExpiry is one minute inside a
+//     five-minute lifetime), so a deployment that never happens to send a request inside it simply
+//     never compacts — the same "silently dead on this deployment" failure CacheAllows' own
+//     Unknown-permits-by-default rule exists to avoid for `summarize`.
+//   - Firing on `any` and arriving COLD does not pay the double-rewrite a naive reading would
+//     predict: see cache_aware_cold.go, which defers the side call until the forwarded request's
+//     own usage confirms the cache it just rewrote, so the side call always reads warm.
+//
+// `pre_expiry` stays reachable and still restricts for a deployment that wants the stronger
+// guarantee of only ever reusing a cache the component KNOWS is still alive (never Unknown either
+// — see Trigger.CacheAllows' Unknown-with-pre_expiry clause, which this component's defaults do
+// not relax).
+const (
+	cacheAwareDefaultRequestFrac = summarizeDefaultRequestFrac
+	cacheAwareDefaultCacheState  = summarizeDefaultCacheState
+)
+
+// applyCacheAwareTriggerDefaults installs this component's trigger defaults for keys the operator
+// did not write, reusing summarize's raw-YAML presence probe (triggerKeysPresent) rather than a
+// second copy of it — see that function for why the zero value of MinRequestFrac cannot be used
+// to detect "absent".
+func applyCacheAwareTriggerDefaults(raw []byte, t *components.Trigger) error {
+	present := triggerKeysPresent(raw)
+	if !present["min_request_frac"] {
+		t.MinRequestFrac = cacheAwareDefaultRequestFrac
+	}
+	if t.CacheState == "" {
+		t.CacheState = cacheAwareDefaultCacheState
+	}
+	return t.Validate("cache_aware_summarizer")
 }
 
 func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
@@ -336,7 +397,9 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	if cfg.ResummarizeTokens < 0 {
 		return nil, errors.New("cache_aware_summarizer: resummarize_tokens must be >= 0")
 	}
-	if err := cfg.Trigger.Validate("cache_aware_summarizer"); err != nil {
+	// Installs min_request_frac: 0.9 / cache_state: any for keys the operator did not write, and
+	// validates cache_state — see applyCacheAwareTriggerDefaults.
+	if err := applyCacheAwareTriggerDefaults(raw, &cfg.Trigger); err != nil {
 		return nil, err
 	}
 	profiles, err := loadSummarizerProfiles(summarizerProfilesYAML)
@@ -394,7 +457,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// First thing, and unconditionally: the money was spent whatever this turn decides.
 	takeDeferredUsage(c)
 	headCount, start, end := summarizeSpan(msgs, 1, s.keepLastTurns)
-	if !s.trigger.Fires(req, c) || end <= start {
+	if end <= start {
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -410,17 +473,73 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		end = trimmed
 	}
 
-	// Reuse first: no model call, and the spliced bytes stay identical so the forwarded prefix is
-	// stable. This is the path that makes the component's name true.
-	if out, keys, ok := s.tryReuse(c, msgs, headCount, start, end); ok {
+	// Reuse first, UNCONDITIONALLY ON THE TRIGGER — the gates below decide whether to PAY for a
+	// FRESH summary, never whether an already-paid-for checkpoint stays in the body we forward.
+	// Those were one decision until the trigger gained a cache-state condition, and conflating
+	// them is cache-DESTRUCTIVE rather than merely a lost saving: `cache_state: pre_expiry` is true
+	// on a small fraction of turns by design, so a turn the gate declines would otherwise forward
+	// the FULL transcript — bytes that diverge from the cached prefix at the first summarized
+	// message, forcing the 1.25x suffix rewrite this component exists to avoid, on every quiet
+	// turn instead of saving it. See summarize.Offload's own comment on this; the two components
+	// share the bug class (and, now, the fix).
+	out, keys, ok, stale := s.tryReuse(c, msgs, headCount, start, end)
+	if ok {
+		if len(keys) == 0 {
+			rep.Irreversible = true // reused a non-full checkpoint (nothing stashed)
+		}
 		req.Input = out
 		return keys, nil
+	}
+	// declineButReplayStale is every later decline's fallback: a checkpoint whose covered hash
+	// still matched tryReuse's check is a faithful summary even when it is too stale to be
+	// REUSED as-is (resummarize_tokens exceeded) or when a resource below (model, stash room,
+	// an unverified role) is simply unavailable this turn. Sending it beats sending the full
+	// transcript — those bytes are what an earlier turn already forwarded — so every decline
+	// from here on tries it before giving up. See replayStale.
+	declineButReplayStale := func() ([]string, error) {
+		if stale {
+			if out, keys, ok := s.replayStale(c, msgs, headCount, start); ok {
+				if len(keys) == 0 {
+					rep.Irreversible = true
+				}
+				req.Input = out
+				return keys, nil
+			}
+		}
+		rep.Skipped = true
+		return nil, nil
+	}
+
+	// THE GATES DECIDE WHETHER TO PAY FOR A FRESH SUMMARY. `sized`/`resolvable` ask "is this
+	// request big enough" on the two separate rulers Trigger.Fires itself keeps separate (see its
+	// own docstring); `phased` asks "does the configured cache_state permit firing on THIS turn's
+	// cache phase" via Ctx.CachePhase/Trigger.CacheAllows — the thing this component used to never
+	// ask (#400). A turn that fails `sized` or `resolvable` has nothing worth registering for the
+	// keep-alive substitution below either, so those two decline (falling back to a stale replay
+	// first) rather than reaching the resource checks; a turn that fails only `phased` still has
+	// a candidate worth keeping (fill is there, the component is just waiting for the right cache
+	// phase to spend on it), so it falls through to the resource checks and the keep-alive
+	// registration before declining.
+	sized := s.trigger.Fires(req, c)
+	if !sized {
+		rep.Gate("below_request_trigger")
+	}
+	resolvable := s.trigger.FracResolvable(c)
+	if !resolvable {
+		rep.Gate("window_not_exact")
+	}
+	if !sized || !resolvable {
+		return declineButReplayStale()
+	}
+	phase := c.CachePhase(s.trigger.PreExpiry())
+	phased := s.trigger.CacheAllows(c, phase)
+	if !phased {
+		rep.Gate("cache_state_declined_" + phase.String())
 	}
 
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
-		rep.Skipped = true
-		return nil, nil
+		return declineButReplayStale()
 	}
 	// The bill is set by the WHOLE conversation, because that is what gets sent. Checked before the
 	// client is even resolved, so an over-large session costs nothing to decline.
@@ -428,23 +547,20 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs}) > s.maxRequestTokens {
 		atomic.AddInt64(&cacheAwareTooLarge, 1)
 		rep.Gate("request_over_max_tokens")
-		rep.Skipped = true
-		return nil, nil
+		return declineButReplayStale()
 	}
 	model := s.modelClient
 	if model == nil {
 		model = c.Model.For(s.modelSource)
 	}
 	if model == nil {
-		rep.Skipped = true
-		return nil, nil
+		return declineButReplayStale()
 	}
 	mm, okModel := model.(components.MessagesModel)
 	if !okModel {
 		atomic.AddInt64(&cacheAwareDeclined, 1)
 		rep.Gate("no_messages_model")
-		rep.Skipped = true
-		return nil, nil
+		return declineButReplayStale()
 	}
 	// Don't pay for a summary the store cannot keep: a full marker promises the span is
 	// restorable, so check the room before the call rather than discovering it after.
@@ -457,8 +573,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	if mode == markerFull && !store.StashRoom(c.Store, len(spanJSON)) {
 		atomic.AddInt64(&cacheAwareRefusedStash, 1)
 		rep.Gate("no_stash_room")
-		rep.Skipped = true
-		return nil, nil
+		return declineButReplayStale()
 	}
 
 	profiles := s.resolveProfiles()
@@ -469,8 +584,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		if r, matched := profiles.roleFor(s.modelID); !matched || r != bschemas.ChatMessageRoleSystem {
 			atomic.AddInt64(&cacheAwareUnverifiedSystem, 1)
 			rep.Gate("unverified_system_role")
-			rep.Skipped = true
-			return nil, nil
+			return declineButReplayStale()
 		}
 	}
 	role := s.instructionRole
@@ -485,6 +599,40 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	ask := make([]bschemas.ChatMessage, 0, len(msgs)+1)
 	ask = append(ask, msgs...)
 	ask = append(ask, instruction)
+
+	// Register this turn's commission material as the idle keep-alive's substitute for a bare
+	// cache-read ping, REGARDLESS of `phased` below. A turn the cache-state gate just declined
+	// (fill is there; the component is waiting for the right phase) is exactly the session whose
+	// NEXT ping the keeper would otherwise spend on a 1-token read — and this material lets it
+	// spend on a cache-reading summary instead. Registering when `phased` is also true is safe:
+	// the registration is only ever consumed between requests, after this turn has already either
+	// fired (so the registry's own single-flight check in commissionSummary refuses a second
+	// dispatch and the keeper falls back to an ordinary ping) or deferred for cold (same check).
+	// See cache_aware_keepalive.go.
+	s.registerKeepAliveCandidate(c, mm, ask, span, end-start)
+
+	if !phased {
+		return declineButReplayStale()
+	}
+
+	// COLD-TURN ORDERING. Firing the side call now, while THIS turn's own forwarded request is
+	// also about to rewrite the same cold prefix, pays the full-prefix rewrite TWICE instead of
+	// once: the side call misses the cache exactly as the forwarded request does, so neither of
+	// them is the cheap cache READ this component's whole argument depends on. Deferring until the
+	// forwarded request's own usage confirms the rewrite happened turns that into a guaranteed
+	// cache HIT — see cache_aware_cold.go for the registry and proxy's call into
+	// ResolveDeferredCacheAwareSummary once that usage is observed.
+	//
+	// Only CachePhaseCold needs this. Unknown is permitted to fire (CacheAllows' own Unknown rule)
+	// but says nothing about whether the prefix is actually gone, so there is no established
+	// double-rewrite to avoid guarding against; Warm and PreExpiry mean the prefix the forwarded
+	// request is about to send is itself still live, so the side call already reads it.
+	if phase == components.CachePhaseCold {
+		s.deferColdSummary(c, mm, ask, span, end-start)
+		rep.Event("cold_commission_deferred")
+		rep.Skipped = true
+		return nil, nil
+	}
 
 	// COMMISSION, do not block. The call covers most of the transcript against a 300 s budget, so
 	// running it inline would stall the triggering turn by minutes — billed against the agent's own
@@ -525,24 +673,34 @@ func (s *CacheAwareSummarizer) splice(msgs []bschemas.ChatMessage, headCount, bo
 // cannot both be in one pipeline; and CoveredHash rejects a checkpoint whose covered prefix does
 // not match, so a preset switch mid-session degrades to a fresh summary rather than reusing a
 // stale one.
-func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int) ([]bschemas.ChatMessage, []string, bool) {
-	if s.resummarizeTokens <= 0 {
-		return nil, nil, false
-	}
-	cp, ok := loadCheckpoint(c)
-	if !ok || cp.CoveredCount <= 0 || cp.SummaryMsg == "" {
-		return nil, nil, false
+// tryReuse's fourth return, stale, is what lets a turn the fresh-commission gates decline still
+// replay an EXISTING checkpoint instead of forwarding the full transcript — see replayStale and
+// the comment at this function's call site in Offload. Mirrors summarize.tryReuse's own
+// (out, keys, ok, stale) shape and for the identical reason: a checkpoint whose covered hash
+// still matches is a faithful summary of msgs[start:boundary] whether or not its tail has grown
+// past resummarize_tokens, so "stale" and "no checkpoint at all" cannot share one false — the
+// caller needs to tell them apart to know whether there is anything left to fall back to.
+func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int) (out []bschemas.ChatMessage, keys []string, ok, stale bool) {
+	cp, found := loadCheckpoint(c)
+	if !found || cp.CoveredCount <= 0 || cp.SummaryMsg == "" {
+		return nil, nil, false, false
 	}
 	boundary := start + cp.CoveredCount
 	if boundary > end {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	covered := msgs[start:boundary]
 	if spanHash(covered) != cp.CoveredHash {
-		return nil, nil, false
+		return nil, nil, false, false // prefix diverged (different session / edited) → fresh
 	}
-	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs[boundary:end]}) >= s.resummarizeTokens {
-		return nil, nil, false
+	// resummarizeTokens <= 0 means "roll the checkpoint forward on every eligible turn" rather
+	// than "never reuse" — checked HERE, after the hash match, so it reports STALE rather than
+	// nothing. A caller that cannot pay for a roll-forward (the fresh gates just declined) still
+	// needs to be told a valid checkpoint exists, or a config carrying `resummarize_tokens: 0`
+	// would replay nothing and oscillate between the full and summarized shapes turn to turn.
+	if s.resummarizeTokens <= 0 ||
+		schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs[boundary:end]}) >= s.resummarizeTokens {
+		return nil, nil, false, true
 	}
 	// Refresh the stashed original so expand keeps resolving it.
 	if cp.Key != "" {
@@ -550,7 +708,53 @@ func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatM
 			c.Store.Put(cp.Key, b)
 		}
 	}
+	spliced := s.splice(msgs, headCount, boundary, cp.SummaryMsg)
+	if cp.Key != "" {
+		return spliced, []string{cp.Key}, true, false
+	}
+	return spliced, nil, true, false
+}
+
+// replayStale re-emits an existing-but-stale checkpoint when the fresh-commission gates decline
+// (below the size threshold, an unresolvable window, or a cache_state the current phase does not
+// permit). The covered hash still matched in tryReuse's check — this checkpoint is a faithful
+// summary of msgs[start:boundary], merely not rolled forward to also cover the newest messages —
+// so sending it is strictly better than the full transcript: those bytes are what an EARLIER turn
+// already forwarded, and the provider has already cached a prefix ending at them. Mirrors
+// summarize.replayStale; see that function's own comment for why the fresh gates must not also
+// gate this fallback (they decide whether to PAY for a new summary, never whether an old one
+// stays in the body).
+func (s *CacheAwareSummarizer) replayStale(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start int) ([]bschemas.ChatMessage, []string, bool) {
+	cp, ok := loadCheckpoint(c)
+	if !ok || cp.CoveredCount <= 0 || cp.SummaryMsg == "" {
+		return nil, nil, false // nothing to fall back to
+	}
+	boundary := start + cp.CoveredCount
+	if boundary > len(msgs) {
+		return nil, nil, false
+	}
+	covered := msgs[start:boundary]
+	// The stash refresh, for the same reason tryReuse's does one: this payload was accepted on
+	// the turn the checkpoint was made, so a key already present is retained whatever the
+	// reserve says, and a refresh failure only means the replayed marker is dangling — the
+	// replay still proceeds, because the summary text must stay byte-identical to the turn that
+	// created it.
+	if cp.Key != "" {
+		if b, err := json.Marshal(covered); err == nil {
+			c.Store.Put(cp.Key, b)
+		}
+	}
 	out := s.splice(msgs, headCount, boundary, cp.SummaryMsg)
+	// A MESSAGE-count shrink is not a TOKEN shrink: emitCheckpoint-equivalent splicing can return
+	// fewer messages but MORE tokens on a short covered span replaced by a verbose summary, and
+	// the pipeline's never-worse rule would then revert this component anyway — forwarding the
+	// full transcript, the exact byte-flip this fallback exists to avoid, just silently instead
+	// of with a name attached.
+	if len(out) >= len(msgs) ||
+		schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: out}) >=
+			schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs}) {
+		return nil, nil, false
+	}
 	if cp.Key != "" {
 		return out, []string{cp.Key}, true
 	}

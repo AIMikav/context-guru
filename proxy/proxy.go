@@ -1180,6 +1180,11 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			// refreshed are inputs to a dollar figure, not just a label.
 			kaPings, kaRefreshed, kaStrategy := h.keeper.arrive(tn.ID, tr.Session)
 			cp.noteKeepAlive(kaPings, kaRefreshed, kaStrategy)
+			// Drop any cache_aware_summarizer keep-alive substitute registered off an earlier
+			// turn's conversation: this request is about to run the pipeline again, and the span
+			// a stale registration names has been superseded whether or not THIS turn re-registers
+			// one. See offload.ClearKeepAliveCandidate.
+			offload.ClearKeepAliveCandidate(tr.Session)
 			h.setLastSession(tr.Session)
 			if h.agg != nil && !bypassed {
 				h.agg.RecordAddedLatency(addedMs)
@@ -1514,6 +1519,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// prefix a ping would replay is the one the provider just hashed. Costs nothing when
 		// no tenant has opted in.
 		h.keeper.record(tn, session, lastUpStart, body, up, r, provider, up.path, status, usage, usageOK)
+		// Release any cache_aware_summarizer side call this turn deferred because its own cache
+		// was COLD: this request has now either rewritten that prefix or failed trying to, and
+		// either way the deferral must resolve rather than wait indefinitely for a signal that
+		// may never come (see offload.ResolveDeferredCacheAwareSummary's own comment on why a
+		// failed forward still resolves it). Harmless, and nearly free, on the overwhelming
+		// majority of sessions that never deferred anything.
+		offload.ResolveDeferredCacheAwareSummary(session)
 		if sse {
 			// The same two facts to both sinks. The aggregator keeps the process-lifetime
 			// average; the dashboard row keeps the per-request pair, so "which model, which

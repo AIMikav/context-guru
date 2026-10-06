@@ -17,6 +17,7 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/rossoctl/context-guru/tenant"
@@ -443,6 +444,16 @@ type keeper struct {
 	failed   atomic.Int64
 	wrote    atomic.Int64  // pings that CREATED instead of refreshing — a bug, not a cost
 	spentUSD atomic.Uint64 // float64 bits; only ever read as a whole
+	// summarySubstituted counts pings replaced by cache_aware_summarizer's own cache-reading
+	// call (see fireSummarySubstitute) — accounted toward `pings` as well, since it IS the ping
+	// for that idle span, never a second one.
+	summarySubstituted atomic.Int64
+	// summarySubstituteFailed counts a substitute attempt that fell back to an ordinary ping
+	// because the call itself declined, timed out, errored, or came back empty.
+	summarySubstituteFailed atomic.Int64
+	// summarySubstituteOverBudget counts a substitute attempt refused BEFORE being dispatched
+	// because its projected cost exceeded the keep-alive per-ping $ cap.
+	summarySubstituteOverBudget atomic.Int64
 }
 
 // keepAliveDisabled is the operator's kill switch, read once at construction. A single
@@ -748,6 +759,32 @@ func (k *keeper) projectedPingUSD(model string, prefix int64, route string) floa
 	return float64(prefix)*price.CacheRead + float64(pingOutputBudget(route))*price.Output
 }
 
+// summaryOutputBudgetGuess is the assumed output size of a keep-alive-substituted summary call,
+// used ONLY to project its cost against the keep-alive $ cap before dispatching it — never a cap
+// on the real call, which runs under cache_aware_summarizer's own full timeout and token budget.
+//
+// Unmeasured, like pingUSD's own disclaimer two paragraphs up: a real summary's length depends on
+// the transcript and the component's configured prompt, and this is new as of #400 so there is no
+// telemetry on this specific call's own output size yet. 2000 tokens is a round, conservative
+// guess sized to make the error fail in the cheap direction — overestimating a verbose model's
+// true output merely sends an ordinary ping instead of substituting one, never the reverse.
+const summaryOutputBudgetGuess = 2000
+
+// projectedSummaryUSD mirrors projectedPingUSD for the keep-alive substitute call: the prefix at
+// the model's own cache-read rate, plus an assumed output budget rather than the ping's 1-token
+// one, since this call generates a full summary.
+func (k *keeper) projectedSummaryUSD(model string, prefix int64) float64 {
+	p := k.h.opts.Prices
+	if p == nil || model == "" || prefix <= 0 {
+		return 0
+	}
+	price, ok := p.Price(context.Background(), model)
+	if !ok || price.Zero() {
+		return 0
+	}
+	return float64(prefix)*price.CacheRead + float64(summaryOutputBudgetGuess)*price.Output
+}
+
 // retire releases one session's held material now: zeroized, deadline cancelled, entry gone.
 // Idempotent and safe on a session that was never tracked, which is what lets every refusal path
 // call it unconditionally.
@@ -930,6 +967,14 @@ func (k *keeper) fire(j pingJob) {
 	}
 	defer release()
 
+	// Let cache_aware_summarizer stand in for this ping when it has material registered for the
+	// session: same cache-read refresh, plus a compaction instead of one output token. Never
+	// double-pinged — on success this returns, and the ordinary ping below never runs for this
+	// due cycle; on any kind of "no" it falls through to the ordinary ping, fail open.
+	if k.fireSummarySubstitute(j) {
+		return
+	}
+
 	body, ok := pingBody(j.raw, j.up.path)
 	if !ok {
 		k.markStopped(j.e)
@@ -971,6 +1016,118 @@ func (k *keeper) fire(j pingJob) {
 		"tenant", tenantLabel(j.tenant), "session", j.session, "ping", j.ping,
 		"cache_read", u.CacheRead, "cache_write", u.CacheWrite, "output", u.Output,
 		"cost_usd", cost, "ms", ms)
+}
+
+// fireSummarySubstitute tries to replace this due ping with cache_aware_summarizer's own
+// cache-reading call. Returns true when it did — the caller must then not also send an ordinary
+// ping. False covers every reason not to, and the caller's existing ping flow is the fallback for
+// all of them without needing to know which: no material is registered for this session (the
+// component is not in this tenant's pipeline, or no turn has reached the registration point —
+// see offload.KeepAliveSubstitute), the registry's own "a checkpoint already exists" refusal, a
+// projected cost over the keep-alive $ cap, or the call itself declining, timing out, erroring,
+// or coming back empty.
+//
+// Fail open throughout, by construction: nothing here can leave this ping unset for the idle
+// span it was due for, because every "no" falls through to the code fire() already runs.
+func (k *keeper) fireSummarySubstitute(j pingJob) bool {
+	dispatch, ok := offload.KeepAliveSubstitute(j.session)
+	if !ok {
+		return false
+	}
+	e := j.e
+	k.mu.Lock()
+	model, prefix, ceiling := e.model, e.prefix, e.pol.Ceiling()
+	k.mu.Unlock()
+	// Respect the keep-alive $ cap on a PROJECTION, before spending anything.
+	if estimate := k.projectedSummaryUSD(model, prefix); estimate > ceiling {
+		k.summarySubstituteOverBudget.Add(1)
+		slog.Debug("context-guru: cache_aware_summarizer keep-alive substitute would exceed the "+
+			"per-ping cost cap; pinging normally instead",
+			"tenant", tenantLabel(j.tenant), "session", j.session,
+			"estimate_usd", estimate, "ceiling_usd", ceiling)
+		return false
+	}
+	start := k.now()
+	res := dispatch(offload.CacheAwareSummarizerCallTimeout())
+	ms := float64(k.now().Sub(start).Microseconds()) / 1000.0
+	if !res.Committed {
+		k.summarySubstituteFailed.Add(1)
+		slog.Debug("context-guru: cache_aware_summarizer keep-alive substitute produced no "+
+			"summary; pinging normally instead",
+			"tenant", tenantLabel(j.tenant), "session", j.session)
+		return false
+	}
+	cost := k.recordSummarySubstitute(j, res, ms, start)
+	slog.Debug("context-guru: cache keep-alive ping (via cache_aware_summarizer)",
+		"tenant", tenantLabel(j.tenant), "session", j.session, "ping", j.ping,
+		"cache_read", res.CacheRead, "cache_write", res.CacheWrite, "output", res.Output,
+		"cost_usd", cost, "ms", ms)
+	return true
+}
+
+// recordSummarySubstitute books a substituted ping exactly like record1 books an ordinary one —
+// the session's running spend, the process counter, the cache-liveness clock, and the host's
+// KeepAliveReport — plus the one difference that justifies a separate function: `pings` is
+// incremented here as PINGS.Add(1) the same as record1, so a substituted ping is counted once
+// toward the process-wide ping figure (never twice: the ordinary ping path that would have
+// counted it never runs, because fireSummarySubstitute returned true). The summarizer's OWN
+// spend is a separate figure, already booked onto the regular LLM-cost ledger by commissionSync's
+// call to deferUsage — this function books only the ping-ledger side of the same event.
+func (k *keeper) recordSummarySubstitute(j pingJob, res offload.KeepAliveSummaryResult, ms float64, startedAt time.Time) float64 {
+	e := j.e
+	k.mu.Lock()
+	provider, route, preset, agent := e.provider, e.route, e.preset, e.agent
+	appliedStrategy := e.appliedStrategy
+	k.mu.Unlock()
+	model := res.Model
+	if model == "" {
+		model = e.model
+	}
+	var price modelinfo.Price
+	priced := false
+	if p := k.h.opts.Prices; p != nil && model != "" {
+		price, priced = p.Price(context.Background(), model)
+	}
+	u := Usage{FreshInput: int64(res.FreshInput), CacheRead: int64(res.CacheRead),
+		CacheWrite: int64(res.CacheWrite), Output: int64(res.Output)}
+	// Same clock, same gate, same reason as record1: a substitute call reads the SAME cached
+	// prefix a ping would (it is built from the byte-identical forwarded body — see
+	// offload.registerKeepAliveCandidate), so it refreshes the SAME liveness clock
+	// cache_state: pre_expiry reads, and only when it actually read something.
+	if u.CacheRead > 0 {
+		apply.RecordCacheTouch(j.st, j.tenant, j.raw, provider, startedAt.UnixMilli())
+	}
+	var cost float64
+	if priced && !price.Zero() && (u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
+		cost = price.CostWithCacheWrite1h(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output, 0)
+	}
+	k.mu.Lock()
+	e.spent += cost
+	e.refreshed = u.CacheRead
+	k.mu.Unlock()
+	for {
+		old := k.spentUSD.Load()
+		if k.spentUSD.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+cost)) {
+			break
+		}
+	}
+	k.pings.Add(1)
+	k.summarySubstituted.Add(1)
+	if ka, ok := j.emitter.(components.KeepAliveEmitter); ok {
+		ka.KeepAlivePing(components.KeepAliveReport{
+			Tenant: j.tenant, Session: j.session, Model: model, Provider: string(provider),
+			Route: route, Pings: j.ping, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite,
+			Output: u.Output, CostUSD: cost, Status: 200, DurationMs: ms,
+			TS: k.now().UnixMilli(), Agent: agent, Preset: preset,
+			Strategy:   appliedStrategy,
+			FreshInput: u.FreshInput,
+			// 0, not pingOutputBudget(route): this ping asked for a full summary, not the
+			// 1-token read an ordinary ping would have, so reporting the ping's own budget here
+			// would misdescribe what was actually requested. See KeepAliveSummaryResult.
+			MaxTokens: 0,
+		})
+	}
+	return cost
 }
 
 // markStopped stops pinging one session, if it is still tracked.
@@ -1255,6 +1412,14 @@ type KeepAliveStats struct {
 	Failed   int64   `json:"failed"`
 	Wrote    int64   `json:"wrote_instead_of_read"`
 	SpentUSD float64 `json:"spend_usd"`
+	// SummarySubstituted, SummarySubstituteFailed and SummarySubstituteOverBudget are
+	// cache_aware_summarizer's share of Pings — see fireSummarySubstitute. A deployment running
+	// that component should see SummarySubstituted climb instead of a flat Pings/Wrote pair; a
+	// SummarySubstituteFailed or SummarySubstituteOverBudget that climbs just as fast says the
+	// substitution is being attempted and declining, not that it is dead.
+	SummarySubstituted          int64 `json:"keepalive_summary_substituted"`
+	SummarySubstituteFailed     int64 `json:"keepalive_summary_substitute_failed"`
+	SummarySubstituteOverBudget int64 `json:"keepalive_summary_substitute_over_budget"`
 }
 
 // PendingPings reports how many tracked sessions still have a ping scheduled ahead of them.
@@ -1313,7 +1478,11 @@ func (k *keeper) Stats() KeepAliveStats {
 	k.mu.Unlock()
 	return KeepAliveStats{Live: live, Pings: k.pings.Load(), Skipped: k.skipped.Load(),
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
-		SpentUSD: math.Float64frombits(k.spentUSD.Load())}
+		SpentUSD:                    math.Float64frombits(k.spentUSD.Load()),
+		SummarySubstituted:          k.summarySubstituted.Load(),
+		SummarySubstituteFailed:     k.summarySubstituteFailed.Load(),
+		SummarySubstituteOverBudget: k.summarySubstituteOverBudget.Load(),
+	}
 }
 
 // LiveSessionKeys returns the session ids the keeper currently considers live — a copy,

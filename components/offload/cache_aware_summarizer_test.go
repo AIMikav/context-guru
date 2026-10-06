@@ -113,8 +113,15 @@ func caCtx(session string) *components.Ctx {
 
 // marker_mode is FULL on purpose: "off" would leave the whole reversibility path — Marshal,
 // PutStash, hashKey, expand.Marker — uncovered, which is where the store-refusal defect lived.
+//
+// trigger.min_request_frac: 0 is deliberate, not a way of dodging the shipped 0.9 default
+// (applyCacheAwareTriggerDefaults) — it ISOLATES the behaviour each test in this file is actually
+// about from the fill-fraction and cache-state conjuncts, which have their own tests
+// (cache_aware_trigger_test.go). caCtx below builds a Ctx with no CtxWindow at all, so leaving the
+// fraction at its default here would make FracResolvable decline every one of these turns before
+// they ever reached the thing under test.
 const caBaseCfg = "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 6000\n" +
-	"trigger:\n  min_messages: 4\n  min_request_tokens: 10\n"
+	"trigger:\n  min_messages: 4\n  min_request_tokens: 10\n  min_request_frac: 0\n"
 
 // caTurn runs ONE turn and returns the forwarded request.
 func caTurn(t *testing.T, s *CacheAwareSummarizer, c *components.Ctx, msgs []bschemas.ChatMessage) (*bschemas.BifrostChatRequest, *components.Report) {
