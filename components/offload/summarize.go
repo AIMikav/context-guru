@@ -498,7 +498,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// covers that content. That is a small weakening of the anti-bounce guard bought with byte
 	// stability, and it was already true of the pre-existing reuse path.
 	if trimmed := trimSpanForKeptVerbatim(msgs, start, end,
-		func(text string) bool { return isKeptVerbatim(c, contentKey(text)) }); trimmed != end {
+		func(text string) bool { return isKeptVerbatim(c, contentKey(text)) || restoredSpanGuard(c, text) }); trimmed != end {
 		rep.Gate(GateKeptVerbatim)
 		end = trimmed
 		if end <= start {

@@ -301,6 +301,13 @@ type Ctx struct {
 	// DisallowCountChange prevents transcript-restructuring components from
 	// running when a host cannot safely write their output back to its wire shape.
 	DisallowCountChange bool
+	// Restored maps the content key (extract.ContentKey) of each expanded original that the host
+	// re-inserts this turn as a separate message at a fixed anchor, to that original's marker id
+	// (`expand.fixed_restore`, #407). For those, kept-verbatim no longer applies: the compacted
+	// bytes at the original position are replayed exactly as before the expand, so nothing inside
+	// the cached prefix changes, and the model reads the content from the inserted copy instead.
+	// Nil (the default, and whenever the anchor cannot be honoured) is today's behaviour.
+	Restored map[string]string
 	// AllowSummarySpan is supplied by a wire adapter when only some normalized
 	// spans can be rebuilt without dropping opaque provider state. Nil means the
 	// ordinary Chat/Anthropic adapter has no extra restriction.

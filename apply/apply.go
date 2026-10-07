@@ -250,6 +250,11 @@ type Trace struct {
 	// assumed, because f was the one input R4's simulation could not read off the database
 	// and had to parameterise.
 	HeadTTLTokens int
+	// Restored is how many expanded originals this request restored as their own message at a
+	// fixed anchor (`expand.fixed_restore`, #407), and RestoredTokens what those copies added on
+	// the wire. The pipeline's own token counts do not include them: the copies are inserted after
+	// it runs, so that no component can ever compact one.
+	Restored, RestoredTokens int
 	// Run is the pipeline's aggregate report (nil when the pipeline never ran).
 	Run *components.RunReport
 	// Changes lists each rewritten message's before/after text (clipped).
@@ -341,6 +346,9 @@ func metaSessionIDs(body []byte) []string {
 // field is filled from a value the rewrite already computed, and nothing branches on it.
 func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o Opts) (res Result) {
 	body, provider, bypass := o.Body, o.Provider, o.Bypass
+	// The transcript exactly as the host passed it, before the envelope rewrites: fixed-restore
+	// anchors are fingerprinted against these bytes on the turn that records them.
+	client := o.Body
 	tr := &res.Trace
 	tr.Bypassed = bypass
 	// Top-level fail-open backstop: the per-component recover in pipeline.runOne only
@@ -458,6 +466,11 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// Via the same function the response path reaches through SessionIDFor, so observe mode's
 	// billed-input record and this pipeline's checkpoints cannot key on different ids.
 	sessionID := sessionIDFrom(o.Tenant, o.Session, body, norm)
+	var restore restorePlan
+	if !bypass {
+		restore = planRestore(pipe, st, sessionID, string(provider), client,
+			messagesArray(client).Array())
+	}
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	nowMs := o.nowMs()
 	coldCache := false
@@ -638,6 +651,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		SystemSplit:   systemSplit,
 		ToolSchema:    toolSchema,
 		FilteredDecls: filteredDecls,
+		Restored:      restore.restored(),
 	}
 	tr.Session, tr.CacheAware, tr.MaxCachedIdx, tr.Messages = sessionID, cacheAware, maxCachedIdx, len(norm)
 	tr.Breakpoints = bps
@@ -708,6 +722,9 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			return res
 		}
 		res.Body, res.Changed = nb, ok || systemSplit || toolSchema || filteredDecls > 0
+		if ok {
+			res = finishRestore(res, restore, string(provider), body, msgs)
+		}
 		return res
 	}
 
@@ -850,7 +867,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		}
 	}
 	res.Body, res.Changed = out, changed
-	return res
+	return finishRestore(res, restore, string(provider), body, msgs)
 }
 
 // resolveCacheAware decides whether cache-aware compaction is active for this
@@ -1772,4 +1789,22 @@ func spliceMessages(body []byte, msgs []gjson.Result, edits map[int][]byte, shif
 		prev = end
 	}
 	return append(out, body[prev:]...), true
+}
+
+// finishRestore inserts the plan's restored copies into res.Body. If they cannot be inserted, the
+// pipeline's output cannot be forwarded either: it compacted the originals on the promise of a
+// copy. So it falls back to fallback, the body before the pipeline, which carries every original in
+// full at its own position.
+func finishRestore(res Result, plan restorePlan, wire string, fallback []byte, client []gjson.Result) Result {
+	if len(plan) == 0 {
+		return res
+	}
+	nb, tokens, ok := plan.insert(wire, res.Body, client)
+	if !ok {
+		res.Body, res.Changed = fallback, true
+		return res
+	}
+	res.Body, res.Changed = nb, true
+	res.Restored, res.RestoredTokens = len(plan), tokens
+	return res
 }

@@ -648,8 +648,8 @@ default pipeline; explicit fields override it.
 
 ### Config shape
 
-The document has six top-level fields (from the `Config` struct in
-`config/config.go`):
+The document's top-level fields (from the `Config` struct in `config/config.go`; the `cache:`
+block is covered in [Cache keep-alive](../how-to/cache-keepalive.md)):
 
 | Field | Type | Role |
 |---|---|---|
@@ -659,6 +659,7 @@ The document has six top-level fields (from the `Config` struct in
 | `store` | object | State store options — see [`store`](#store) below. |
 | `mode` | string | Operating mode: `sync` (default) \| `observe`. See [Operating modes](../how-to/operating-modes.md). |
 | `observe` | object | Observe-mode tuning; ignored in sync mode. |
+| `expand` | object | How expanded content is given back on later turns — see [`expand`](#expand) below. |
 
 #### `store`
 
@@ -822,6 +823,12 @@ Always explicit — nothing infers it from the rest of the configuration.
 |---|---|---|
 | `max_queue` | `256` | Bound on the off-path measurement queue. A full queue **drops** (counted as `dropped`) and never blocks the request path. |
 | `workers` | `1` | Drain goroutines. One keeps a single measurement's cheap-model call in flight per process, which keeps that spend and gateway rate limits predictable. |
+
+#### `expand`
+
+| Field | Default | Purpose |
+|---|---|---|
+| `fixed_restore` | `false` | After the agent expands an offloaded output, keep the original **compacted** at its own position and give the content back as a separate message, labelled with the same `<<cg:HASH>>` marker, inserted right after the turn that expanded it — at the same index, byte-identical, on every later turn. Off is the older behaviour: the original reverts to full at its own position (kept-verbatim), a change inside the cached prefix that costs a cache-write of the whole suffix. One switch for every offloader, because the compacting component can be any of them. See [What an expand costs](../how-to/recover-context.md#fixed-restore-opt-in). |
 
 !!! warning "Strict: unknown keys are rejected"
     The YAML loader runs with `KnownFields(true)`, so a typo'd key fails loudly

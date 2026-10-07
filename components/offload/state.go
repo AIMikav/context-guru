@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
@@ -375,9 +376,44 @@ func KeptVerbatim(st store.Store, original string) bool {
 	return ok
 }
 
+// isKeptVerbatim is the ONE place every offloader asks "did the agent expand this?" — reapplyFrozen,
+// skipReduce, extract_llm, extract_llm_sweep and failed_run all come through here — which is why
+// fixed restore (#407) is decided here rather than per component. When the host re-inserts this
+// content at a fixed anchor this turn (c.Restored), the answer is no: each offloader then does
+// exactly what it did before the expand, so the compacted bytes at the original position are
+// replayed unchanged instead of reverting to the full original inside the cached prefix.
+// Anything that makes the anchor unusable leaves c.Restored without the key, and the mark below
+// applies as it always has.
 func isKeptVerbatim(c *components.Ctx, ck string) bool {
+	if _, ok := c.Restored[ck]; ok {
+		return false
+	}
 	_, ok := c.Store.Get(keptKey(ck))
 	return ok
+}
+
+// restoredSpanGuard reports whether text is, in either form, an original the host restores at a
+// fixed anchor this turn: the full original (its content key), or the compacted message that
+// replaced it (it carries that original's marker).
+//
+// The span removers need it because they are the one place isKeptVerbatim's "no" is wrong. In-place
+// offloaders replay a compaction at the original position, which is what keeps the prefix stable;
+// summarize REPLACES a span with one new message, so a span covering the original would also cover
+// the anchor right after the turn that expanded it, and the inserted copy would lose its place.
+// Protecting the original exactly as kept-verbatim did keeps the span ending before it.
+func restoredSpanGuard(c *components.Ctx, text string) bool {
+	if len(c.Restored) == 0 {
+		return false
+	}
+	if _, ok := c.Restored[contentKey(text)]; ok {
+		return true
+	}
+	for _, id := range c.Restored {
+		if strings.Contains(text, expand.Marker(id)) {
+			return true
+		}
+	}
+	return false
 }
 
 // skipReduce reports whether an offloader must leave this content untouched: it

@@ -18,6 +18,10 @@ import (
 type Pipeline struct {
 	comps   []Component
 	emitter Emitter
+	// fixedRestore is the config's `expand.fixed_restore` (#407). It lives on the pipeline
+	// because the pipeline is the per-config-document value every host already holds per
+	// tenant, and the decision spans all of its offloaders at once rather than any one of them.
+	fixedRestore bool
 }
 
 // NewPipeline builds a pipeline from already-constructed components in order.
@@ -345,6 +349,14 @@ func (p *Pipeline) HasOffload() bool {
 	}
 	return false
 }
+
+// SetFixedRestore records the config's `expand.fixed_restore` switch. Set once by the
+// builder, before the pipeline serves a request.
+func (p *Pipeline) SetFixedRestore(on bool) { p.fixedRestore = on }
+
+// FixedRestore reports whether expanded content is restored as a separate message at a fixed
+// anchor rather than by un-compacting the original in place (#407). Nil-safe: false.
+func (p *Pipeline) FixedRestore() bool { return p != nil && p.fixedRestore }
 
 // Has reports whether a component with this name is configured in the pipeline.
 // Hosts use it to gate body-level work that belongs to a component's concern but

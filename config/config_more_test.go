@@ -333,3 +333,26 @@ func TestHousellmFloorClearsTheBandsThatLoseAtEveryK(t *testing.T) {
 			"literal alone.", got.MinTokens, floor, floor, p90TokenValue)
 	}
 }
+
+// `expand.fixed_restore` reaches the pipeline every host holds per tenant, and is off unless set.
+func TestExpandFixedRestoreReachesThePipeline(t *testing.T) {
+	for doc, want := range map[string]bool{
+		"preset: off\n": false,
+		"preset: off\nexpand:\n  fixed_restore: true\n": true,
+	} {
+		c, err := LoadBytes([]byte(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pipe, err := c.Build(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pipe.FixedRestore() != want {
+			t.Errorf("%q: FixedRestore() = %v, want %v", doc, pipe.FixedRestore(), want)
+		}
+	}
+	if _, err := LoadBytes([]byte("expand:\n  fixed_restor: true\n")); err == nil {
+		t.Error("a typo'd expand key was accepted")
+	}
+}

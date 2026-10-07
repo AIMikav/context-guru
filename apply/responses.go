@@ -499,6 +499,7 @@ func normalizeResponses(body []byte) (out []bschemas.ChatMessage, slots []respon
 func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o Opts) Result {
 	res := Result{Body: o.Body}
 	res.Bypassed = o.Bypass
+	client := o.Body // before the envelope rewrites; see BodyOpts
 	// Envelope transforms must run before normalization: tools and instructions
 	// are outside the component message view, and later text write-back uses
 	// paths into this transformed body. Both transforms are deterministic and
@@ -554,6 +555,7 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		ttl, ttlKind = 0, CacheLifetimeUnknown
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: bschemas.OpenAI, Input: append([]bschemas.ChatMessage(nil), norm...)}
+	restore := planRestore(pipe, st, res.Session, "responses", client, gjson.GetBytes(client, "input").Array())
 	c := &components.Ctx{Ctx: ctx, Session: res.Session, Store: st, Model: o.Models,
 		// OpenAI's 30m is a minimum, never proof of expiry. ColdCache stays
 		// false even after a long idle gap, matching the Chat Completions path.
@@ -573,7 +575,8 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		Mode: mode, CacheAware: cacheAware, MaxCachedIdx: maxCachedIdx, IdleMs: idleMs,
 		PrefixAsk:  o.PrefixAsk,
 		CacheTTLMs: ttl.Milliseconds(), CacheTTLMinimum: ttlKind == CacheLifetimeMinimum,
-		PrevBilledInput: prevBilledInput(st, res.Session), SelfRates: o.SelfRates, RatesFor: o.RatesFor}
+		PrevBilledInput: prevBilledInput(st, res.Session), SelfRates: o.SelfRates, RatesFor: o.RatesFor,
+		Restored: restore.restored()}
 	res.Run = pipe.Run(chat, c)
 	start := 0
 	if cacheAware && maxCachedIdx >= 0 {
@@ -584,6 +587,7 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 	if len(chat.Input) != len(norm) || summaryStructureChanged(norm, chat.Input) {
 		if next, ok := rebuildResponsesCountChanged(o.Body, norm, slots, chat.Input); ok {
 			res.Body, res.Changed = next, true
+			res = finishRestore(res, restore, "responses", o.Body, gjson.GetBytes(o.Body, "input").Array())
 		}
 		return res
 	}
@@ -607,5 +611,5 @@ func bodyResponsesOpts(ctx context.Context, pipe *components.Pipeline, st store.
 		body, res.Changed = next, true
 	}
 	res.Body = body
-	return res
+	return finishRestore(res, restore, "responses", o.Body, gjson.GetBytes(o.Body, "input").Array())
 }

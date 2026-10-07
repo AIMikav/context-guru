@@ -224,13 +224,20 @@ const (
 	// PINNED, like SumPrefix and BilledPrefix: losing it loses a cost figure permanently, and a
 	// savings measurement missing its costs is worse than one that is simply absent.
 	UsagePrefix = "cg:use:"
+	// RestorePrefix is a session's fixed-restore anchors (expand.Anchor, #407): where each
+	// expanded original is re-inserted as its own message on every later turn.
+	//
+	// PINNED, because losing it is cache-destructive by construction: the turn after the loss falls
+	// back to kept-verbatim, which reverts the original to its full form inside the cached prefix —
+	// the very cache-write fixed restore exists to avoid — and drops the inserted copy as well.
+	RestorePrefix = "cg:rst:"
 )
 
 // DefaultPinPrefixes is the shipped set of key namespaces whose loss is cache-destructive.
 // Callers that build their own Store may pass a different set; the zero value means "none",
 // so a host that opts out simply gets plain TTL+LRU.
 var DefaultPinPrefixes = []string{FrozenPrefix, ResultPrefix, LenPrefix, XResultPrefix, TTLPrefix, SeenPrefix, SumPrefix,
-	BilledPrefix, UsagePrefix}
+	BilledPrefix, UsagePrefix, RestorePrefix}
 
 // pinned reports whether key belongs to one of the configured pin namespaces.
 func (m *Memory) isPinPrefix(key string) bool {

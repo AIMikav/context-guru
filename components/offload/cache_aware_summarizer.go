@@ -402,7 +402,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// exists to prevent, and it falsifies expand.RestoredInPlace's "present above" pointer.
 	if trimmed := trimSpanForKeptVerbatim(msgs, start, end, func(content string) bool {
 		_, skip := skipReduce(c, content)
-		return skip
+		return skip || restoredSpanGuard(c, content)
 	}); trimmed <= start {
 		rep.Skipped = true
 		return nil, nil
