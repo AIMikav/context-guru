@@ -166,6 +166,35 @@ func TestCompletePrefixedLeavesNoThinkingUnaffected(t *testing.T) {
 	}
 }
 
+// A TRUNCATED REPLY MUST FAIL, NOT PARSE AS "NOTHING WAS SPENT". On the ceiling branch above, the
+// reply allowance can shrink to almost nothing, so the model can still run out of room — the
+// provider reports stop_reason: "max_tokens" rather than a 400. CompletePrefixed must turn that
+// into an error so the caller takes its normal failure path (sweep_ask_failed, the WARN added in
+// #401, fallback-or-decline) instead of reading a clipped JSON array as a clean verdict.
+func TestCompletePrefixedFailsOnATruncatedReply(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[{\"i\":0"}],`+
+			`"stop_reason":"max_tokens","usage":{"input_tokens":40,"output_tokens":16000}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-haiku-4-5","max_tokens":32000,` +
+		`"thinking":{"type":"enabled","budget_tokens":31999},` +
+		`"messages":[{"role":"user","content":"carry on"}]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-haiku-4-5"}
+	reply, usage, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge")
+	if err == nil {
+		t.Fatalf("a stop_reason=max_tokens reply was accepted as a verdict: reply=%q", reply)
+	}
+	if reply != "" {
+		t.Fatalf("a failed call returned reply text anyway: %q", reply)
+	}
+	// Usage is still billed: the tokens were spent whether or not the reply was usable.
+	if usage.Output != 16000 {
+		t.Fatalf("usage.Output = %d, want 16000 (truncation does not mean free)", usage.Output)
+	}
+}
+
 // thinkingAdjustedMaxTokens unit-level: pins the arithmetic directly, independent of the HTTP
 // plumbing above.
 func TestThinkingAdjustedMaxTokens(t *testing.T) {
@@ -181,6 +210,11 @@ func TestThinkingAdjustedMaxTokens(t *testing.T) {
 		{"adaptive", `{"thinking":{"type":"adaptive"}}`, PrefixAskMaxTokens},
 		{"disabled", `{"thinking":{"type":"disabled"}}`, PrefixAskMaxTokens},
 		{"absent", `{}`, PrefixAskMaxTokens},
+		// Reviewer's minor note: "enabled" with budget_tokens missing is 0 + reply. The API would
+		// reject such a body anyway (thinking.enabled requires a budget), so this is not a shape
+		// CompletePrefixed must defend against — just pinned so the fall-through reads as a
+		// choice, not an oversight.
+		{"enabled with budget_tokens missing", `{"thinking":{"type":"enabled"}}`, PrefixAskMaxTokens},
 		// The reviewer's live-measured 64000/63999 shape: the raw want (63999+16000=79999)
 		// exceeds the model's cap, so the body's own max_tokens (64000, already proven valid for
 		// this exact request) is used instead.

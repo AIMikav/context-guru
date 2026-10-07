@@ -311,7 +311,8 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
-		Usage struct {
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
 			InputTokens      int `json:"input_tokens"`
 			OutputTokens     int `json:"output_tokens"`
 			CacheCreationTok int `json:"cache_creation_input_tokens"`
@@ -325,6 +326,16 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 		Fresh: out.Usage.InputTokens, Output: out.Usage.OutputTokens}
 	recordUsageCache(ctx, a.Model, out.Usage.InputTokens, out.Usage.OutputTokens,
 		out.Usage.CacheCreationTok, out.Usage.CacheReadTok)
+	// A TRUNCATED REPLY IS NOT A VERDICT. thinkingAdjustedMaxTokens's ceiling can leave the reply
+	// only the tokens thinking did not spend, so a budget-heavy turn can still run out of room —
+	// the provider reports it as stop_reason: "max_tokens" rather than a 400. Returning the clipped
+	// text would hand the caller a cut-off JSON array that may parse as "nothing was spent" purely
+	// because the closing bracket never arrived. Fail the call instead: the usage above is still
+	// billed (the tokens were spent either way), but the caller takes the same sweep_ask_failed /
+	// WARN / fallback-or-decline path as any other prefix-ask failure (see extract_sweep.go).
+	if out.StopReason == "max_tokens" {
+		return "", u, fmt.Errorf("cheapmodel: prefixed reply truncated (stop_reason: max_tokens)")
+	}
 	// OUR TOOL'S INPUT BEATS TEXT. When the prefix advertises the structured-answer tool the model uses
 	// it of its own accord, and the input arrives already schema-shaped — which removes three failure
 	// modes the text path had: prose instead of JSON, verdicts for only part of the batch, and an array
