@@ -72,14 +72,13 @@ func init() { components.Register("readlifecycle", newReadLifecycle) }
 // gone for the rest of the session. See TestStaleAtDepthAmortizes for the measured
 // distance, and the doc for the dollars.
 type ReadLifecycle struct {
-	minTokens             int
-	mode                  markerMode
-	stale                 bool
-	superseded            bool
-	bashEdits             bool
-	coldCache             bool
-	atDepth               bool
-	keepFrozenAfterExpand bool
+	minTokens  int
+	mode       markerMode
+	stale      bool
+	superseded bool
+	bashEdits  bool
+	coldCache  bool
+	atDepth    bool
 }
 
 type readLifecycleConfig struct {
@@ -94,10 +93,6 @@ type readLifecycleConfig struct {
 	// StaleAtDepth lifts the cache-tail gate for the STALE class on any turn, warm or
 	// cold. See the amortization argument on ReadLifecycle.atDepth.
 	StaleAtDepth bool `yaml:"stale_at_depth"`
-	// KeepFrozenAfterExpand keeps replaying a frozen offload even after the agent expands
-	// it, instead of letting the Read revert to its full form at depth. Off by default;
-	// see keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newReadLifecycle(raw []byte) (components.Component, error) {
@@ -110,7 +105,6 @@ func newReadLifecycle(raw []byte) (components.Component, error) {
 		minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode),
 		stale: on(cfg.Stale), superseded: on(cfg.Superseded),
 		bashEdits: cfg.BashEdits, coldCache: cfg.ColdCache, atDepth: cfg.StaleAtDepth,
-		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand,
 	}, nil
 }
 
@@ -163,7 +157,7 @@ func (rl *ReadLifecycle) Offload(req *bschemas.BifrostChatRequest, rep *componen
 		// Replay a frozen decision on EVERY turn, at any depth: the agent re-sends the
 		// original each turn, so not re-offloading it would flip the message
 		// offloaded→full→offloaded and churn the provider's KV cache.
-		if fk, _, ok := reapplyFrozen(c, rep, rl.Name(), msg, rl.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, rl.Name(), msg); ok {
 			changed++
 			keys = append(keys, fk...)
 			continue
@@ -451,6 +445,5 @@ func init() {
 			Hint: "Also treat narrow shell write forms (> file, >> file, tee, sed -i, patch, truncate) as edits. Off by default: a false positive here deletes correct context."},
 		markerModeField(),
 		coldCacheFieldDefault(false), // not a pure function of (content, config): see coldCacheDefault
-		keepFrozenAfterExpandField(),
 	})
 }

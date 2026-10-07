@@ -49,10 +49,9 @@ var failMarkers = regexp.MustCompile(`(?im)([1-9]\d* (failed|error(s|ed)?)\b|\be
 // pointer + stash. This is the "provable-reason" collapse — a superseded run is
 // safely recoverable via expand if the agent still needs it.
 type FailedRun struct {
-	minTokens             int
-	mode                  markerMode
-	coldCache             bool
-	keepFrozenAfterExpand bool
+	minTokens int
+	mode      markerMode
+	coldCache bool
 }
 
 type failedRunConfig struct {
@@ -62,10 +61,6 @@ type failedRunConfig struct {
 	// provably expired (see components.Ctx.TailOnlyCold). ON by default; see
 	// coldCacheDefault.
 	ColdCache *bool `yaml:"cold_cache"`
-	// KeepFrozenAfterExpand keeps replaying a frozen collapse even after the agent expands
-	// it, instead of letting the output revert to its full form at depth. Off by default;
-	// see keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newFailedRun(raw []byte) (components.Component, error) {
@@ -74,7 +69,7 @@ func newFailedRun(raw []byte) (components.Component, error) {
 		return nil, err
 	}
 	return &FailedRun{minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode),
-		coldCache: coldCacheDefault(cfg.ColdCache), keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand}, nil
+		coldCache: coldCacheDefault(cfg.ColdCache)}, nil
 }
 
 func (FailedRun) Name() string                 { return "failed_run" }
@@ -125,7 +120,7 @@ func (fr *FailedRun) Offload(req *schemas.BifrostChatRequest, rep *components.Re
 		// Reapply a previously-frozen collapse on EVERY turn (cache-stable), regardless
 		// of the tail boundary — the agent re-sends the original, so we must re-collapse
 		// it to the same bytes or it reverts to full and churns the cache.
-		if fk, _, ok := reapplyFrozen(c, rep, fr.Name(), m, fr.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, fr.Name(), m); ok {
 			changed++
 			keys = append(keys, fk...)
 			continue
@@ -196,6 +191,5 @@ func init() {
 			Hint: "Only collapse a superseded failed run above this many tokens."},
 		markerModeField(),
 		coldCacheField(),
-		keepFrozenAfterExpandField(),
 	})
 }

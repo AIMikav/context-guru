@@ -51,13 +51,12 @@ func init() { components.Register("collapse", newCollapse) }
 // top of the strings.Split above it. Fine at the measured rate (16 bodies in 3,347
 // requests) but it is the obvious thing to make streaming if that rate rises.
 type Collapse struct {
-	maxTokens             int
-	maxFrac               float64
-	headLines             int
-	tailLines             int
-	mode                  markerMode
-	coldCache             bool
-	keepFrozenAfterExpand bool
+	maxTokens int
+	maxFrac   float64
+	headLines int
+	tailLines int
+	mode      markerMode
+	coldCache bool
 }
 
 type collapseConfig struct {
@@ -70,10 +69,6 @@ type collapseConfig struct {
 	// provably expired (see components.Ctx.TailOnlyCold). ON by default; see
 	// coldCacheDefault.
 	ColdCache *bool `yaml:"cold_cache"`
-	// KeepFrozenAfterExpand keeps replaying a frozen collapse even after the agent expands
-	// it, instead of letting the output revert to its full form at depth. Off by default;
-	// see keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newCollapse(raw []byte) (components.Component, error) {
@@ -86,8 +81,7 @@ func newCollapse(raw []byte) (components.Component, error) {
 	// which fail-open contained but which also made splitWindow's own guard unreachable for
 	// the config it looked like it defended.
 	return &Collapse{maxTokens: cfg.MaxTokens, maxFrac: cfg.MaxFrac, headLines: max(cfg.HeadLines, 0),
-		tailLines: max(cfg.TailLines, 0), mode: parseMarkerMode(cfg.MarkerMode), coldCache: coldCacheDefault(cfg.ColdCache),
-		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand}, nil
+		tailLines: max(cfg.TailLines, 0), mode: parseMarkerMode(cfg.MarkerMode), coldCache: coldCacheDefault(cfg.ColdCache)}, nil
 }
 
 func (Collapse) Name() string                 { return "collapse" }
@@ -116,7 +110,7 @@ func (cl *Collapse) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		// on purpose — with max_frac set, CtxWindow can resolve differently mid-session
 		// (model swap, refreshed modelinfo), and a threshold that drifts above this output
 		// would otherwise flip it collapsed→full inside the cached prefix.
-		if fk, _, ok := reapplyFrozen(c, rep, cl.Name(), m, cl.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, cl.Name(), m); ok {
 			changed++
 			keys = append(keys, fk...)
 			continue
@@ -319,6 +313,5 @@ func init() {
 			Hint: "Lines kept from the end of a collapsed output. Also the tail share of the character window used when a line window would not shrink the output."},
 		markerModeField(),
 		coldCacheField(),
-		keepFrozenAfterExpandField(),
 	})
 }

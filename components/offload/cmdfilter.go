@@ -27,10 +27,9 @@ func init() { components.Register("cmdfilter", newCmdfilter) }
 // leading `$ <command>` line — so a filter can key on the command that produced
 // the output the way rtk's do, not only on the output's shape.
 type Cmdfilter struct {
-	reg                   *dsl.Registry
-	mode                  markerMode
-	minSize               int
-	keepFrozenAfterExpand bool
+	reg     *dsl.Registry
+	mode    markerMode
+	minSize int
 }
 
 type cmdfilterConfig struct {
@@ -39,10 +38,6 @@ type cmdfilterConfig struct {
 	MarkerMode      string   `yaml:"marker_mode"`      // full (default) | summary | off
 	MinSize         *int     `yaml:"min_size"`         // byte floor below which filtering isn't worth a marker
 	AgentFilters    string   `yaml:"agent_filters"`    // off (default) | safe | lossy — the ledger-derived coding-agent sets
-	// KeepFrozenAfterExpand keeps replaying a frozen filter even after the agent expands it,
-	// instead of letting the output revert to its full form at depth. Off by default; see
-	// keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 // defaultMinSize is the byte floor below which a filter isn't attempted at all.
@@ -95,8 +90,7 @@ func newCmdfilter(raw []byte) (components.Component, error) {
 	if cfg.MinSize != nil {
 		minSize = *cfg.MinSize
 	}
-	return &Cmdfilter{reg: reg, mode: parseMarkerMode(cfg.MarkerMode), minSize: minSize,
-		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand}, nil
+	return &Cmdfilter{reg: reg, mode: parseMarkerMode(cfg.MarkerMode), minSize: minSize}, nil
 }
 
 func (Cmdfilter) Name() string { return "cmdfilter" }
@@ -146,7 +140,7 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		// reapplyFrozen also re-Puts the stashed original for every marker in the
 		// replacement, so the expand loop keeps working across turns, and it declines
 		// content the agent has expanded (kept-verbatim).
-		if fk, _, ok := reapplyFrozen(c, rep, f.Name(), m, f.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, f.Name(), m); ok {
 			changed++
 			keys = append(keys, fk...)
 			continue
@@ -381,6 +375,5 @@ func init() {
 		{Key: "min_size", Type: components.FieldInt, Default: defaultMinSize,
 			Hint: "Byte floor below which a filter is not attempted at all (0 = no floor). 400 is measured: it takes the whole Terminal-Bench win and is the last value at which the never-worse guard rejects nothing new."},
 		markerModeField(),
-		keepFrozenAfterExpandField(),
 	})
 }

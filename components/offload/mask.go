@@ -14,12 +14,11 @@ func init() { components.Register("mask", newMask) }
 // older ones are replaced with a short marker + stash. Age-based, complementary
 // to the content-based offloaders.
 type Mask struct {
-	keepRecent            int
-	minTokens             int
-	keepHeadChars         int
-	mode                  markerMode
-	coldCache             bool
-	keepFrozenAfterExpand bool
+	keepRecent    int
+	minTokens     int
+	keepHeadChars int
+	mode          markerMode
+	coldCache     bool
 }
 
 type maskConfig struct {
@@ -34,10 +33,6 @@ type maskConfig struct {
 	// replacement is a pure function of (content, config), which is what makes the
 	// sweep safe; see coldCacheDefault.
 	ColdCache *bool `yaml:"cold_cache"`
-	// KeepFrozenAfterExpand keeps replaying a frozen mask even after the agent expands it,
-	// instead of letting the message revert to its full form at depth. Off by default; see
-	// keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newMask(raw []byte) (components.Component, error) {
@@ -50,8 +45,7 @@ func newMask(raw []byte) (components.Component, error) {
 		keepHead = *cfg.KeepHeadChars
 	}
 	return &Mask{keepRecent: cfg.KeepRecent, minTokens: cfg.MinTokens, keepHeadChars: keepHead,
-		mode: parseMarkerMode(cfg.MarkerMode), coldCache: coldCacheDefault(cfg.ColdCache),
-		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand}, nil
+		mode: parseMarkerMode(cfg.MarkerMode), coldCache: coldCacheDefault(cfg.ColdCache)}, nil
 }
 
 func (Mask) Name() string                 { return "mask" }
@@ -83,7 +77,7 @@ func (m *Mask) Offload(req *bschemas.BifrostChatRequest, rep *components.Report,
 		// the tail boundary: the agent re-sends the original, so we must re-mask it to the
 		// same bytes or it reverts full→masked→full and churns the provider KV cache. This
 		// also skips kept-verbatim content (see reapplyFrozen).
-		if fk, _, ok := reapplyFrozen(c, rep, m.Name(), msg, m.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, m.Name(), msg); ok {
 			changed++
 			keys = append(keys, fk...)
 			continue
@@ -148,7 +142,6 @@ func init() {
 			Hint: "Leave a one-line peek of the masked output inside the marker so the model knows what was hidden (cuts blind expand round-trips); 0 disables."},
 		markerModeField(),
 		coldCacheField(),
-		keepFrozenAfterExpandField(),
 	})
 }
 

@@ -71,16 +71,15 @@ func init() { components.Register("agentdiet", newAgentDiet) }
 // the published numbers; setting `min_saved_tokens` to θ and `max_keep_ratio` to 0
 // reproduces the paper's stated gate exactly.
 type AgentDiet struct {
-	delay                 int     // a: steps of protection before a step becomes eligible
-	ctxBefore             int     // b: steps of leading context handed to the model
-	minStep               int     // θ: a step below this many tokens is not worth a call
-	minSaved              int     // apply if the reduction saves at least this many tokens…
-	maxKeepRatio          float64 // …or if it keeps less than this fraction of the step
-	modelSource           string
-	modelClient           components.Model
-	mode                  markerMode
-	tailOnly              bool
-	keepFrozenAfterExpand bool
+	delay        int     // a: steps of protection before a step becomes eligible
+	ctxBefore    int     // b: steps of leading context handed to the model
+	minStep      int     // θ: a step below this many tokens is not worth a call
+	minSaved     int     // apply if the reduction saves at least this many tokens…
+	maxKeepRatio float64 // …or if it keeps less than this fraction of the step
+	modelSource  string
+	modelClient  components.Model
+	mode         markerMode
+	tailOnly     bool
 }
 
 // agentDietConfig is the `agentdiet:` block.
@@ -106,10 +105,6 @@ type agentDietConfig struct {
 	// happens once per step, not once per turn. Set true only if you would rather
 	// keep the cache pristine and reduce nothing.
 	CacheTailOnly *bool `yaml:"cache_tail_only"`
-	// KeepFrozenAfterExpand keeps replaying a frozen reduction even after the agent expands
-	// it, instead of letting the step revert to its full form at depth. Off by default; see
-	// keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newAgentDiet(raw []byte) (components.Component, error) {
@@ -140,7 +135,6 @@ func newAgentDiet(raw []byte) (components.Component, error) {
 	if cfg.CacheTailOnly != nil {
 		d.tailOnly = *cfg.CacheTailOnly
 	}
-	d.keepFrozenAfterExpand = cfg.KeepFrozenAfterExpand
 	return d, nil
 }
 
@@ -406,7 +400,7 @@ func (d *AgentDiet) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 			if !schema.Rewritable(*msg) {
 				continue
 			}
-			if fk, saved, ok := reapplyFrozen(c, rep, d.Name(), msg, d.keepFrozenAfterExpand); ok {
+			if fk, saved, ok := reapplyFrozen(c, rep, d.Name(), msg); ok {
 				rep.TokensBefore += saved // best-effort; the pipeline recomputes exactly
 				keys = append(keys, fk...)
 				changed++
@@ -634,7 +628,6 @@ func init() {
 		{Key: "cache_tail_only", Type: components.FieldBool,
 			Hint: "Restrict NEW reductions to the uncached tail. Default false, which is the faithful setting: the target step is chosen by age, so it is always inside the cached prefix and a tail restriction would make this component a silent no-op."},
 		markerModeField(),
-		keepFrozenAfterExpandField(),
 	}
 	components.RegisterFields("agentdiet", agentDietConfig{}, append(f, modelFields("model")...))
 }

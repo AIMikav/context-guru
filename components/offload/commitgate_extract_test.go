@@ -213,7 +213,7 @@ func TestADanglingReplayIsCountedApartFromADeclinedRemoval(t *testing.T) {
 	m := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleTool}
 	schema.SetMessageText(&m, original)
 	var rep components.Report
-	keys, _, ok := reapplyFrozen(c, &rep, "mask", &m, false)
+	keys, _, ok := reapplyFrozen(c, &rep, "mask", &m)
 	if !ok || len(keys) == 0 {
 		t.Fatal("the frozen decision was not replayed, so no marker was re-sent and this test " +
 			"proves nothing about a dangling one")

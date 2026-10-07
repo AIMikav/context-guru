@@ -200,25 +200,9 @@ func frozenLost(c *components.Ctx, key string) bool {
 // exists and still shrinks it. It also refreshes the expand originals for any markers
 // in the replacement (the agent re-sent the full original as m's content), so
 // restoration keeps working across turns. Returns the marker keys + whether it acted.
-//
-// keepFrozenAfterExpand is the per-component `keep_frozen_after_expand` opt-in (#407). Off
-// (the default) is today's behaviour: once the agent expands this content, stop replaying
-// the collapse so the next branch can decline and the caller falls back to the original
-// bytes at m's own position. On, the collapse keeps being replayed — same bytes, same
-// position — even after the expand, so nothing inside the provider's cached prefix changes.
-// The agent still gets the full content back: it already received it as the answer to its
-// own context_guru_expand call, at a fixed point right after the turn that asked (the
-// in-band continuation, or the next-turn repair — see expand/repair.go RestoredInPlace and
-// proxy.go's repairExpandErrors), so there is nothing left for this branch to supply.
-//
-// Measured without it (session e8f16627, request 3556): $0.615 to restore ~300 tokens —
-// cache_read 62,965, cache_write 239,967 — because the flip happened deep in the cached
-// prefix and the provider's lookback (~20 blocks) could not re-anchor past it.
-func reapplyFrozen(c *components.Ctx, rep *components.Report, comp string, m *bschemas.ChatMessage, keepFrozenAfterExpand bool) ([]string, int, bool) {
+func reapplyFrozen(c *components.Ctx, rep *components.Report, comp string, m *bschemas.ChatMessage) ([]string, int, bool) {
 	content := schema.MessageText(*m)
-	ck := contentKey(content)
-	kept := isKeptVerbatim(c, ck)
-	if kept && !keepFrozenAfterExpand {
+	if isKeptVerbatim(c, contentKey(content)) {
 		// The agent expanded this; replaying the collapse would loop it into another expand.
 		//
 		// COUNT THE FLIP, which needs one more lookup than declining does. Whether this turn
@@ -243,29 +227,17 @@ func reapplyFrozen(c *components.Ctx, rep *components.Report, comp string, m *bs
 		//
 		// One extra lookup on rare content: this branch is reached only for content the agent
 		// actually expanded, not on the hot path.
-		if store.Peek(c.Store, frozenKey(c.Session, comp, ck)) {
+		if store.Peek(c.Store, frozenKey(c.Session, comp, contentKey(content))) {
 			expandFlips.Add(1)
 		}
 		return nil, 0, false
 	}
-	repl, ok := c.Store.Get(frozenKey(c.Session, comp, ck))
+	repl, ok := c.Store.Get(frozenKey(c.Session, comp, contentKey(content)))
 	if !ok {
-		// kept && keepFrozenAfterExpand, but the freeze itself is gone (TTL/pin cap): there is
-		// nothing left to replay. The caller's skipReduce (content is the full original here)
-		// still declines a NEW compaction for kept-verbatim content, so this falls back to
-		// today's flip rather than silently drifting — see repairLostFreeze for why that is the
-		// one place the depth gate is lifted instead.
 		frozenMisses.Add(1)
 		return nil, 0, false
 	}
 	frozenHits.Add(1)
-	if kept {
-		// Visible even though nothing flipped: an operator reading kept_verbatim_after_expand
-		// should still see that this content was expanded, just without the cost that gate name
-		// used to imply unconditionally. See ExpandPrefixFlips for the counter that DOES track
-		// the cost, which this path by construction never increments.
-		rep.Gate(GateKeptVerbatim)
-	}
 	rs := string(repl)
 	saved := schema.TextTokens(content) - schema.TextTokens(rs)
 	if saved <= 0 {
@@ -447,21 +419,6 @@ const (
 	// message reverts to its full form inside the cached prefix — see ExpandPrefixFlips.
 	GateKeptVerbatim = "kept_verbatim_after_expand"
 )
-
-// keepFrozenAfterExpandField is the shared `keep_frozen_after_expand` descriptor for every
-// offloader whose replay goes through reapplyFrozen (mask, agentdiet, coref, cmdfilter,
-// collapse, failed_run, readlifecycle, skeleton). Declared once because the trade-off is one
-// decision, not eight — see reapplyFrozen and rossoctl/context-guru#407.
-func keepFrozenAfterExpandField() components.Field {
-	return components.Field{Key: "keep_frozen_after_expand", Type: components.FieldBool, Default: false,
-		Hint: "After the agent expands this component's offload, keep replaying the SAME frozen " +
-			"collapse at the message's original position instead of reverting it to the full " +
-			"original there — which today changes bytes deep inside the provider's cached prefix " +
-			"and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 " +
-			"tokens). The agent still gets the full content back, from the expand tool's own " +
-			"answer at the fixed point right after the turn that asked for it. Off by default " +
-			"until measured on real traffic; see #407."}
-}
 
 // --- Stash ownership (scoping GET /expand by session) ----------------------
 //

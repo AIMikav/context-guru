@@ -41,19 +41,18 @@ func init() { components.Register("coref", newCoref) }
 // guessed closed_dist would be shipping the one number the proposal says must be
 // measured. Turn it on with cut_closed once there are numbers.
 type Coref struct {
-	trigger               components.Trigger
-	minTokens             int
-	closedDist            int
-	openReps              int
-	minLaterTurns         int
-	cutUnreferenced       bool
-	cutClosed             bool
-	rewriteBudget         int
-	minBatchFrac          float64
-	breakEven             bool
-	keepHeadChars         int
-	mode                  markerMode
-	keepFrozenAfterExpand bool
+	trigger         components.Trigger
+	minTokens       int
+	closedDist      int
+	openReps        int
+	minLaterTurns   int
+	cutUnreferenced bool
+	cutClosed       bool
+	rewriteBudget   int
+	minBatchFrac    float64
+	breakEven       bool
+	keepHeadChars   int
+	mode            markerMode
 }
 
 type corefConfig struct {
@@ -93,10 +92,6 @@ type corefConfig struct {
 	// cut without a blind expand round-trip; 0 disables.
 	KeepHeadChars *int   `yaml:"keep_head_chars"`
 	MarkerMode    string `yaml:"marker_mode"` // full (default) | summary | off
-	// KeepFrozenAfterExpand keeps replaying a frozen cut even after the agent expands it,
-	// instead of letting the output revert to its full form at depth. Off by default; see
-	// keepFrozenAfterExpandField and rossoctl/context-guru#407.
-	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newCoref(raw []byte) (components.Component, error) {
@@ -107,19 +102,18 @@ func newCoref(raw []byte) (components.Component, error) {
 		}
 	}
 	cf := &Coref{
-		trigger:               cfg.Trigger,
-		minTokens:             cfg.MinTokens,
-		closedDist:            cfg.ClosedDist,
-		openReps:              cfg.OpenReps,
-		minLaterTurns:         corefMinLaterDefault,
-		cutUnreferenced:       true,
-		cutClosed:             false,
-		rewriteBudget:         3,
-		minBatchFrac:          0.05,
-		breakEven:             true,
-		keepHeadChars:         96,
-		mode:                  parseMarkerMode(cfg.MarkerMode),
-		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand,
+		trigger:         cfg.Trigger,
+		minTokens:       cfg.MinTokens,
+		closedDist:      cfg.ClosedDist,
+		openReps:        cfg.OpenReps,
+		minLaterTurns:   corefMinLaterDefault,
+		cutUnreferenced: true,
+		cutClosed:       false,
+		rewriteBudget:   3,
+		minBatchFrac:    0.05,
+		breakEven:       true,
+		keepHeadChars:   96,
+		mode:            parseMarkerMode(cfg.MarkerMode),
 	}
 	if cfg.MinLaterTurns != nil {
 		cf.minLaterTurns = *cfg.MinLaterTurns
@@ -198,7 +192,7 @@ func (cf *Coref) Offload(req *bschemas.BifrostChatRequest, rep *components.Repor
 		if !schema.Rewritable(*m) || schema.MessageText(*m) == "" {
 			continue
 		}
-		if fk, _, ok := reapplyFrozen(c, rep, cf.Name(), m, cf.keepFrozenAfterExpand); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, cf.Name(), m); ok {
 			replayed[i] = true
 			changed++
 			keys = append(keys, fk...)
@@ -490,6 +484,5 @@ func init() {
 		{Key: "keep_head_chars", Type: components.FieldInt, Default: 96, Min: 0,
 			Hint: "Leave a one-line peek inside the marker so the model can tell WHICH marker holds what it wants without a blind expand round-trip. 0 disables. This does not change whether a wrong cut is recoverable — the stash always holds the bytes — it changes whether the model can find the right marker on the first try instead of expanding several or giving up."},
 		markerModeField(),
-		keepFrozenAfterExpandField(),
 	}, components.TriggerFields("trigger")...))
 }
