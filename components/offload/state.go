@@ -496,6 +496,15 @@ type sumCheckpoint struct {
 	CoveredCount int    `json:"c"`
 	CoveredHash  string `json:"h"`
 	Key          string `json:"k"`
+	// Reserved marks a cache_aware_summarizer checkpoint commissioned under cache_state:
+	// pre_expiry that has not yet been spliced into any forwarded body. It is cache_aware_
+	// summarizer's own field, in a struct this file shares with summarize (same store key
+	// namespace, store.SumPrefix+session) — summarize never sets it, and cache_aware_summarizer
+	// never sets it for its own cache_state: any, so a zero value here always means "apply
+	// immediately", exactly as both components behaved before this field existed. See
+	// cache_aware_summarizer.go's own package comment on the two cache-state modes, and
+	// cacheAwareApplyPhase for how a Reserved checkpoint graduates.
+	Reserved bool `json:"reserved,omitempty"`
 }
 
 func sumKey(session string) string { return store.SumPrefix + session }

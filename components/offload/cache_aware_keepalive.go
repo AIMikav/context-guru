@@ -7,6 +7,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 )
 
@@ -137,6 +138,23 @@ func ClearKeepAliveCandidate(session string) {
 	keepAliveCandMu.Unlock()
 }
 
+// checkpointCurrent reports whether an existing checkpoint still covers enough of candSpan (the
+// latest registered commission span) that the tail accumulated since it stays under
+// resummarizeTokens — tryReuse's own staleness test, specialised for a caller that only has a
+// candidate's span/coveredCount to work with, not a live request's msgs/start/end. Used only for
+// a `cache_state: pre_expiry` candidate: see KeepAliveSubstitute's own comment on why `any`
+// never asks this question.
+func checkpointCurrent(cp sumCheckpoint, candSpan []bschemas.ChatMessage, resummarizeTokens int) bool {
+	if resummarizeTokens <= 0 || cp.CoveredCount <= 0 || cp.CoveredCount > len(candSpan) {
+		return false
+	}
+	if spanHash(candSpan[:cp.CoveredCount]) != cp.CoveredHash {
+		return false // prefix diverged — not the same conversation this checkpoint covers
+	}
+	tail := candSpan[cp.CoveredCount:]
+	return schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: tail}) < resummarizeTokens
+}
+
 // KeepAliveSubstitute reports whether a session has commission material the idle keep-alive may
 // use instead of a bare ping, and a Dispatch function to run it.
 //
@@ -151,6 +169,16 @@ func ClearKeepAliveCandidate(session string) {
 //
 // info is returned alongside ok=true so the caller can additionally check cache_state against
 // its OWN timing before deciding to dispatch — see KeepAliveCandidateInfo.
+//
+// AN EXISTING CHECKPOINT REFUSES SUBSTITUTION, UNLESS IT IS A STALE `pre_expiry` RESERVE. For
+// `any` — "no combination wastes calls: with any, keep today's behaviour exactly" — any existing
+// checkpoint refuses, unconditionally, precisely as before: the next real turn splices it for
+// free, so a call here would summarize a span nobody is waiting on. For `pre_expiry`, a reserve
+// held across several pings must eventually be allowed to grow: once its own tail reaches
+// resummarize_tokens, substitution REFRESHES it (a fresh call covering the candidate's current,
+// larger span replaces the stale one) instead of sending a plain ping that holds the cache
+// warm but lets the reserve go stale forever. A CURRENT reserve still refuses, exactly like
+// `any` — there is nothing to gain from paying for a summary identical to the one already held.
 func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, info KeepAliveCandidateInfo, reason KeepAliveSubstituteReason, ok bool) {
 	keepAliveCandMu.Lock()
 	cand, exists := keepAliveCand[session]
@@ -158,12 +186,22 @@ func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) K
 	if !exists {
 		return nil, KeepAliveCandidateInfo{}, KeepAliveReasonNoCandidate, false
 	}
-	if _, has := loadCheckpoint(cand.ctx); has {
-		return nil, KeepAliveCandidateInfo{}, KeepAliveReasonCheckpointExists, false
+	if cp, has := loadCheckpoint(cand.ctx); has {
+		if cand.cacheState != components.CacheStatePreExpiry ||
+			checkpointCurrent(cp, cand.span, cand.s.resummarizeTokens) {
+			return nil, KeepAliveCandidateInfo{}, KeepAliveReasonCheckpointExists, false
+		}
+		// pre_expiry AND stale: fall through — Dispatch will commission a fresh summary that
+		// refreshes the reserve, covering the candidate's current (larger) span.
 	}
 	info = KeepAliveCandidateInfo{CacheState: cand.cacheState, PreExpirySeconds: cand.preExpirySeconds}
+	// reserved: a pre_expiry candidate is only ever offered when the keeper's OWN clock agrees
+	// this ping is inside the pre-expiry window (fireSummarySubstitute's phase check), so a
+	// summary committed from here is exactly as "not yet applied" as one committed directly from
+	// a PreExpiry-phase turn in Offload — see commitAsyncSummary's own comment on Reserved.
+	reserved := cand.cacheState == components.CacheStatePreExpiry
 	return func(timeout time.Duration) KeepAliveSummaryResult {
-		return cand.s.commissionSync(cand.ctx, cand.call, cand.path, cand.span, cand.coveredCount, timeout)
+		return cand.s.commissionSync(cand.ctx, cand.call, cand.path, reserved, cand.span, cand.coveredCount, timeout)
 	}, info, KeepAliveReasonNone, true
 }
 

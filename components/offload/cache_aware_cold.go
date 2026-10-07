@@ -105,7 +105,7 @@ func (s *CacheAwareSummarizer) deferColdSummary(c *components.Ctx, call summaryC
 		// compaction, or the memory bound, entirely.
 		coldDeferredMu.Unlock()
 		atomic.AddInt64(&cacheAwareColdDeferredDropped, 1)
-		s.startAsyncSummary(lite, call, path, "cold_deferred", spanCopy, coveredCount)
+		s.startAsyncSummary(lite, call, path, "cold_deferred", false, spanCopy, coveredCount)
 		return
 	}
 	if prev, ok := coldDeferred[c.Session]; ok && prev.timer != nil {
@@ -140,7 +140,7 @@ func (s *CacheAwareSummarizer) resolveFallback(session string) {
 		return // already resolved via the proxy hook
 	}
 	atomic.AddInt64(&cacheAwareColdDeferredFallbackFired, 1)
-	d.s.startAsyncSummary(d.ctx, d.call, d.path, "cold_deferred", d.span, d.coveredCount)
+	d.s.startAsyncSummary(d.ctx, d.call, d.path, "cold_deferred", false, d.span, d.coveredCount)
 }
 
 // ResolveDeferredCacheAwareSummary dispatches a cold-commissioned summary once the triggering
@@ -163,5 +163,5 @@ func ResolveDeferredCacheAwareSummary(session string) {
 		return
 	}
 	atomic.AddInt64(&cacheAwareColdDeferredResolved, 1)
-	d.s.startAsyncSummary(d.ctx, d.call, d.path, "cold_deferred", d.span, d.coveredCount)
+	d.s.startAsyncSummary(d.ctx, d.call, d.path, "cold_deferred", false, d.span, d.coveredCount)
 }

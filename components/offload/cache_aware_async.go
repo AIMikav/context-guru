@@ -117,7 +117,7 @@ func cacheAwareSummaryIncomplete(raw string) bool {
 // reading c.Store or calling effectiveMode from inside the goroutine would put a concurrent read
 // on a struct the request owns, which is the shape a review already caught once in summarize.
 func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summaryCaller, path, trigger string,
-	span []bschemas.ChatMessage, coveredCount int) string {
+	reserved bool, span []bschemas.ChatMessage, coveredCount int) string {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
 		return "summary_already_in_flight"
@@ -191,7 +191,7 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summary
 				"session", session)
 			return
 		}
-		s.commitAsyncSummary(mode, session, st, spanCopy, out, coveredCount)
+		s.commitAsyncSummary(mode, session, st, spanCopy, out, coveredCount, reserved)
 	}()
 	return ""
 }
@@ -210,8 +210,13 @@ func recordCacheAwareCacheTokens(sink *cheapmodel.Sink) {
 // goroutine. Stash first: a checkpoint whose marker resolves to nothing is an irreversible loss
 // dressed up as a reversible one. If the stash is refused NO checkpoint is written, and the next
 // turn simply sends what it would have sent anyway.
+// reserved marks the checkpoint as commissioned under cache_state: pre_expiry and not yet
+// applied — see sumCheckpoint.Reserved and tryReuse's own comment on how it graduates. Always
+// false for a commission summarize ever makes (it shares this store key namespace but never
+// reserves) and for cache_aware_summarizer's own cache_state: any (which has no reserve concept
+// at all — a fresh checkpoint there is live the moment it is committed, exactly as before).
 func (s *CacheAwareSummarizer) commitAsyncSummary(mode markerMode, session string, st store.Store,
-	span []bschemas.ChatMessage, raw string, coveredCount int) {
+	span []bschemas.ChatMessage, raw string, coveredCount int, reserved bool) {
 	// The reply is UNTRUSTED. The whole trajectory reached the summarizer, so planted text in any
 	// tool output had a long run at it — strip forged expand markers (both spellings), the summary
 	// sentinel and a premature </summary> before this text is framed as trustworthy context.
@@ -231,7 +236,7 @@ func (s *CacheAwareSummarizer) commitAsyncSummary(mode markerMode, session strin
 	summaryText := cacheAwareSummaryWrapper(summary, key, mode)
 	if b, err := json.Marshal(sumCheckpoint{
 		SummaryMsg: summaryText, CoveredCount: coveredCount,
-		CoveredHash: spanHash(span), Key: key,
+		CoveredHash: spanHash(span), Key: key, Reserved: reserved,
 	}); err == nil {
 		st.Put(store.SumPrefix+session, b)
 		atomic.AddInt64(&cacheAwareAsyncCommitted, 1)
@@ -268,7 +273,7 @@ type KeepAliveSummaryResult struct {
 // which caller started it, and the two callers racing to summarize the same span would otherwise
 // write the same checkpoint twice.
 func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCaller, path string,
-	span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
+	reserved bool, span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
 		return KeepAliveSummaryResult{Reason: KeepAliveReasonInFlight}
@@ -324,7 +329,7 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCal
 		return res
 	}
 	committedBefore := atomic.LoadInt64(&cacheAwareAsyncCommitted)
-	s.commitAsyncSummary(mode, session, st, span, out, coveredCount)
+	s.commitAsyncSummary(mode, session, st, span, out, coveredCount, reserved)
 	res.Committed = atomic.LoadInt64(&cacheAwareAsyncCommitted) != committedBefore
 	return res
 }

@@ -70,6 +70,35 @@ var summarizerProfilesYAML []byte
 // and both boundaries must respect that; a private copy of the invariant would be a second
 // place for it to drift, and the drift would surface as an exception-rate difference blamed on
 // the method under test.
+//
+// # Two cache-state modes, and they mean genuinely different things
+//
+// `trigger.cache_state: any` (the default) summarizes and USES the summary now: the turn that
+// crosses the fill threshold commissions a checkpoint, and the next eligible turn splices it,
+// warm or cold, exactly as every component in this file described before this comment existed.
+//
+// `trigger.cache_state: pre_expiry` means something else: PREPARE one in the background, and
+// use it only on a cold return. A checkpoint commissioned while the cache is still believed
+// live (phase PreExpiry) is held RESERVED (sumCheckpoint.Reserved) rather than spliced — warm
+// turns keep forwarding the full history untouched, because splicing it now would be the exact
+// cache-destructive rewrite this mode exists to avoid. While reserved, an idle keep-alive ping
+// still pings the FULL history (that is what the provider actually has cached); once the
+// reserve's own tail grows past resummarize_tokens, a ping is spent on a FRESH summary instead
+// — refreshing the reserve — rather than on a plain read of a prefix the reserve no longer
+// matches. Only a turn whose phase is Cold (the cache is actually gone) or Unknown (no
+// cache-aware tracking exists on this request at all, so there is nothing live to protect)
+// graduates the reserve: splices it, tail and all, and marks it live from then on — see
+// cacheAwareApplyPhase. From that turn forward the session behaves exactly like `any` for that
+// one checkpoint: replayed while current, re-summarized fresh once stale, on any phase.
+//
+// WHY THIS IS WORTH THE COMPLEXITY: a warm turn reading a 900k-token prefix costs about $0.18 on
+// Sonnet 5 at the cache-read rate; reading the ~80k reserve summarizes down to costs about
+// $0.016 instead — paid at every ping instead of a free read, which is why it is spent only when
+// the reserve has grown enough to be worth refreshing, not on every ping unconditionally. The
+// return this buys: a COLD return against the full 900k prefix costs about $0.20 to write once
+// the ~80k reserve is already in hand, against roughly $2.25 to re-write the full 900k from
+// scratch — the rewrite cache_state: pre_expiry exists to avoid paying for AT THE WORST possible
+// moment, a cold turn that is already paying full freight for everything else.
 type CacheAwareSummarizer struct {
 	keepLastTurns     int
 	instructionRole   bschemas.ChatMessageRole
@@ -458,6 +487,23 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	if err := applyCacheAwareTriggerDefaults(raw, &cfg.Trigger); err != nil {
 		return nil, err
 	}
+	// COMMISSION-REPEATEDLY-NEVER-APPLY, REFUSED AT CONFIG TIME. Under cache_state: pre_expiry a
+	// checkpoint is held in reserve across keep-alive pings, refreshed only once its own tail
+	// reaches resummarize_tokens (see KeepAliveSubstitute's checkpointCurrent). resummarize_tokens:
+	// 0 makes EVERY ping see the reserve as stale — even with zero new messages, 0 tokens >= 0 is
+	// still true — so every single ping would pay for a fresh summary identical to the one already
+	// held, forever, instead of a plain cache-read ping. That is strictly worse than the ping it
+	// replaces and never earns its own cost back, which is exactly the failure mode worth refusing
+	// up front rather than measuring in production. `any` has no such trap: 0 there means "roll
+	// forward on every eligible TURN" (a real, if expensive, choice already supported) because `any`
+	// never asks a ping to make this decision at all.
+	if cfg.Trigger.CacheState == components.CacheStatePreExpiry && cfg.ResummarizeTokens == 0 {
+		return nil, errors.New("cache_aware_summarizer: resummarize_tokens: 0 with trigger.cache_state: " +
+			"pre_expiry would pay for a fresh summary at every keep-alive ping forever, even with " +
+			"nothing new to summarize — the reserve is never 'current' when the threshold is zero. " +
+			"Set resummarize_tokens to a positive value, or use cache_state: any if re-summarizing on " +
+			"every eligible turn is really what you want")
+	}
 	profiles, err := loadSummarizerProfiles(summarizerProfilesYAML)
 	if err != nil {
 		return nil, err
@@ -529,6 +575,12 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		end = trimmed
 	}
 
+	// Computed HERE, before tryReuse, because tryReuse itself now needs it: a checkpoint
+	// commissioned under cache_state: pre_expiry is held IN RESERVE (see sumCheckpoint.Reserved)
+	// until a turn whose phase is Cold or Unknown graduates it — see cacheAwareApplyPhase and the
+	// package comment on cache_aware_summarizer's two cache-state modes.
+	phase := c.CachePhase(s.trigger.PreExpiry())
+
 	// Reuse first, UNCONDITIONALLY ON THE TRIGGER — the gates below decide whether to PAY for a
 	// FRESH summary, never whether an already-paid-for checkpoint stays in the body we forward.
 	// Those were one decision until the trigger gained a cache-state condition, and conflating
@@ -538,7 +590,12 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// message, forcing the 1.25x suffix rewrite this component exists to avoid, on every quiet
 	// turn instead of saving it. See summarize.Offload's own comment on this; the two components
 	// share the bug class (and, now, the fix).
-	out, keys, ok, stale := s.tryReuse(c, msgs, headCount, start, end)
+	//
+	// UNCONDITIONAL IS NO LONGER THE WHOLE STORY under cache_state: pre_expiry. tryReuse itself
+	// now withholds a RESERVED checkpoint (one commissioned while the cache was still believed
+	// live) from this splice until phase graduates it — see tryReuse's own comment. `any` mode
+	// never reserves, so this call is exactly as unconditional for it as it always was.
+	out, keys, ok, stale := s.tryReuse(c, msgs, headCount, start, end, phase)
 	if ok {
 		if len(keys) == 0 {
 			rep.Irreversible = true // reused a non-full checkpoint (nothing stashed)
@@ -587,7 +644,6 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	if !sized || !resolvable {
 		return declineButReplayStale()
 	}
-	phase := c.CachePhase(s.trigger.PreExpiry())
 	phased := s.trigger.CacheAllows(c, phase)
 	if !phased {
 		rep.Gate("cache_state_declined_" + phase.String())
@@ -750,11 +806,21 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		return nil, nil
 	}
 
+	// reserved marks a cache_state: pre_expiry commission as NOT YET APPLIED — see
+	// sumCheckpoint.Reserved and tryReuse's own comment. Only PreExpiry reaches this line under
+	// pre_expiry mode (CacheAllows permits only PreExpiry and Unknown for it, and Unknown is
+	// deliberately excluded here: it means no cache-aware tracking exists on this
+	// request/deployment at all — the same reasoning Trigger.CacheAllows' own docstring gives for
+	// why a size-gated compactor must fire on Unknown rather than treat it as "wait and see". A
+	// reserve that can only graduate on Cold would never graduate on a deployment whose phase is
+	// always Unknown, so Unknown applies immediately instead, exactly like `any`.
+	reserved := s.trigger.CacheState == components.CacheStatePreExpiry && phase == components.CachePhasePreExpiry
+
 	// COMMISSION, do not block. The call covers most of the transcript against a 300 s budget, so
 	// running it inline would stall the triggering turn by minutes — billed against the agent's own
 	// timeout. summarize_async.go exists for exactly this reason. So this turn forwards UNTOUCHED
 	// and the next eligible turn finds the checkpoint and splices; see cache_aware_async.go.
-	if gate := s.startAsyncSummary(c, call, path, "turn", span, end-start); gate != "" {
+	if gate := s.startAsyncSummary(c, call, path, "turn", reserved, span, end-start); gate != "" {
 		rep.Gate(gate)
 	}
 	rep.Skipped = true
@@ -796,7 +862,38 @@ func (s *CacheAwareSummarizer) splice(msgs []bschemas.ChatMessage, headCount, bo
 // still matches is a faithful summary of msgs[start:boundary] whether or not its tail has grown
 // past resummarize_tokens, so "stale" and "no checkpoint at all" cannot share one false — the
 // caller needs to tell them apart to know whether there is anything left to fall back to.
-func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int) (out []bschemas.ChatMessage, keys []string, ok, stale bool) {
+// cacheAwareApplyPhase reports whether a RESERVED checkpoint (one commissioned under
+// cache_state: pre_expiry while the cache was still believed live) may graduate — be spliced
+// into the forwarded body, and marked no-longer-reserved from then on — on a turn classified at
+// this phase.
+//
+// Cold is the phase the reserve design exists for: the cache is actually gone, so splicing now
+// costs nothing that was not already lost, and the whole point of holding the summary in reserve
+// was to have it ready for exactly this moment instead of paying for it inline on the cold turn.
+//
+// Unknown ALSO graduates, and that is a deliberate asymmetry with PreExpiry/Warm rather than an
+// oversight. Unknown means no cache-aware tracking exists for this request at all — a
+// non-caching provider, `cache_mode: off`, a bypassed turn, a first turn — so there is no live
+// prefix a graduation-on-Unknown could disturb. A reserve that could ONLY graduate on Cold would
+// never graduate at all on a deployment whose phase is always Unknown, which would make
+// cache_state: pre_expiry silently dead there — the identical failure mode
+// Trigger.CacheAllows' own docstring already rejects for the same reason, applied here to
+// graduation instead of to firing.
+func cacheAwareApplyPhase(phase components.CachePhase) bool {
+	return phase == components.CachePhaseCold || phase == components.CachePhaseUnknown
+}
+
+// tryReuse re-emits (or, for a reserved checkpoint, GRADUATES and then re-emits) an existing
+// checkpoint. phase is the CURRENT turn's cache phase, needed only for the Reserved case — see
+// cacheAwareApplyPhase.
+//
+// WHY A RESERVED CHECKPOINT IS GATED HERE AND NOT AT THE CALL SITE: Offload calls this
+// unconditionally, before any of its own gates run (see its own comment on why reuse must be
+// unconditional on the TRIGGER). A reserve is a narrower exception to that unconditionality —
+// not "has the trigger decided to pay", but "has this specific checkpoint earned the right to be
+// LIVE yet" — and keeping both decisions in the one function that already owns the checkpoint's
+// shape keeps a future change to one from silently missing the other.
+func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int, phase components.CachePhase) (out []bschemas.ChatMessage, keys []string, ok, stale bool) {
 	cp, found := loadCheckpoint(c)
 	if !found || cp.CoveredCount <= 0 || cp.SummaryMsg == "" {
 		return nil, nil, false, false
@@ -808,6 +905,38 @@ func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatM
 	covered := msgs[start:boundary]
 	if spanHash(covered) != cp.CoveredHash {
 		return nil, nil, false, false // prefix diverged (different session / edited) → fresh
+	}
+	// RESERVE GATING. Only ever true for a checkpoint commissioned under THIS component's
+	// CURRENT cache_state: pre_expiry — a leftover Reserved flag from a config that has since
+	// switched to `any` is deliberately ignored (`any` has no reserve concept, so an existing
+	// checkpoint is live the moment it is found, exactly as it always was for that mode).
+	if cp.Reserved && s.trigger.CacheState == components.CacheStatePreExpiry {
+		if !cacheAwareApplyPhase(phase) {
+			// Still waiting for a cold (or untracked) return. NOT reported as stale: staleness
+			// is a question about whether an ALREADY-LIVE checkpoint needs refreshing, which
+			// does not arise until this one graduates — reporting it here would let
+			// declineButReplayStale's fallback splice a reserve into a WARM turn, which is
+			// exactly the cache-destructive rewrite pre_expiry's reserve design exists to defer.
+			return nil, nil, false, false
+		}
+		// Graduating NOW: splice whatever is held, however stale its tail has grown — a fresh
+		// re-summarize at this exact turn would reintroduce the same double-rewrite risk
+		// cold-turn deferral already guards against for cache_state: any (see Offload's own
+		// cold-defer branch), and the point of holding a reserve was to have something ready for
+		// this moment rather than paying for it inline here. Persisted before splicing so a
+		// concurrent request on the same session cannot double-graduate it.
+		cp.Reserved = false
+		saveCheckpoint(c, cp)
+		if cp.Key != "" {
+			if b, err := json.Marshal(covered); err == nil {
+				c.Store.Put(cp.Key, b)
+			}
+		}
+		spliced := s.splice(msgs, headCount, boundary, cp.SummaryMsg)
+		if cp.Key != "" {
+			return spliced, []string{cp.Key}, true, false
+		}
+		return spliced, nil, true, false
 	}
 	// resummarizeTokens <= 0 means "roll the checkpoint forward on every eligible turn" rather
 	// than "never reuse" — checked HERE, after the hash match, so it reports STALE rather than

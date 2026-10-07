@@ -118,7 +118,14 @@ func TestCacheAwareTriggerDefaultsAndTheirOptOut(t *testing.T) {
 // cache-state gate declines must still replay its existing checkpoint, or it forwards the FULL
 // transcript — bytes diverging from the cached prefix at the first summarized message, forcing
 // the exact 1.25x suffix rewrite this component exists to avoid.
-func TestCacheAwareReplaysItsCheckpointOnATurnTheCacheStateDeclines(t *testing.T) {
+// ⭐ THE RESERVE DESIGN'S CENTRAL PROPERTY: a checkpoint commissioned under cache_state:
+// pre_expiry while the cache was still believed live (phase PreExpiry) must NOT be spliced into
+// a WARM turn — that is exactly the cache-destructive rewrite this mode exists to defer. This
+// replaces an earlier version of this test that asserted the OPPOSITE (replay unconditionally on
+// any cache-state decline) — correct for the bug class it was originally guarding against
+// (summarize-style conflation of "pay for a fresh one" with "keep an old one live"), but pre_expiry
+// no longer means "keep whatever exists live"; it means "hold this in reserve for a cold return".
+func TestCacheAwarePreExpiryReserveDoesNotSpliceOnAWarmTurn(t *testing.T) {
 	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\nresummarize_tokens: 50\ninstruction_role: user\n"+
 		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
 	model := &capturingModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
@@ -127,7 +134,7 @@ func TestCacheAwareReplaysItsCheckpointOnATurnTheCacheStateDeclines(t *testing.T
 
 	msgs := caTranscript(3)
 	turn1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
-	ctx := caGatedCtx("ca-cachegate", st, "pre_expiry", 0, false, 0)
+	ctx := caGatedCtx("ca-reserve-warm", st, "pre_expiry", 0, false, 0)
 	var rep components.Report
 	if _, err := s.Offload(turn1, &rep, ctx); err != nil {
 		t.Fatalf("Offload must fail open: %v", err)
@@ -135,37 +142,103 @@ func TestCacheAwareReplaysItsCheckpointOnATurnTheCacheStateDeclines(t *testing.T
 	if !WaitForSummaryForTest(ctx.Session, 5*time.Second) {
 		t.Fatal("turn 1's summary never landed")
 	}
-	if _, ok := loadCheckpoint(ctx); !ok {
+	cp, ok := loadCheckpoint(ctx)
+	if !ok {
 		t.Fatalf("turn 1 commissioned no checkpoint (gates: %v, events: %v)", rep.Gates, rep.Events)
+	}
+	if !cp.Reserved {
+		t.Fatal("a checkpoint commissioned at phase PreExpiry under cache_state: pre_expiry must " +
+			"be marked Reserved")
 	}
 	if model.calls != 1 {
 		t.Fatalf("turn 1 made %d model calls, want 1 (gates: %v)", model.calls, rep.Gates)
 	}
-	cp, _ := loadCheckpoint(ctx)
-	summaryText := cp.SummaryMsg
 
-	// Turn 2: warm cache (the gate shuts), a tail grown enough that the checkpoint is stale.
-	grown := caTranscript(9)
-	turn2 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), grown...)}
+	// Turn 2: warm. The reserve exists and matches, but must not be spliced.
+	turn2 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
 	rep = components.Report{}
-	if _, err := s.Offload(turn2, &rep, caGatedCtx("ca-cachegate", st, "warm", 0, false, 0)); err != nil {
+	if _, err := s.Offload(turn2, &rep, caGatedCtx("ca-reserve-warm", st, "warm", 0, false, 0)); err != nil {
 		t.Fatalf("Offload must fail open: %v", err)
 	}
 	if rep.Gates["cache_state_declined_warm"] == 0 {
 		t.Fatalf("turn 2 was not gated by cache state (gates: %v, events: %v)", rep.Gates, rep.Events)
 	}
-	if len(turn2.Input) == len(grown) {
-		t.Errorf("a gated turn sent the FULL transcript (%d messages) instead of replaying the "+
-			"existing checkpoint — bytes diverging from the cached prefix at the first summarized "+
-			"message, forcing the 1.25x suffix rewrite this component exists to avoid "+
-			"(gates: %v, events: %v)", len(turn2.Input), rep.Gates, rep.Events)
-	}
-	if got := schema.MessageText(turn2.Input[1]); got != summaryText {
-		t.Errorf("the replayed summary differs from the checkpoint:\n got %q\nwant %q", got, summaryText)
+	if len(turn2.Input) != len(msgs) {
+		t.Errorf("a warm turn spliced the reserve (%d -> %d messages) instead of forwarding the "+
+			"full history untouched — splicing it now is exactly the cache-destructive rewrite "+
+			"pre_expiry's reserve design exists to defer (gates: %v)", len(msgs), len(turn2.Input), rep.Gates)
 	}
 	if model.calls != 1 {
-		t.Errorf("the gated turn made a model call (%d total): the gate must suppress the SPEND, "+
-			"not the splice", model.calls)
+		t.Errorf("the warm turn made a model call (%d total): a reserved checkpoint must not be "+
+			"refreshed on an ordinary warm turn", model.calls)
+	}
+	// Still reserved — nothing about a warm turn may change that.
+	if cp, ok := loadCheckpoint(ctx); !ok || !cp.Reserved {
+		t.Error("the reserve was consumed or lost on a warm turn that must not touch it")
+	}
+}
+
+// The reserve graduates — splices, tail and all, and stops being Reserved — on a turn whose
+// phase is Cold. From there the session behaves exactly like cache_state: any for this one
+// checkpoint.
+func TestCacheAwarePreExpiryReserveSplicesOnAColdTurn(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\nresummarize_tokens: 50\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	model := &capturingModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
+	s.modelClient = model
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+
+	msgs := caTranscript(3)
+	turn1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	ctx := caGatedCtx("ca-reserve-cold", st, "pre_expiry", 0, false, 0)
+	var rep components.Report
+	if _, err := s.Offload(turn1, &rep, ctx); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if !WaitForSummaryForTest(ctx.Session, 5*time.Second) {
+		t.Fatal("turn 1's summary never landed")
+	}
+	cp, ok := loadCheckpoint(ctx)
+	if !ok || !cp.Reserved {
+		t.Fatalf("precondition: want a reserved checkpoint (gates: %v)", rep.Gates)
+	}
+	summaryText := cp.SummaryMsg
+
+	// Turn 2: cold. The reserve must graduate — splice now, however stale its tail might be.
+	turn2 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	rep = components.Report{}
+	if _, err := s.Offload(turn2, &rep, caGatedCtx("ca-reserve-cold", st, "cold", 0, false, 0)); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if len(turn2.Input) == len(msgs) {
+		t.Errorf("a cold turn did not splice the reserve (gates: %v, events: %v)", rep.Gates, rep.Events)
+	}
+	if got := schema.MessageText(turn2.Input[1]); got != summaryText {
+		t.Errorf("the spliced summary differs from the reserve:\n got %q\nwant %q", got, summaryText)
+	}
+	if model.calls != 1 {
+		t.Errorf("the cold turn made a model call (%d total): graduating a reserve must not pay "+
+			"for a fresh one at the exact turn that is already paying full freight for everything "+
+			"else", model.calls)
+	}
+	if cp, ok := loadCheckpoint(ctx); !ok || cp.Reserved {
+		t.Error("the checkpoint is still marked Reserved after graduating — later warm turns would " +
+			"wrongly keep forwarding full history for a checkpoint that is now live")
+	}
+
+	// Turn 3: warm again, same checkpoint. Now behaves exactly like `any` — replayed while
+	// current.
+	turn3 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	rep = components.Report{}
+	if _, err := s.Offload(turn3, &rep, caGatedCtx("ca-reserve-cold", st, "warm", 0, false, 0)); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if len(turn3.Input) == len(msgs) {
+		t.Error("turn 3 forwarded full history for an already-graduated checkpoint on a warm turn")
+	}
+	if model.calls != 1 {
+		t.Errorf("turn 3 made a model call (%d total): an already-graduated, current checkpoint "+
+			"must simply be replayed", model.calls)
 	}
 }
 
@@ -497,5 +570,140 @@ func TestCacheAwareRejectsATruncatedSummaryOnTheKeepAliveSubstitutePath(t *testi
 	}
 	if _, ok := loadCheckpoint(ctx); ok {
 		t.Error("a checkpoint exists despite the reply being truncated")
+	}
+}
+
+// A keep-alive ping for a session already holding a CURRENT pre_expiry reserve must stay a plain
+// ping: KeepAliveSubstitute refuses with KeepAliveReasonCheckpointExists, exactly as it already
+// does for `any` whenever a checkpoint exists — there is nothing to gain from paying for a
+// summary identical to the one already held.
+func TestKeepAliveSubstituteRefusesACurrentReserve(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\nresummarize_tokens: 50\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	model := &capturingModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
+	s.modelClient = model
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+
+	msgs := caTranscript(3)
+	turn1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	ctx := caGatedCtx("ca-ping-current", st, "pre_expiry", 0, false, 0)
+	var rep components.Report
+	if _, err := s.Offload(turn1, &rep, ctx); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if !WaitForSummaryForTest(ctx.Session, 5*time.Second) {
+		t.Fatal("turn 1's summary never landed")
+	}
+	if cp, ok := loadCheckpoint(ctx); !ok || !cp.Reserved {
+		t.Fatalf("precondition: want a reserved checkpoint (gates: %v)", rep.Gates)
+	}
+	if model.calls != 1 {
+		t.Fatalf("turn 1 made %d model calls, want 1", model.calls)
+	}
+
+	// The reserve was just commissioned from exactly this span, with no tail yet — it must read
+	// as current, not stale.
+	_, _, reason, ok := KeepAliveSubstitute(ctx.Session)
+	if ok {
+		t.Fatal("KeepAliveSubstitute offered a dispatch for a session whose reserve is current")
+	}
+	if reason != KeepAliveReasonCheckpointExists {
+		t.Errorf("reason = %q, want %q", reason, KeepAliveReasonCheckpointExists)
+	}
+	if model.calls != 1 {
+		t.Errorf("the lookup alone made %d model calls, want 1 (unchanged)", model.calls)
+	}
+}
+
+// Once a reserve's own tail (the material registered by LATER turns, since the keeper's
+// candidate is replaced wholesale on every turn) reaches resummarize_tokens, a ping must stop
+// being a plain ping and instead become a fresh summary call that REFRESHES the reserve to
+// cover the larger span — never left to go stale indefinitely just because something is already
+// stored under this session's checkpoint key.
+func TestKeepAliveSubstituteRefreshesAStaleReserve(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\nresummarize_tokens: 50\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	model := &capturingModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
+	s.modelClient = model
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+
+	msgs := caTranscript(3)
+	turn1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	ctx := caGatedCtx("ca-ping-stale", st, "pre_expiry", 0, false, 0)
+	var rep components.Report
+	if _, err := s.Offload(turn1, &rep, ctx); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if !WaitForSummaryForTest(ctx.Session, 5*time.Second) {
+		t.Fatal("turn 1's summary never landed")
+	}
+	cp1, ok := loadCheckpoint(ctx)
+	if !ok || !cp1.Reserved {
+		t.Fatalf("precondition: want a reserved checkpoint (gates: %v)", rep.Gates)
+	}
+
+	// Turn 2: warm (declines on cache state, as the reserve-does-not-splice-while-warm test also
+	// exercises), but with a MUCH bigger transcript — registration happens regardless of the gate
+	// (cache_aware_summarizer.go's own comment at the registerKeepAliveCandidate call site), so
+	// the keep-alive candidate's span grows even though no new checkpoint is written here.
+	grown := caTranscript(9)
+	turn2 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), grown...)}
+	rep = components.Report{}
+	if _, err := s.Offload(turn2, &rep, caGatedCtx("ca-ping-stale", st, "warm", 0, false, 0)); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["cache_state_declined_warm"] == 0 {
+		t.Fatalf("turn 2 was not gated by cache state (gates: %v)", rep.Gates)
+	}
+	if model.calls != 1 {
+		t.Fatalf("turn 2 made a model call (%d total) despite being gated", model.calls)
+	}
+	if cp, ok := loadCheckpoint(ctx); !ok || cp.CoveredCount != cp1.CoveredCount {
+		t.Fatal("turn 2 changed the checkpoint — it must stay untouched until KeepAliveSubstitute " +
+			"decides to refresh it")
+	}
+
+	dispatch, _, reason, ok := KeepAliveSubstitute(ctx.Session)
+	if !ok {
+		t.Fatalf("KeepAliveSubstitute refused a stale reserve (reason: %q)", reason)
+	}
+	res := dispatch(5 * time.Second)
+	if !res.Committed {
+		t.Fatalf("the refresh dispatch did not commit: %+v", res)
+	}
+	if model.calls != 2 {
+		t.Fatalf("the refresh made %d model calls, want 2 total (1 commission + 1 refresh)", model.calls)
+	}
+	cp2, ok := loadCheckpoint(ctx)
+	if !ok {
+		t.Fatal("the refresh produced no checkpoint")
+	}
+	if cp2.CoveredCount <= cp1.CoveredCount {
+		t.Errorf("the refreshed checkpoint covers %d messages, want more than the original %d — "+
+			"it must cover the GROWN span, not re-derive the same one", cp2.CoveredCount, cp1.CoveredCount)
+	}
+	if !cp2.Reserved {
+		t.Error("the refreshed checkpoint lost its Reserved mark — it must stay a reserve until a " +
+			"cold turn graduates it, exactly like the one it replaced")
+	}
+}
+
+// resummarize_tokens: 0 under cache_state: pre_expiry commissions a fresh summary on EVERY
+// keep-alive ping forever (checkpointCurrent's tail < resummarizeTokens is false whenever
+// resummarizeTokens <= 0, however small the tail), paying more than the ping it replaces and
+// never earning that cost back — refused at config time rather than discovered as a live spend.
+func TestCacheAwareRejectsResummarizeTokensZeroUnderPreExpiry(t *testing.T) {
+	_, err := newCacheAwareSummarizer([]byte("resummarize_tokens: 0\ntrigger:\n  cache_state: pre_expiry\n"))
+	if err == nil {
+		t.Fatal("resummarize_tokens: 0 with cache_state: pre_expiry built without error")
+	}
+	if !strings.Contains(err.Error(), "resummarize_tokens") {
+		t.Errorf("error does not name the offending field: %v", err)
+	}
+
+	// The same resummarize_tokens: 0 is fine under `any` — it never asks a ping to decide
+	// staleness, so there is no commission-repeatedly-never-apply trap to guard against.
+	if _, err := newCacheAwareSummarizer([]byte("resummarize_tokens: 0\ntrigger:\n  cache_state: any\n")); err != nil {
+		t.Errorf("resummarize_tokens: 0 with cache_state: any was rejected: %v", err)
 	}
 }
