@@ -416,12 +416,12 @@ type deferredUsage struct {
 // turn's Report (it hasn't happened yet) nor the splicing turn's (it ran on a different
 // goroutine, with no Report of its own).
 type deferredCall struct {
-	Model      string  `json:"model"`
-	In         int     `json:"in"`
-	Out        int     `json:"out"`
-	CacheWrite int     `json:"cache_write"`
-	CacheRead  int     `json:"cache_read"`
-	Component  string  `json:"component"`
+	Model      string `json:"model"`
+	In         int    `json:"in"`
+	Out        int    `json:"out"`
+	CacheWrite int    `json:"cache_write"`
+	CacheRead  int    `json:"cache_read"`
+	Component  string `json:"component"`
 	// Path is "messages" (components.MessagesModel) or "prefix_ask" (components.PrefixAsker) —
 	// cache_aware_summarizer's only, "" for summarize's always-flat-prompt call.
 	Path string `json:"path,omitempty"`
