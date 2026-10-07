@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -251,6 +250,12 @@ type PrefixUsage struct {
 //     the appended user message satisfies by construction — but it means prefixBody must not be
 //     extended any other way.
 //
+//   - THE APPENDED MESSAGE IS NOT ALWAYS LAST. See insertAskMessage: when prefixBody's own last
+//     message is a `role: system` mid-conversation reminder — which Claude Code sends on
+//     effectively every turn — appending after it is a guaranteed 400 ("role 'system' must
+//     precede an 'assistant' message or end the array"), so the ask goes immediately BEFORE that
+//     trailing system run instead. Every byte before the insertion point is still untouched.
+//
 // Everything else about the body is preserved untouched, because every byte before the appended
 // message is prefix and any edit to it costs the cache read this method exists for. `stream` is the
 // one exception: the caller wants a single JSON answer, and a streamed response is not that.
@@ -259,9 +264,7 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 	if !gjson.GetBytes(prefixBody, "messages").IsArray() {
 		return "", u, fmt.Errorf("cheapmodel: prefix body has no messages array")
 	}
-	n := len(gjson.GetBytes(prefixBody, "messages").Array())
-	body, err := sjson.SetBytes(prefixBody, "messages."+strconv.Itoa(n),
-		map[string]any{"role": "user", "content": ask})
+	body, err := insertAskMessage(prefixBody, ask)
 	if err != nil {
 		return "", u, err
 	}
@@ -416,4 +419,59 @@ func thinkingAdjustedMaxTokens(body []byte, reply int) (want int, capped bool) {
 		return orig, true
 	}
 	return want, false
+}
+
+// insertAskMessage appends `ask` as a new user message to prefixBody's `messages` array, in the
+// one place that keeps the result a VALID Anthropic request: before any trailing run of
+// system-role messages, never after it.
+//
+// WHY A TRAILING SYSTEM MESSAGE CANNOT BE FOLLOWED. Anthropic's own rule — this codebase already
+// enforces it offline, see schema.ValidateShapeFor's RuleSystemPosition and systemPositionOK — is
+// that a system-role message away from index 0 must either be IMMEDIATELY followed by an
+// assistant message, or END THE ARRAY. Claude Code sends a mid-conversation `role: system`
+// reminder as the request's LAST message on effectively every turn (docs/components/caching.md:
+// "Claude Code marks its own final message on 466 of 472 measured requests"), so the naive fix —
+// always appending at the end — turns that legal, array-ending system message into one followed
+// by our new user message, which satisfies NEITHER branch of the rule. The provider's own 400
+// confirms it character-for-character: "role 'system' must precede an 'assistant' message or end
+// the array" (live, PR for this fix).
+//
+// INSERTING BEFORE THE RUN KEEPS THE SHAPE, AND THE CACHE. Moving the ask one slot earlier makes
+// the array end with the untouched system run again, which clears the same rule. Two consecutive
+// user-role messages (the prefix's own last user turn, immediately followed by this ask) are not
+// a problem: `schema.ValidateShapeFor` and docs/components/summarize.md both note that Anthropic
+// has no alternation requirement and explicitly accepts consecutive same-role messages. And this
+// is the SAME shape Claude Code's own ordinary turns already have — [user turn, system reminder]
+// — so inserting the ask as that "user turn" one slot before the reminder reproduces the pattern
+// the provider is already proven to answer correctly, rather than inventing a new one.
+//
+// Nothing before the insertion point moves. Every message that was already in the array keeps its
+// EXACT original bytes (gjson.Result.Raw is a substring of prefixBody, not a re-encoding), so the
+// cache_control breakpoint — which docs/components/caching.md's own measurement says Claude Code
+// places on its own final message, i.e. on the system reminder itself in this shape — stays in
+// the same position relative to the array's end and still covers the identical byte prefix. The
+// one case this changes nothing for is the ordinary case with no trailing system message: the
+// loop below finds no run to insert before, k stays at len(msgs), and the result is byte-for-byte
+// the old "append at the end" behaviour.
+func insertAskMessage(prefixBody []byte, ask string) ([]byte, error) {
+	msgs := gjson.GetBytes(prefixBody, "messages").Array()
+	k := len(msgs) // insertion point: before the trailing run of system messages, if any
+	for k > 0 && msgs[k-1].Get("role").String() == "system" {
+		k--
+	}
+	askJSON, err := json.Marshal(map[string]any{"role": "user", "content": ask})
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]string, 0, len(msgs)+1)
+	for i, m := range msgs {
+		if i == k {
+			parts = append(parts, string(askJSON))
+		}
+		parts = append(parts, m.Raw)
+	}
+	if k == len(msgs) { // no trailing system run: the old "append at the very end" behaviour
+		parts = append(parts, string(askJSON))
+	}
+	return sjson.SetRawBytes(prefixBody, "messages", []byte("["+strings.Join(parts, ",")+"]"))
 }
