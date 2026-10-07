@@ -75,7 +75,7 @@ func TestAnAnchorIsUsableOnlyWhereItWasRecorded(t *testing.T) {
 func TestInsertRestoredKeepsEveryOtherMessageByteForByte(t *testing.T) {
 	for _, wire := range []string{"anthropic", "openai", "responses"} {
 		t.Run(wire, func(t *testing.T) {
-			field := messagesField(wire)
+			field := MessagesField(wire)
 			body := []byte(`{"model":"m","` + field + `":[{"role":"user","content":"a"},{"role":"user", "content" : "b"},{"role":"assistant","content":"c"}]}`)
 			out, ok := InsertRestored(wire, body, []Insertion{{At: 2, Text: RestoredText("abc", "ORIG")}})
 			if !ok {
@@ -123,5 +123,15 @@ func TestCallSitesFindTheTurnThatExpanded(t *testing.T) {
 		`{"type":"function_call_output","call_id":"c1","output":"note"}]}`)
 	if cs := CallSites("responses", rs); len(cs) != 1 || cs[0].At != 1 || cs[0].Answer != "note" {
 		t.Fatalf("responses call sites = %+v", cs)
+	}
+}
+
+// JSON numbers must keep their exact value. Decoded as float64, two integers above 2^53 that
+// differ by 1 become the same number, so two different messages would share a fingerprint.
+func TestTheFingerprintKeepsLargeIntegersExact(t *testing.T) {
+	a := gjson.Parse(`{"role":"user","content":[{"type":"text","text":"x","n":9007199254740993}]}`)
+	b := gjson.Parse(`{"role":"user","content":[{"type":"text","text":"x","n":9007199254740992}]}`)
+	if Fingerprint(a) == "" || Fingerprint(a) == Fingerprint(b) {
+		t.Fatal("two messages that differ only in an integer above 2^53 got the same fingerprint")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
@@ -46,8 +47,9 @@ type Anchor struct {
 
 func anchorKey(session string) string { return store.RestorePrefix + session }
 
-// messagesField is where a dialect keeps its transcript.
-func messagesField(wire string) string {
+// MessagesField is the body field where a dialect keeps its transcript: Responses `input`,
+// every other dialect `messages`. The one definition the anchor code and apply share.
+func MessagesField(wire string) string {
 	if wire == "responses" {
 		return "input"
 	}
@@ -60,10 +62,13 @@ func messagesField(wire string) string {
 // old message: it marks the LAST message of each request, so the message an anchor points at
 // carries it on the turn the anchor is recorded and not afterwards. Everything else must match.
 // Keys are re-serialized in sorted order, so the fingerprint does not depend on the client's
-// key order either.
+// key order either. Numbers are kept as their literal text (UseNumber): decoded as float64, two
+// integers above 2^53 that differ would read as one, and so would the two messages.
 func Fingerprint(msg gjson.Result) string {
+	dec := json.NewDecoder(strings.NewReader(msg.Raw))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal([]byte(msg.Raw), &v); err != nil {
+	if err := dec.Decode(&v); err != nil {
 		return ""
 	}
 	b, err := json.Marshal(stripCacheControl(v))
@@ -97,7 +102,7 @@ func AnchorPoint(wire string, body []byte) (at int, fp string, ok bool) {
 	if wire == "responses" && gjson.GetBytes(body, "previous_response_id").String() != "" {
 		return 0, "", false // history held upstream: these items are not the transcript
 	}
-	msgs := gjson.GetBytes(body, messagesField(wire)).Array()
+	msgs := gjson.GetBytes(body, MessagesField(wire)).Array()
 	if len(msgs) == 0 || !mayPrecede(wire, msgs[len(msgs)-1]) {
 		return 0, "", false
 	}
@@ -190,7 +195,7 @@ type CallSite struct {
 
 // CallSites lists the expand calls in a transcript, first call per id.
 func CallSites(wire string, body []byte) []CallSite {
-	msgs := gjson.GetBytes(body, messagesField(wire)).Array()
+	msgs := gjson.GetBytes(body, MessagesField(wire)).Array()
 	answers := map[string]string{} // call id -> result text
 	for _, m := range msgs {
 		switch {
@@ -288,7 +293,7 @@ func InsertRestored(wire string, body []byte, ins []Insertion) ([]byte, bool) {
 	if len(ins) == 0 {
 		return body, true
 	}
-	field := messagesField(wire)
+	field := MessagesField(wire)
 	msgs := gjson.GetBytes(body, field)
 	if !msgs.IsArray() {
 		return body, false

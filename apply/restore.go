@@ -92,7 +92,7 @@ func (p restorePlan) insert(wire string, out []byte, client []gjson.Result) ([]b
 	if len(p) == 0 {
 		return out, 0, true
 	}
-	outMsgs := gjson.GetBytes(out, messagesFieldFor(wire)).Array()
+	outMsgs := gjson.GetBytes(out, expand.MessagesField(wire)).Array()
 	shift := len(client) - len(outMsgs)
 	ins := make([]expand.Insertion, 0, len(p))
 	tokens := 0
@@ -111,11 +111,4 @@ func (p restorePlan) insert(wire string, out []byte, client []gjson.Result) ([]b
 		return out, 0, false
 	}
 	return nb, tokens, true
-}
-
-func messagesFieldFor(wire string) string {
-	if wire == "responses" {
-		return "input"
-	}
-	return "messages"
 }
