@@ -38,6 +38,30 @@ type Config struct {
 	// around requests, which no component can reach: keeping an idle session's cached
 	// prefix alive, and which TTL tier its breakpoints ask for. Both default to off.
 	Cache CacheConfig `yaml:"cache"`
+	// Expand tunes how expanded content comes back; see ExpandConfig.
+	Expand ExpandConfig `yaml:"expand"`
+}
+
+// ExpandConfig is the `expand:` block: how content the agent expanded with
+// context_guru_expand is given back to it on the turns after the expand.
+//
+// A block of its own rather than a key on each offloader, because the choice spans every
+// offloader at once: an expanded output may have been compacted by any of them (the measured
+// case in #407 was extract, which has no replay path to put a per-component switch on), and the
+// restored copy is inserted by the host, not by a component.
+type ExpandConfig struct {
+	// FixedRestore, when true, keeps the expanded original COMPACTED at its own position and gives
+	// the agent the content as a separate message labelled with the same <<cg:HASH>> marker,
+	// inserted at a fixed anchor right after the turn that expanded it and re-inserted there,
+	// byte-identical, on every later turn.
+	//
+	// Off (the default) is the behaviour before this existed: the original reverts to its full form
+	// at its own position (kept-verbatim). That is a byte change deep inside the cached prefix and
+	// costs a cache-write of the whole suffix — measured on session e8f16627, request 3556, as
+	// $0.615 to restore ~300 tokens. Off by default until fixed restore has been measured on real
+	// traffic. Anything that makes the anchor unusable (store eviction, a client-side compaction,
+	// an edited history) falls back to the off behaviour for that turn.
+	FixedRestore bool `yaml:"fixed_restore"`
 }
 
 // CacheConfig is the `cache:` block: provider prompt-cache policy that lives above the
@@ -828,7 +852,9 @@ func (c *Config) Build(e components.Emitter) (*components.Pipeline, error) {
 		}
 		comps = append(comps, comp)
 	}
-	return components.NewPipeline(comps, e), nil
+	pipe := components.NewPipeline(comps, e)
+	pipe.SetFixedRestore(c.Expand.FixedRestore)
+	return pipe, nil
 }
 
 // NewStore builds the configured state store: an in-memory TTL+LRU by default,

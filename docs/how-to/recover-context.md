@@ -96,6 +96,35 @@ copies, permanently. If the original is *not* in the transcript (the agent's own
 that message while keeping the round-trip) the tool_result carries the content, exactly as before,
 because then it is the model's only copy.
 
+### Fixed restore (opt-in)
+
+`expand: {fixed_restore: true}` removes that cache-write. Measured without it on session e8f16627,
+request 3556: $0.615 to restore ~300 tokens (cache_read 62,965, cache_write 239,967), because the
+flip sat deeper than the provider's ~20-block cache lookback could re-anchor past.
+
+With it on, the expanded original stays **compacted** at its own position — every offloader replays
+exactly what it sent before the expand — and the content comes back as a **separate user message**,
+labelled with the marker the agent expanded, inserted at a fixed **anchor**: the first position after
+the turn that expanded it (in-band: right after that turn's request; repair path: right before the
+assistant message holding the call). The anchor is recorded per session in the store and the copy is
+re-inserted there, byte-identical, on every later turn, so nothing before it ever changes. It is
+inserted after the pipeline runs, so it is never a compaction, summarize or sweep candidate.
+
+That matters most on the in-band path, where the client never sees the expand: its next request
+carries no copy of the content at all, so without the inserted message the model would be reading the
+bare marker again.
+
+It **fails open to kept-verbatim** — the off behaviour — for any turn where the anchor cannot be
+honoured: no anchor recorded (or the store lost it), the stashed original gone, a transcript that no
+longer has the anchored message (the agent's own compaction, `/compact`, an edited history), a
+Responses request on `previous_response_id`, or an original that is a span of native Responses items
+rather than text. The decision is made per anchor before the pipeline runs, so the two halves cannot
+disagree: an original is never left compacted without its copy.
+
+Off by default until measured on real traffic. The request's lifecycle log line carries
+`expand_restored` and `expand_restored_tokens` when copies were inserted; the pipeline's own
+`tokens_after` does not include them.
+
 ## Recovery needs the store
 
 The store *is* the reversibility mechanism. It defaults to in-memory TTL+LRU — 10000s

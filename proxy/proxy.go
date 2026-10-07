@@ -1099,6 +1099,10 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			wire = "responses"
 		}
 		var tr apply.Trace // hoisted: the lifecycle log line below reads it
+		// Where an expand answered in band on this turn is restored from the next turn on, when
+		// the config asks for fixed restore (#407). Read off the transcript apply is about to see,
+		// in the same coordinates the anchor is checked against on every later turn.
+		var anchor *expand.Anchor
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
@@ -1138,6 +1142,11 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				var strays int
 				if body, strays = adjudicate.AnswerStrayCalls(wire, body); strays > 0 {
 					lg.Debug("cg.adjudicate_stray", "answered", strays)
+				}
+			}
+			if tn.Mode != components.ModeObserve && !bypassed && tn.Pipe.FixedRestore() {
+				if at, fp, ok := expand.AnchorPoint(wire, body); ok {
+					anchor = &expand.Anchor{At: at, Fp: fp}
 				}
 			}
 			var added time.Duration
@@ -1262,7 +1271,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 		// emits it in a defer once the response is finished, so a request produces exactly
 		// one lifecycle line whichever way it ends — and the attrs are built here, once,
 		// rather than on the response path.
-		h.serve(w, r, provider, up, body, bypassed, cp, tn, tr.Session, lifecycleLogger(lg, tr, bypassed))
+		h.serve(w, r, provider, up, body, bypassed, cp, tn, tr.Session, anchor, lifecycleLogger(lg, tr, bypassed))
 	}
 }
 
@@ -1287,6 +1296,10 @@ func lifecycleLogger(lg *slog.Logger, tr apply.Trace, bypassed bool) *slog.Logge
 	if tr.Run != nil {
 		lg = lg.With("tokens_before", tr.Run.TokensBefore, "tokens_after", tr.Run.TokensAfter,
 			"saved", tr.Run.Saved(), "cg_ms", tr.Run.DurationMs)
+	}
+	if tr.Restored > 0 {
+		// Inserted after the pipeline, so tokens_after above does not include them.
+		lg = lg.With("expand_restored", tr.Restored, "expand_restored_tokens", tr.RestoredTokens)
 	}
 	return lg
 }
@@ -1432,7 +1445,11 @@ var errNoUpstream = errors.New("no upstream configured")
 // cap, a stream that will not reconstruct, another dialect, a bypassed turn carrying older
 // markers — reaches the client as the model wrote it, is counted (sse_expand_after_stream),
 // and is answered on the NEXT request instead (expand.RepairToolResults).
-func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture, tn *Tenancy, session string, lg *slog.Logger) {
+//
+// anchor, when non-nil, is where this turn's in-band expands are restored on later turns
+// (expand.fixed_restore, #407): the client never sees the call or its result, so nothing in its
+// next request would otherwise carry the content.
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture, tn *Tenancy, session string, anchor *expand.Anchor, lg *slog.Logger) {
 	wire := string(provider)
 	if up.path == "/v1/responses" {
 		wire = "responses"
@@ -1818,6 +1835,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 				// The agent needed this content back — don't re-compact it on later turns
 				// (that would loop it straight back into another expand). Keep it verbatim.
 				offload.MarkKeptVerbatim(tn.Store, orig)
+				// And, under fixed restore, where to give it back from now on. The mark above stays:
+				// it is the fail-open behaviour for any turn on which the anchor cannot be honoured.
+				if anchor != nil {
+					expand.RecordAnchor(tn.Store, session, expand.Anchor{ID: c.HashID, At: anchor.At, Fp: anchor.Fp})
+				}
 				back := schema.TextTokens(orig)
 				if h.agg != nil {
 					h.agg.RecordExpand(back) // bounce: offload had to come back
