@@ -2296,6 +2296,115 @@ func TestStatuslineServesStaleStatsOnATimeoutRatherThanLoading(t *testing.T) {
 	}
 }
 
+// TestStatuslineReportsNotRespondingOnceAStaleFetchHangsTooLong is the review's third finding,
+// second half: once a cached body is older than STALE_STATS_MAX_AGE_SECONDS and the fetch meant
+// to refresh it STILL times out, "stats loading…" stops being honest — there WAS a working
+// proxy, and reaching it has been failing for a long time, not "about to resolve on the next
+// render". It must render a distinct marker, not either of the other two: `cg!` (which claims a
+// refusal that never happened — this port is reachable) or "loading…" (which undersells how
+// long this has been going on).
+func TestStatuslineReportsNotRespondingOnceAStaleFetchHangsTooLong(t *testing.T) {
+	tmp := t.TempDir()
+	port, stall := toggleStub(t, `{"total_saved_usd": 0.03, "saved_unique": 12000}`)
+	stdin := statuslinePayload("sess-hung", 0.41, 180000, 7000)
+	env := routedEnv(port)
+	env["TMPDIR"] = tmp
+
+	py := requireTool(t, "python3")
+	run := func() string {
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp)
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("running statusline.py: %v (%s)", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if got := run(); !strings.Contains(got, "$0.03/12.0k saved") {
+		t.Fatalf("priming call: got %q, want the live savings figure", got)
+	}
+
+	// Backdate well past STALE_STATS_MAX_AGE_SECONDS (read from the script itself, not retyped
+	// here, so the two cannot silently drift apart).
+	maxAge := statslineConstInt(t, "STALE_STATS_MAX_AGE_SECONDS")
+	cachePath := filepath.Join(tmp, fmt.Sprintf("context-guru-statusline-%s-sess-hung.json", port))
+	old := time.Now().Add(-time.Duration(maxAge+60) * time.Second)
+	if err := os.Chtimes(cachePath, old, old); err != nil {
+		t.Fatalf("backdating the stats cache file: %v", err)
+	}
+
+	stall()
+	got := run()
+	if got != "cg? not responding" {
+		t.Errorf("got %q, want %q", got, "cg? not responding")
+	}
+}
+
+// statslineConstInt reads an integer module-level constant out of statusline.py by actually
+// importing it, so a test asserting a boundary (here, STALE_STATS_MAX_AGE_SECONDS) cannot drift
+// from the real value the way a retyped literal could.
+func statslineConstInt(t *testing.T, name string) int {
+	t.Helper()
+	py := requireTool(t, "python3")
+	script := `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("statusline", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(int(getattr(m, sys.argv[2])))
+`
+	out, err := exec.Command(py, "-c", script, filepath.Join(scriptsDir(t), "statusline.py"), name).CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading %s from statusline.py: %v\n%s", name, err, out)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("%s is not an int: %q", name, out)
+	}
+	return n
+}
+
+// TestStatuslineTreatsAConnectPhaseTimeoutAsATimeoutNotDown is the review's third finding,
+// first half: a timeout during urlopen's CONNECT phase reaches Python wrapped as
+// urllib.error.URLError(reason=socket.timeout(...)) rather than raised directly the way a
+// READ-phase timeout is (the shape every other test in this file exercises, via toggleStub/
+// stallingPort, both of which accept the TCP connection first). Reproducing a genuine
+// connect-phase timeout needs an unroutable network path, which is not reliable to construct in
+// a test — so this drives the real _fetch_stats function with urlopen replaced by a stub that
+// raises exactly the shape urllib actually raises there, and checks the real except clauses
+// route it to STATS_TIMEOUT rather than STATS_DOWN.
+func TestStatuslineTreatsAConnectPhaseTimeoutAsATimeoutNotDown(t *testing.T) {
+	py := requireTool(t, "python3")
+	script := `
+import importlib.util, sys, socket, urllib.error
+spec = importlib.util.spec_from_file_location("statusline", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+def fake_urlopen(url, timeout=None):
+    raise urllib.error.URLError(socket.timeout("timed out"))
+
+m.urllib.request.urlopen = fake_urlopen
+stats, status = m._fetch_stats("9", None)
+assert stats is None, stats
+print(status)
+`
+	out, err := exec.Command(py, "-c", script, filepath.Join(scriptsDir(t), "statusline.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running the stub: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	if got != "timeout" {
+		t.Errorf("got status %q, want %q (STATS_TIMEOUT) — a connect-phase timeout must not be "+
+			"mistaken for a refusal", got, "timeout")
+	}
+}
+
 // TestStatuslineNeverFailsOnAConnectionRefusal is the cheap, common shape of "down" — nothing
 // listening at all — kept distinct from the stalling-port test above because a refused
 // connection returns instantly and must not be confused with a slow one in the code path.

@@ -1083,17 +1083,7 @@ func atoiDefault(s string, def int) int {
 	return n
 }
 
-// statsLeanFields is every field the status line's _fetch_stats actually reads off /api/stats
-// (context-guru-plugin/scripts/statusline.py: total_saved_usd, saved_unique, cg_latency_ms_avg,
-// upstream_ms_avg, keepalive_net_usd, keepalive_misses_avoided) — all of them populated by
-// Overview() alone, before CachesplitHistoricalUSD/TierCosts/DeclCreditFor ever run. ?lean=1
-// trades the three priced additions' contribution to total_saved_usd (the prefix-cache
-// historical split and the declaration-removal credit — see the full handler below) for not
-// running them at all, which is the whole cost difference: Overview() itself is one indexed,
-// session-scoped aggregate; the other three are what turned this endpoint slow (see
-// SelfRemovals' own comment on tool_declarations, and jsonCache's refresh gate above). A lean
-// caller gets a real, slightly conservative total_saved_usd and every other field it reads at
-// full precision, in roughly the time Overview() alone takes rather than the slowest of four.
+// statsLean reports whether ?lean=1 was passed — see the stats handler's lean branch below.
 func statsLean(r *http.Request) bool {
 	return r.URL.Query().Get("lean") == "1"
 }
@@ -1105,11 +1095,63 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if statsLean(r) {
+		// ?lean=1 answers every field the status line's _fetch_stats actually reads
+		// (context-guru-plugin/scripts/statusline.py: total_saved_usd, saved_unique,
+		// cg_latency_ms_avg, upstream_ms_avg, keepalive_net_usd, keepalive_misses_avoided) at
+		// FULL precision, not an approximation — see the review of PR #403 for why this needs
+		// saying plainly rather than as "slightly conservative". The full handler below runs
+		// four things: Overview, CachesplitHistoricalUSD, TierCosts and DeclCreditFor.
+		// DeclCreditFor is two halves (dash/declcredit.go): FilterUSD, a single filtered SQL
+		// query exactly like CachesplitHistoricalUSD, folds into TotalSavedUSD; SelfUSD, which
+		// needs SelfRemovals' full-tenant scan over tool_declarations (dash/toolapi.go,
+		// IGNORING the session filter by design — self-removal is a cross-session signal),
+		// folds ONLY into TotalReducedUSD, a field this response never carries. So the one
+		// expensive call among the four (SelfRemovals) contributes NOTHING to total_saved_usd,
+		// and can be skipped here with no loss: this path runs Overview, CachesplitHistoricalUSD
+		// and DeclFilterSavings (the measured half only, bypassing DeclCreditFor's call into
+		// SelfRemovals entirely) and adds their USD into TotalSavedUSD exactly as the full
+		// handler does. TierCosts is skipped because nothing here reads it, not because it is
+		// expensive — measured at low single-digit milliseconds, same ballpark as the other two.
 		a.serveJSON(w, r, &a.statsCache, cacheKey(p, r), func(db *DB) ([]byte, error) {
-			o, err := db.Overview(f)
-			if err != nil {
-				return nil, err
+			var (
+				o              *Overview
+				overviewErr    error
+				cachesplitHist *CachesplitHistorical
+				filterSaving   *DeclFilterSaving
+			)
+			var g errgroup.Group
+			g.Go(func() error {
+				o, overviewErr = db.Overview(f)
+				return nil // see the full handler below for why this is never folded in here
+			})
+			if a.pricer != nil {
+				g.Go(func() error {
+					if h, err := db.CachesplitHistoricalUSD(f, a.pricer); err == nil {
+						cachesplitHist = &h
+					}
+					return nil
+				})
+				g.Go(func() error {
+					if fs, err := db.DeclFilterSavings(f, a.priceFn(r)); err == nil {
+						filterSaving = fs
+					} else {
+						slog.Warn("dash: lean declaration-filter credit unavailable", "err", err)
+					}
+					return nil
+				})
 			}
+			g.Wait() //nolint:errcheck // every goroutine above always returns nil
+			if overviewErr != nil {
+				return nil, overviewErr
+			}
+			if cachesplitHist != nil {
+				o.CachesplitHistorical = cachesplitHist
+				o.TotalSavedUSD += cachesplitHist.USD
+			}
+			if filterSaving != nil && filterSaving.Priced {
+				o.TotalSavedUSD += filterSaving.USD
+			}
+			o.Waterfall = o.waterfall()
 			return json.Marshal(o)
 		})
 		return

@@ -1,6 +1,8 @@
 package dash
 
 import (
+	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -148,5 +150,64 @@ func TestStatsLeanIsACacheKeySeparateFromTheFullHandler(t *testing.T) {
 	// the two requests were not served the exact same cached bytes.
 	if full["total_saved_usd"] == nil || lean["total_saved_usd"] == nil {
 		t.Fatal("total_saved_usd missing from one of the two responses")
+	}
+}
+
+// TestStatsLeanTotalSavedMatchesFullHandler is the fix for the PR #403 review's finding 1: lean
+// used to leave CachesplitHistorical.USD and the declaration-filter credit (FilterUSD) out of
+// total_saved_usd, so the status line under-reported relative to the dashboard whenever either
+// was nonzero. Both are now included — only SelfRemovals' full-tenant scan is skipped, and that
+// one was NEVER part of total_saved_usd even in the full handler (dash/declcredit.go's
+// SetDeclCredit folds SelfUSD into TotalReducedUSD only) — so lean's total_saved_usd must now
+// equal the full handler's exactly, not merely be closer to it.
+//
+// seedCredit (dash/declcredit_test.go) gives the filter-credit half; a pre-instrumentation
+// cachesplit-historical pair (same shape as TestWaterfallTotalMatchesTheHeadlineAfterAllPricedAdditions
+// in dash/declcredit_test.go) gives the historical-split half, so both of the review's named
+// amounts are actually nonzero in this fixture rather than trivially matching by both being zero.
+func TestStatsLeanTotalSavedMatchesFullHandler(t *testing.T) {
+	db := seedCredit(t, 1000)
+	teach := mkEvent(9000, "s-hist", "aws/claude-sonnet-5", 100, 100)
+	teach.TenantID, teach.CacheRead, teach.CacheWrite, teach.SplitStableTokens = "t1", 54_304, 1_000, 5_697
+	qualifies := mkEvent(9100, "s-new-hist", "aws/claude-sonnet-5", 100, 100)
+	qualifies.TenantID, qualifies.CacheRead, qualifies.CacheWrite = "t1", 54_304, 1_000
+	if err := db.insertBatch([]*Event{teach, qualifies}); err != nil {
+		t.Fatal(err)
+	}
+	rec := &Recorder{db: db, hub: NewHub(), done: make(chan struct{})}
+	t.Cleanup(func() { rec.Close() })
+	api := NewAPI(rec)
+	api.SetPricer(staticPricer{ibmSonnet})
+	mux := http.NewServeMux()
+	api.Mount(mux)
+
+	full := httptest.NewRecorder()
+	mux.ServeHTTP(full, httptest.NewRequest(http.MethodGet, "/api/stats", nil))
+	lean := httptest.NewRecorder()
+	mux.ServeHTTP(lean, httptest.NewRequest(http.MethodGet, "/api/stats?lean=1", nil))
+	if full.Code != http.StatusOK || lean.Code != http.StatusOK {
+		t.Fatalf("full = %d, lean = %d", full.Code, lean.Code)
+	}
+
+	var fullBody, leanBody struct {
+		TotalSavedUSD float64 `json:"total_saved_usd"`
+		DeclFilterUSD float64 `json:"decl_filter_usd"`
+	}
+	if err := json.Unmarshal(full.Body.Bytes(), &fullBody); err != nil {
+		t.Fatalf("full body: %v\n%s", err, full.Body)
+	}
+	if err := json.Unmarshal(lean.Body.Bytes(), &leanBody); err != nil {
+		t.Fatalf("lean body: %v\n%s", err, lean.Body)
+	}
+	if fullBody.TotalSavedUSD <= 0 {
+		t.Fatal("full handler's total_saved_usd is not positive; the fixture is not exercising anything")
+	}
+	if fullBody.DeclFilterUSD <= 0 {
+		t.Fatal("decl_filter_usd is not positive; the fixture stopped exercising the filter credit")
+	}
+	if math.Abs(fullBody.TotalSavedUSD-leanBody.TotalSavedUSD) > 1e-9 {
+		t.Errorf("lean total_saved_usd = %v, full total_saved_usd = %v — lean must match exactly, "+
+			"since the only thing it skips (SelfRemovals) was never part of this field",
+			leanBody.TotalSavedUSD, fullBody.TotalSavedUSD)
 	}
 }
