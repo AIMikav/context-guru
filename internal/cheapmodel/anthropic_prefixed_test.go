@@ -76,9 +76,9 @@ func TestCompletePrefixedRaisesMaxTokensAboveTheThinkingBudget(t *testing.T) {
 // the MODEL's own output cap -- a new 400 with a different message ("max_tokens: 79999 > 64000,
 // which is the maximum allowed number of output tokens") in place of the one this fix exists to
 // avoid. Claude Code with CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 and MAX_THINKING_TOKENS=63999 on
-// claude-haiku-4-5 is exactly this shape; 64000 is the value the provider accepted on the agent's
-// own seed call for this exact model and request, which is why it is the fallback ceiling. See
-// thinkingAdjustedMaxTokens's doc comment for the full trade-off this ceiling accepts.
+// claude-haiku-4-5 is exactly this shape, and 64000/63999 was measured live: OK, reply "YES",
+// cache_read=16230, cache_write=0. See thinkingAdjustedMaxTokens's doc comment for the full
+// trade-off this ceiling accepts.
 func TestCompletePrefixedCapsAtTheBodysOwnMaxTokensWhenWantWouldExceedTheModelsCap(t *testing.T) {
 	var got []byte
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -166,17 +166,35 @@ func TestCompletePrefixedLeavesNoThinkingUnaffected(t *testing.T) {
 	}
 }
 
-// A TRUNCATED REPLY IS NOT TURNED INTO AN ERROR HERE. On the ceiling branch above, the reply
-// allowance can shrink to almost nothing, so the model can still come back cut off
-// (stop_reason: "max_tokens"). CompletePrefixed used to turn that into an error; it no longer
-// does, because the caller (extract_sweep.go) already detects a cut-off reply itself for free --
-// it fails extract.ParseVerdicts, which reports ReplyWasTruncated=true, and the sweep declines
-// under sweep_reply_truncated with no extra call. Turning it into an error here instead routed it
-// through sweep_ask_failed, which runs a second, full-price fallback by default -- a cost
-// regression caught in review. This is pinned at the CompletePrefixed level in
-// TestCompletePrefixedCapsAtTheBodysOwnMaxTokensWhenWantWouldExceedTheModelsCap, which does not
-// assert an error on its (non-truncated) reply; a dedicated truncated-reply test was removed with
-// this revert, since asserting "no special-case error" would just restate the absence of code.
+// A CUT-OFF REPLY (stop_reason: "max_tokens") IS RETURNED AS TEXT, NOT AS AN ERROR. The sweep
+// (extract_sweep.go) already detects this itself for free -- extract.ParseVerdicts fails on it
+// and reports ReplyWasTruncated=true, so the sweep declines under sweep_reply_truncated with no
+// extra call. Turning it into an error here instead would route it through sweep_ask_failed,
+// which runs a second, full-price fallback by default -- a cost regression a prior version of
+// this fix introduced and review caught.
+func TestCompletePrefixedReturnsATruncatedReplyRatherThanAnError(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"[{\"i\":0"}],`+
+			`"stop_reason":"max_tokens","usage":{"input_tokens":40,"output_tokens":16000}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-haiku-4-5","max_tokens":32000,` +
+		`"thinking":{"type":"enabled","budget_tokens":31999},` +
+		`"messages":[{"role":"user","content":"carry on"}]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-haiku-4-5"}
+	reply, usage, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge")
+	if err != nil {
+		t.Fatalf("a truncated reply was turned into an error: %v", err)
+	}
+	if reply != `[{"i":0` {
+		t.Fatalf("reply = %q, want the clipped text passed through unchanged", reply)
+	}
+	// Usage is still billed: the tokens were spent whether or not the reply parses.
+	if usage.Output != 16000 {
+		t.Fatalf("usage.Output = %d, want 16000", usage.Output)
+	}
+}
 
 // thinkingAdjustedMaxTokens unit-level: pins the arithmetic directly, independent of the HTTP
 // plumbing above.
@@ -200,8 +218,8 @@ func TestThinkingAdjustedMaxTokens(t *testing.T) {
 		// choice, not an oversight.
 		{"enabled with budget_tokens missing", `{"thinking":{"type":"enabled"}}`, PrefixAskMaxTokens, false},
 		// The reviewer's live-measured 64000/63999 shape: the raw want (63999+16000=79999)
-		// exceeds the model's cap, so the body's own max_tokens (64000, the value the provider
-		// accepted on the agent's own seed call for this exact request) is used instead.
+		// exceeds the model's cap, so the body's own max_tokens (64000, measured live as OK --
+		// cache_read=16230, cache_write=0) is used instead.
 		{"orig max_tokens caps a want that would exceed the model's output limit",
 			`{"thinking":{"type":"enabled","budget_tokens":63999},"max_tokens":64000}`, 64000, true},
 		// orig == budget is NOT a valid ceiling (it would equal the budget, violating the

@@ -332,20 +332,9 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 		Fresh: out.Usage.InputTokens, Output: out.Usage.OutputTokens}
 	recordUsageCache(ctx, a.Model, out.Usage.InputTokens, out.Usage.OutputTokens,
 		out.Usage.CacheCreationTok, out.Usage.CacheReadTok)
-	// A TRUNCATED REPLY IS NOT RETURNED AS AN ERROR HERE, on purpose. thinkingAdjustedMaxTokens's
-	// ceiling can leave the reply only the tokens thinking did not spend, so a budget-heavy turn
-	// can still run out of room and come back cut off. That used to be turned into an error in
-	// this method (stop_reason: "max_tokens" -> error), which looked right but cost more: the
-	// caller (extract_sweep.go) already detects a cut-off reply itself -- it fails to parse as a
-	// verdict, extract.ParseVerdicts reports ok=false, ReplyWasTruncated=true, and the sweep
-	// declines for FREE under the sweep_reply_truncated gate. Turning it into an error here
-	// instead routes it through sweep_ask_failed, which by default runs a second, full-price
-	// fallback call with the outputs copied into the prompt -- on every truncated ask, not only
-	// the ceiling case; this component's own history notes cut-off replies were once 70% of
-	// calls. It also hides sweep_reply_truncated, the counter that distinguishes "raise the
-	// budget" from "fix the prompt", behind a reading that looks like a transport failure. So the
-	// clipped text is returned as a normal reply, same as before thinkingAdjustedMaxTokens: the
-	// cost of a truncation is left where it already was, as a free decline.
+	// A cut-off reply (stop_reason: "max_tokens") is returned as text, not as an error. The sweep
+	// detects it and declines at no cost (sweep_reply_truncated); an error here would start a
+	// full-price fallback.
 	// OUR TOOL'S INPUT BEATS TEXT. When the prefix advertises the structured-answer tool the model uses
 	// it of its own accord, and the input arrives already schema-shaped — which removes three failure
 	// modes the text path had: prose instead of JSON, verdicts for only part of the batch, and an array
@@ -395,10 +384,9 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 // MAX_THINKING_TOKENS=63999 on claude-haiku-4-5 produced a want of 79999, which the provider
 // rejected with "max_tokens: 79999 > 64000, which is the maximum allowed number of output tokens"
 // -- the same class of failure this function exists to fix, just with a different message. The
-// body's OWN max_tokens is the fallback: it is what the provider already accepted for this exact
-// model on this exact request (the agent's seed call succeeded with it), so when budget_tokens is
-// below it and the computed want is above it, prefer it over a number that may not clear the cap
-// we cannot see.
+// body's OWN max_tokens is the fallback: this exact 64000/63999 shape was measured live as OK
+// (reply "YES", cache_read=16230, cache_write=0), so when budget_tokens is below it and the
+// computed want is above it, prefer it over a number that may not clear the cap we cannot see.
 //
 // TRADE-OFF, stated rather than hidden: on that fallback branch the reply allowance shrinks to
 // whatever thinking leaves of the agent's own max_tokens -- as little as ~1 token if the model
