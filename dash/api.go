@@ -1148,7 +1148,13 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 				o.CachesplitHistorical = cachesplitHist
 				o.TotalSavedUSD += cachesplitHist.USD
 			}
-			if filterSaving != nil && filterSaving.Priced {
+			if filterSaving != nil {
+				// Unconditional on filterSaving.Priced, matching SetDeclCredit (dash/overview.go)
+				// exactly: Priced is false when ANY ONE request in scope used an unpriced model,
+				// but USD is still the priced SUBSET's real dollar figure, not a fabricated one —
+				// see DeclFilterSaving's own comment. Gating on Priced here (as an earlier version
+				// of this branch did) silently dropped the WHOLE credit over one unpriced model
+				// anywhere in scope, which SetDeclCredit never does and lean must not either.
 				o.TotalSavedUSD += filterSaving.USD
 			}
 			o.Waterfall = o.waterfall()

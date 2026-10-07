@@ -171,7 +171,16 @@ func TestStatsLeanTotalSavedMatchesFullHandler(t *testing.T) {
 	teach.TenantID, teach.CacheRead, teach.CacheWrite, teach.SplitStableTokens = "t1", 54_304, 1_000, 5_697
 	qualifies := mkEvent(9100, "s-new-hist", "aws/claude-sonnet-5", 100, 100)
 	qualifies.TenantID, qualifies.CacheRead, qualifies.CacheWrite = "t1", 54_304, 1_000
-	if err := db.insertBatch([]*Event{teach, qualifies}); err != nil {
+	// One filtered row on a model staticPricer refuses to price (see its own doc comment: the
+	// sentinel name "some/unmeasured-model" always returns Priced=false). This is the fixture
+	// gap a re-review of this PR found: DeclFilterSaving.Priced goes false the moment ANY ONE
+	// request in scope is unpriced, but USD still holds the priced subset's real dollar figure
+	// — and an earlier version of the lean handler gated on Priced, which dropped the WHOLE
+	// filter credit over this one row. Every model in the fixture above this comment has a
+	// price, so without this row the parity assertion below would pass for the wrong reason.
+	unpriced := mkEvent(9200, "s-unpriced", "some/unmeasured-model", 100, 90)
+	unpriced.TenantID, unpriced.Tools, unpriced.FilteredDeclTokens = "t1", 4, 500
+	if err := db.insertBatch([]*Event{teach, qualifies, unpriced}); err != nil {
 		t.Fatal(err)
 	}
 	rec := &Recorder{db: db, hub: NewHub(), done: make(chan struct{})}
