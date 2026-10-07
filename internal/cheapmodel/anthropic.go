@@ -253,39 +253,6 @@ type PrefixUsage struct {
 // Everything else about the body is preserved untouched, because every byte before the appended
 // message is prefix and any edit to it costs the cache read this method exists for. `stream` is the
 // one exception: the caller wants a single JSON answer, and a streamed response is not that.
-// thinkingAdjustedMaxTokens returns the max_tokens CompletePrefixed must send so the Messages
-// API's own invariant holds -- "max_tokens must be greater than thinking.budget_tokens" -- WITHOUT
-// touching the thinking block itself.
-//
-// The thinking block is off limits. Anthropic's prompt-caching docs list the thinking parameters
-// (and, in extended mode, the budget) as cache-key material: "Changing thinking parameters
-// (switching modes, or changing the budget) invalidates cached message blocks."
-// (https://platform.claude.com/docs/en/build-with-claude/prompt-caching, "What invalidates the
-// cache"). proxy/keepalive.go:665-669 already leans on the same fact to justify refusing a
-// thinking-enabled ping rather than editing the block. CompletePrefixed's entire point is reading
-// the AGENT's own cache entry over the transcript it already paid to write, so stripping or
-// resizing thinking to dodge the max_tokens error would defeat that -- it would read raw a
-// trailing user message against a byte-DIFFERENT prefix and pay fresh for the whole thing, the
-// exact cost this method exists to avoid.
-//
-// So the budget is read, never written: with `thinking.type: "enabled"`, the outbound max_tokens
-// becomes budget_tokens + reply, which is strictly greater than the budget for any reply > 0 and
-// leaves room for the actual answer on top of the thinking spend. `reply` is billed as additional
-// OUTPUT only if the model actually produces that many tokens -- same accounting
-// PrefixAskMaxTokens's own doc comment already relies on -- so there is no cost to leaving it
-// generous.
-//
-// `adaptive` thinking carries no budget_tokens and is passed through unchanged, as is anything
-// else (disabled, or no thinking block at all): only "enabled" ties max_tokens to a number this
-// call does not otherwise know.
-func thinkingAdjustedMaxTokens(body []byte, reply int) int {
-	if gjson.GetBytes(body, "thinking.type").String() != "enabled" {
-		return reply
-	}
-	budget := gjson.GetBytes(body, "thinking.budget_tokens").Int()
-	return int(budget) + reply
-}
-
 func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask string) (string, PrefixUsage, error) {
 	var u PrefixUsage
 	if !gjson.GetBytes(prefixBody, "messages").IsArray() {
@@ -379,4 +346,60 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 		}
 	}
 	return "", u, nil
+}
+
+// thinkingAdjustedMaxTokens returns the max_tokens CompletePrefixed must send so the Messages
+// API's own invariant holds -- "max_tokens must be greater than thinking.budget_tokens" -- WITHOUT
+// touching the thinking block itself.
+//
+// The thinking block is off limits. Anthropic's prompt-caching docs list the thinking parameters
+// (and, in extended mode, the budget) as cache-key material: "Changing thinking parameters
+// (switching modes, or changing the budget) invalidates cached message blocks."
+// (https://platform.claude.com/docs/en/build-with-claude/prompt-caching, "What invalidates the
+// cache"). proxy/keepalive.go:665-669 already leans on the same fact to justify refusing a
+// thinking-enabled ping rather than editing the block. CompletePrefixed's entire point is reading
+// the AGENT's own cache entry over the transcript it already paid to write, so stripping or
+// resizing thinking to dodge the max_tokens error would defeat that -- it would read raw a
+// trailing user message against a byte-DIFFERENT prefix and pay fresh for the whole thing, the
+// exact cost this method exists to avoid.
+//
+// So the budget is read, never written: with `thinking.type: "enabled"`, the first candidate is
+// budget_tokens + reply, strictly above the budget for any reply > 0 and leaving room for the
+// actual answer on top of the thinking spend. `reply` is billed as additional OUTPUT only if the
+// model actually produces that many tokens -- same accounting PrefixAskMaxTokens's own doc comment
+// already relies on -- so there is no cost to leaving it generous.
+//
+// THAT CANDIDATE HAS NO CEILING, and a large thinking budget pushes it past the model's own output
+// cap -- measured live (PR #406 review): Claude Code with CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 and
+// MAX_THINKING_TOKENS=63999 on claude-haiku-4-5 produced a want of 79999, which the provider
+// rejected with "max_tokens: 79999 > 64000, which is the maximum allowed number of output tokens"
+// -- the same class of failure this function exists to fix, just with a different message. The
+// body's OWN max_tokens is the fallback: it is what the provider already accepted for this exact
+// model on this exact request (the agent's seed call succeeded with it), so when budget_tokens is
+// below it and the computed want is above it, prefer it over a number that may not clear the cap
+// we cannot see.
+//
+// TRADE-OFF, stated rather than hidden: on that fallback branch the reply allowance shrinks to
+// whatever thinking leaves of the agent's own max_tokens -- as little as ~1 token if the model
+// spends the whole budget thinking -- against the generous PrefixAskMaxTokens headroom this
+// function gives everywhere else. The alternative would be to learn the model's real output cap and
+// use THAT as the ceiling instead of the body's max_tokens, but context-guru has no reachable
+// source for it here: internal/modelinfo resolves the INPUT window (Window/Exact), never an output
+// cap, and CompletePrefixed takes no components.Ctx to carry one even if modelinfo grew one.
+// Plumbing that through is future work, not blocking this fix -- the fallback below is proven valid
+// for the shape it was measured against.
+//
+// `adaptive` thinking carries no budget_tokens and is passed through unchanged, as is anything else
+// (disabled, or no thinking block at all): only "enabled" ties max_tokens to a number this call does
+// not otherwise know.
+func thinkingAdjustedMaxTokens(body []byte, reply int) int {
+	if gjson.GetBytes(body, "thinking.type").String() != "enabled" {
+		return reply
+	}
+	budget := int(gjson.GetBytes(body, "thinking.budget_tokens").Int())
+	want := budget + reply
+	if orig := int(gjson.GetBytes(body, "max_tokens").Int()); orig > budget && orig < want {
+		return orig
+	}
+	return want
 }

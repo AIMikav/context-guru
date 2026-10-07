@@ -29,14 +29,8 @@ func (o OpenAI) CompletePrefixedResponses(ctx context.Context, prefixBody []byte
 	if maxTok == 0 {
 		maxTok = PrefixAskMaxTokens
 	}
-	// NOT the same class of bug as anthropic.go's CompletePrefixed. Anthropic's `thinking` block
-	// carries a `budget_tokens` the Messages API validates max_tokens against ("max_tokens must
-	// be greater than thinking.budget_tokens"), so overwriting max_tokens blind can send an
-	// invalid combination. The Responses API's reasoning control is `reasoning.effort` —
-	// low/medium/high/xhigh/max (see dash/event.go's ReasoningEffort) — a qualitative level, not
-	// a token count, and there is no field here this call could contradict by setting
-	// max_output_tokens. Checked when fixing the Anthropic path's max_tokens/thinking-budget
-	// defect; nothing to adjust here.
+	// Unlike anthropic.go's CompletePrefixed, no fix needed here: Responses' reasoning control is
+	// a qualitative effort level, not a token budget, so there's no field max_output_tokens could contradict.
 	if body, err = sjson.SetBytes(body, "max_output_tokens", maxTok); err != nil {
 		return "", usage, err
 	}

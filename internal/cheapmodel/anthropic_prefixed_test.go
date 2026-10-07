@@ -71,6 +71,44 @@ func TestCompletePrefixedRaisesMaxTokensAboveTheThinkingBudget(t *testing.T) {
 	}
 }
 
+// THE CEILING BUG, found live on PR #406's review: thinkingAdjustedMaxTokens's raw
+// budget_tokens + reply has no upper bound, so a large thinking budget can push max_tokens past
+// the MODEL's own output cap -- a new 400 with a different message ("max_tokens: 79999 > 64000,
+// which is the maximum allowed number of output tokens") in place of the one this fix exists to
+// avoid. Claude Code with CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 and MAX_THINKING_TOKENS=63999 on
+// claude-haiku-4-5 is exactly this shape; measured live, max_tokens: 64000 (the body's own,
+// already-proven-valid value) succeeded where 79999 did not. See thinkingAdjustedMaxTokens's doc
+// comment for the full trade-off this ceiling accepts.
+func TestCompletePrefixedCapsAtTheBodysOwnMaxTokensWhenWantWouldExceedTheModelsCap(t *testing.T) {
+	var got []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[]}"}],"usage":{}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-haiku-4-5","max_tokens":64000,` +
+		`"thinking":{"type":"enabled","budget_tokens":63999},` +
+		`"messages":[{"role":"user","content":"carry on"}]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-haiku-4-5"}
+	if _, _, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge"); err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	outMax := gjson.GetBytes(got, "max_tokens").Int()
+	// The reviewer's exact ask: a result <= 64000 (the model's cap, read via the body's own
+	// max_tokens) and > 63999 (still clears the thinking budget).
+	if outMax > 64000 || outMax <= 63999 {
+		t.Fatalf("max_tokens = %d, want in (63999, 64000]", outMax)
+	}
+	if got2 := gjson.GetBytes(got, "thinking").String(); got2 != `{"type":"enabled","budget_tokens":63999}` {
+		t.Fatalf("the thinking block was changed: %s", got2)
+	}
+}
+
 // thinking.type "adaptive" carries no budget_tokens at all, and must pass through exactly as
 // PrefixAskMaxTokens always has -- this pins that the new budget-reading logic does not touch
 // the ordinary case.
@@ -136,13 +174,29 @@ func TestThinkingAdjustedMaxTokens(t *testing.T) {
 		body string
 		want int
 	}{
-		{"enabled with a large budget", `{"thinking":{"type":"enabled","budget_tokens":31999}}`,
-			31999 + PrefixAskMaxTokens},
+		{"enabled with a large budget, no orig max_tokens on the body",
+			`{"thinking":{"type":"enabled","budget_tokens":31999}}`, 31999 + PrefixAskMaxTokens},
 		{"enabled with a small budget", `{"thinking":{"type":"enabled","budget_tokens":10}}`,
 			10 + PrefixAskMaxTokens},
 		{"adaptive", `{"thinking":{"type":"adaptive"}}`, PrefixAskMaxTokens},
 		{"disabled", `{"thinking":{"type":"disabled"}}`, PrefixAskMaxTokens},
 		{"absent", `{}`, PrefixAskMaxTokens},
+		// The reviewer's live-measured 64000/63999 shape: the raw want (63999+16000=79999)
+		// exceeds the model's cap, so the body's own max_tokens (64000, already proven valid for
+		// this exact request) is used instead.
+		{"orig max_tokens caps a want that would exceed the model's output limit",
+			`{"thinking":{"type":"enabled","budget_tokens":63999},"max_tokens":64000}`, 64000},
+		// orig == budget is NOT a valid ceiling (it would equal the budget, violating the
+		// provider's strict ">" requirement), so the strict "orig > budget" guard must reject it
+		// and fall through to the computed want.
+		{"orig max_tokens equal to the budget is not used as a ceiling",
+			`{"thinking":{"type":"enabled","budget_tokens":31999},"max_tokens":31999}`,
+			31999 + PrefixAskMaxTokens},
+		// orig below the computed want but ALSO below the budget: not a valid ceiling either
+		// (an orig that doesn't even clear the budget proves nothing), so it must not be used.
+		{"orig max_tokens below the budget is not used as a ceiling",
+			`{"thinking":{"type":"enabled","budget_tokens":31999},"max_tokens":100}`,
+			31999 + PrefixAskMaxTokens},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := thinkingAdjustedMaxTokens([]byte(tc.body), PrefixAskMaxTokens); got != tc.want {
