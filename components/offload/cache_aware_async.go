@@ -94,7 +94,7 @@ func classifyCallErr(ctx context.Context, session string, err error) {
 // caller can file it. Everything the goroutine needs is read HERE, on the request's goroutine —
 // reading c.Store or calling effectiveMode from inside the goroutine would put a concurrent read
 // on a struct the request owns, which is the shape a review already caught once in summarize.
-func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summaryCaller,
+func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summaryCaller, path, trigger string,
 	span []bschemas.ChatMessage, coveredCount int) string {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
@@ -148,10 +148,13 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summary
 		// replay. Detaching makes the attribution single-valued.
 		ctx, callSink := cheapmodel.WithDetachedSink(ctx)
 		atomic.AddInt64(&cacheAwareCalls, 1)
+		callStart := time.Now()
 		out, err := call(ctx)
+		callMs := float64(time.Since(callStart).Milliseconds())
+		recordCacheAwareCacheTokens(callSink)
 		// Deferred BEFORE the error check: a call that timed out may still have been billed for its
 		// input, and a cost we incurred is a cost we report.
-		deferUsage(st, session, callSink)
+		deferUsage(st, session, "cache_aware_summarizer", path, trigger, callMs, callSink)
 		if err != nil {
 			classifyCallErr(ctx, session, err)
 			return
@@ -163,6 +166,16 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summary
 		s.commitAsyncSummary(mode, session, st, spanCopy, out, coveredCount)
 	}()
 	return ""
+}
+
+// recordCacheAwareCacheTokens adds one call's cache tiers to the process-wide /stats counters —
+// the direct answer to "is cache_aware_summarizer's own call actually reading warm", which the
+// component's whole design rests on and which was otherwise visible only by reading a dashboard
+// row (and, before this round, not even that).
+func recordCacheAwareCacheTokens(sink *cheapmodel.Sink) {
+	cw, cr := sink.CacheTotals()
+	atomic.AddInt64(&cacheAwareCacheWriteTokens, cw)
+	atomic.AddInt64(&cacheAwareCacheReadTokens, cr)
 }
 
 // commitAsyncSummary stashes the span and writes the checkpoint, in that order, from the background
@@ -208,6 +221,11 @@ type KeepAliveSummaryResult struct {
 	// bound is full), or because it ran and produced nothing usable (error, timeout, empty
 	// reply). Either way the caller's answer is the same: fall back to an ordinary ping.
 	Committed bool
+	// Reason explains a false Committed — KeepAliveReasonInFlight or KeepAliveReasonConcurrencyFull
+	// for the two refusals that happen before any call is made, or "" (KeepAliveReasonNone) for a
+	// call that was made and simply did not commit (its own error/empty counters already say why —
+	// see classifyCallErr and cacheAwareEmpty).
+	Reason KeepAliveSubstituteReason
 }
 
 // commissionSync runs the whole commission call INLINE and blocks until it resolves, for the one
@@ -221,18 +239,18 @@ type KeepAliveSummaryResult struct {
 // duplicating either: a session has, at most, one commission in flight at a time regardless of
 // which caller started it, and the two callers racing to summarize the same span would otherwise
 // write the same checkpoint twice.
-func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCaller,
+func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCaller, path string,
 	span []bschemas.ChatMessage, coveredCount int, timeout time.Duration) KeepAliveSummaryResult {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
-		return KeepAliveSummaryResult{}
+		return KeepAliveSummaryResult{Reason: KeepAliveReasonInFlight}
 	}
 	defer inFlight.finish(c.Session, j)
 	select {
 	case summarySlots <- struct{}{}:
 	default:
 		atomic.AddInt64(&cacheAwareAsyncRefused, 1)
-		return KeepAliveSummaryResult{}
+		return KeepAliveSummaryResult{Reason: KeepAliveReasonConcurrencyFull}
 	}
 	defer func() { <-summarySlots }()
 	atomic.AddInt64(&cacheAwareAsyncStarted, 1)
@@ -251,7 +269,9 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCal
 	// path's own goroutine — see its comment on why a chained sink would double-charge.
 	ctx, callSink := cheapmodel.WithDetachedSink(ctx)
 	atomic.AddInt64(&cacheAwareCalls, 1)
+	callStart := time.Now()
 	out, err := call(ctx)
+	callMs := float64(time.Since(callStart).Milliseconds())
 	// Deferred BEFORE the error check, and READ before being deferred: a call that timed out may
 	// still have been billed for its input, and the result the keeper books is the same figures
 	// deferUsage is about to replay onto this session's next real turn — the keeper's ping ledger
@@ -260,7 +280,8 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCal
 	cw, cr := callSink.CacheTotals()
 	res := KeepAliveSummaryResult{Model: callSink.Model(),
 		FreshInput: int(in), Output: int(outTok), CacheWrite: int(cw), CacheRead: int(cr)}
-	deferUsage(st, session, callSink)
+	recordCacheAwareCacheTokens(callSink)
+	deferUsage(st, session, "cache_aware_summarizer", path, "keepalive_substitute", callMs, callSink)
 	if err != nil {
 		classifyCallErr(ctx, session, err)
 		return res

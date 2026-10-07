@@ -267,6 +267,15 @@ var (
 	// incoming-model path (#275). Zero here on a deployment running Anthropic-only traffic means
 	// this component is still measuring `off`, whatever CacheAwareSummarizerDeclined says.
 	cacheAwarePrefixAskUsed int64
+	// cacheAwareCacheReadTokens/cacheAwareCacheWriteTokens are the cumulative cache tiers of
+	// every commission call this component has made (any trigger, any path) — the direct,
+	// process-wide answer to "is the call actually reading warm", which is this component's
+	// whole argument and was otherwise visible only on a per-call dashboard row (see
+	// deferredCall in summarize_async.go). cacheAwareCacheReadTokens staying at 0 across many
+	// calls is the same "never verify a cache win from placement, read the number" discipline
+	// cheapmodel.CacheUsage's own docstring states for the cheap-model path.
+	cacheAwareCacheReadTokens  int64
+	cacheAwareCacheWriteTokens int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
@@ -275,6 +284,12 @@ func CacheAwareSummarizerErrors() int64   { return atomic.LoadInt64(&cacheAwareE
 func CacheAwareSummarizerNoPrefix() int64 { return atomic.LoadInt64(&cacheAwareNoPrefix) }
 func CacheAwareSummarizerPrefixAskUsed() int64 {
 	return atomic.LoadInt64(&cacheAwarePrefixAskUsed)
+}
+
+// CacheAwareSummarizerCacheTokens returns the cumulative cache-read/cache-write tokens of every
+// commission call this component has made, across every trigger and path.
+func CacheAwareSummarizerCacheTokens() (read, write int64) {
+	return atomic.LoadInt64(&cacheAwareCacheReadTokens), atomic.LoadInt64(&cacheAwareCacheWriteTokens)
 }
 
 // CacheAwareSummarizerDeclined counts turns that reached the model step and stopped because
@@ -488,7 +503,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	msgs := req.Input
 	// Attribute any spend a DETACHED summarizer call incurred since this session's last turn.
 	// First thing, and unconditionally: the money was spent whatever this turn decides.
-	takeDeferredUsage(c)
+	takeDeferredUsage(c, rep)
 	headCount, start, end := summarizeSpan(msgs, 1, s.keepLastTurns)
 	if end <= start {
 		rep.Skipped = true
@@ -605,20 +620,6 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		}
 		return declineButReplayStale()
 	}
-	// Don't pay for a summary the store cannot keep: a full marker promises the span is
-	// restorable, so check the room before the call rather than discovering it after.
-	mode := effectiveMode(c, s.mode)
-	// Size the room check against the payload we would actually stash, not a token guess.
-	spanJSON, jerr := json.Marshal(span)
-	if jerr != nil {
-		return nil, jerr
-	}
-	if mode == markerFull && !store.StashRoom(c.Store, len(spanJSON)) {
-		atomic.AddInt64(&cacheAwareRefusedStash, 1)
-		rep.Gate("no_stash_room")
-		return declineButReplayStale()
-	}
-
 	profiles := s.resolveProfiles()
 	// The pinned-system guard, at the point of use. Declining costs this arm its compaction;
 	// proceeding would risk a summary that is really the model's next turn, which no metric here
@@ -657,7 +658,13 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// before this function returns, the same discipline startAsyncSummary's own copy used to
 	// enforce for `ask` directly.
 	var call summaryCaller
+	// path tags every dashboard row and /stats figure this commission produces (see
+	// deferredCall in summarize_async.go) with which model path actually ran — the only way an
+	// operator can tell "this is compacting via PrefixAsk on my Anthropic traffic" from "this
+	// never left the no_messages_model decline".
+	path := "messages"
 	if usePrefixAsk {
+		path = "prefix_ask"
 		atomic.AddInt64(&cacheAwarePrefixAskUsed, 1)
 		asker, session, instructionText := c.PrefixAsk, c.Session, schema.MessageText(instruction)
 		call = func(ctx context.Context) (string, error) {
@@ -687,7 +694,30 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// fired (so the registry's own single-flight check in commissionSummary refuses a second
 	// dispatch and the keeper falls back to an ordinary ping) or deferred for cold (same check).
 	// See cache_aware_keepalive.go.
-	s.registerKeepAliveCandidate(c, call, span, end-start)
+	s.registerKeepAliveCandidate(c, call, path, span, end-start)
+
+	// Don't pay for a summary the store cannot keep: a full marker promises the span is
+	// restorable, so check the room before the call rather than discovering it after.
+	//
+	// DELIBERATELY AFTER registration, not before. This is a check on whether the store has
+	// capacity RIGHT NOW, which is exactly the kind of transient condition that can be true again
+	// by the time a later turn or the keep-alive substitute actually dispatches — unlike the
+	// model/role checks above it, which are permanent for this session as configured. Blocking
+	// registration on it needlessly cost the keep-alive opportunity: a review of a live session
+	// found candidates going unregistered on turns that recorded cache_state_declined_* because
+	// a LATER check in this function (this one, in its old position) returned first, with no
+	// trace of which check it was. commitAsyncSummary re-checks StashRoom itself before writing
+	// anything, so moving this later costs no safety.
+	mode := effectiveMode(c, s.mode)
+	spanJSON, jerr := json.Marshal(span)
+	if jerr != nil {
+		return nil, jerr
+	}
+	if mode == markerFull && !store.StashRoom(c.Store, len(spanJSON)) {
+		atomic.AddInt64(&cacheAwareRefusedStash, 1)
+		rep.Gate("no_stash_room")
+		return declineButReplayStale()
+	}
 
 	if !phased {
 		return declineButReplayStale()
@@ -706,7 +736,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// double-rewrite to avoid guarding against; Warm and PreExpiry mean the prefix the forwarded
 	// request is about to send is itself still live, so the side call already reads it.
 	if phase == components.CachePhaseCold {
-		s.deferColdSummary(c, call, span, end-start)
+		s.deferColdSummary(c, call, path, span, end-start)
 		rep.Event("cold_commission_deferred")
 		rep.Skipped = true
 		return nil, nil
@@ -716,7 +746,7 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	// running it inline would stall the triggering turn by minutes — billed against the agent's own
 	// timeout. summarize_async.go exists for exactly this reason. So this turn forwards UNTOUCHED
 	// and the next eligible turn finds the checkpoint and splices; see cache_aware_async.go.
-	if gate := s.startAsyncSummary(c, call, span, end-start); gate != "" {
+	if gate := s.startAsyncSummary(c, call, path, "turn", span, end-start); gate != "" {
 		rep.Gate(gate)
 	}
 	rep.Skipped = true

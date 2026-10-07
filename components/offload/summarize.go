@@ -369,7 +369,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// Attribute any model spend a DETACHED summarizer call incurred since this session's last
 	// turn. First thing, and unconditionally: the money was spent whatever this turn decides, and
 	// the compaction-episode panel charges it as a debit. See takeDeferredUsage.
-	takeDeferredUsage(c)
+	takeDeferredUsage(c, rep)
 	if end > start && c.AllowSummarySpan != nil && !c.AllowSummarySpan(start, end) {
 		rep.Gate("wire_span_unsafe")
 		rep.Skipped = true

@@ -60,7 +60,7 @@ func kaCandidateWithCacheState(t *testing.T, session string, st store.Store, mod
 	ask := append([]bschemas.ChatMessage(nil), span...)
 	ask = append(ask, bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser})
 	call := func(ctx context.Context) (string, error) { return model.CompleteMessages(ctx, "", ask) }
-	offload.RegisterKeepAliveCandidateForTest(session, st, call, span, 1, cacheState, preExpirySeconds)
+	offload.RegisterKeepAliveCandidateForTest(session, st, call, "messages", span, 1, cacheState, preExpirySeconds)
 	// The registry is a package GLOBAL in offload, keyed by session — and "sess-1" is the shared
 	// session name every other test in this file's testKeeper/recordOne helpers uses. Left
 	// registered, a candidate from this test silently hijacks an unrelated LATER test's ping into

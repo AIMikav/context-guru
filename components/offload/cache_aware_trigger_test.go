@@ -9,6 +9,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 )
@@ -313,7 +314,7 @@ func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenCacheStateDeclines(t *tes
 		t.Fatalf("this turn must have been declined by cache_state for the test to mean anything "+
 			"(gates: %v)", rep.Gates)
 	}
-	dispatch, _, ok := KeepAliveSubstitute(ctx.Session)
+	dispatch, _, _, ok := KeepAliveSubstitute(ctx.Session)
 	if !ok {
 		t.Fatal("no keep-alive candidate was registered for a turn with real commission material")
 	}
@@ -330,7 +331,7 @@ func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenCacheStateDeclines(t *tes
 
 	// Once a checkpoint exists, the candidate must no longer be offered: the next real turn will
 	// splice the checkpoint for free, so spending another call here would be pure waste.
-	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("a candidate was still offered after a checkpoint was written")
 	}
 }
@@ -346,11 +347,11 @@ func TestClearKeepAliveCandidateDropsAStaleRegistration(t *testing.T) {
 	ctx := caGatedCtx("ca-ka-clear", st, "warm", 0, false, 0)
 	var rep components.Report
 	s.Offload(req, &rep, ctx)
-	if _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
 		t.Fatal("precondition: no candidate was registered")
 	}
 	ClearKeepAliveCandidate(ctx.Session)
-	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("ClearKeepAliveCandidate did not drop the registration")
 	}
 }
@@ -370,7 +371,59 @@ func TestCacheAwareDoesNotRegisterAKeepAliveCandidateWhenNotBigEnough(t *testing
 	if rep.Gates["below_request_trigger"] == 0 {
 		t.Fatalf("precondition: want below_request_trigger (gates: %v)", rep.Gates)
 	}
-	if _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("a candidate was registered for a turn that was never big enough to summarize")
+	}
+}
+
+// usageRecordingModel is capturingModel plus a real write into the ambient cheapmodel sink via
+// cheapmodel.ReplayUsage — capturingModel itself never touches it (it is a pure test double with
+// no real HTTP call), so without this a test asserting on deferred-usage/dashboard plumbing would
+// pass vacuously: deferUsage's own guard (`calls == 0`) silently skips persisting anything when
+// the sink recorded nothing, which is exactly the state every OTHER test using capturingModel
+// leaves it in.
+type usageRecordingModel struct {
+	capturingModel
+}
+
+func (m *usageRecordingModel) CompleteMessages(ctx context.Context, system string, msgs []bschemas.ChatMessage) (string, error) {
+	out, err := m.capturingModel.CompleteMessages(ctx, system, msgs)
+	cheapmodel.ReplayUsage(ctx, "fake-model", 100, 50, 10, 20)
+	return out, err
+}
+
+// ⭐ THE SUMMARY CALL'S OWN USAGE MUST REACH A DASHBOARD. It was otherwise invisible: it never
+// appears on the triggering turn's Report (the call hasn't happened yet) nor the splicing turn's
+// own synchronous work (the call ran on a different goroutine). takeDeferredUsage is the one
+// place it can surface, since every turn calls it unconditionally before anything else.
+func TestCacheAwareCommissionUsageReachesTheSplicingTurnsReport(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = &usageRecordingModel{capturingModel{out: "<summary>explored the handler.</summary>"}}
+
+	in := caFixture()
+	c := caCtx("ca-dashboard-row")
+	t1, _ := caTurn(t, s, c, in)
+	if len(t1.Input) != len(in) {
+		t.Fatalf("turn 1 must forward untouched")
+	}
+	if !WaitForSummaryForTest(c.Session, 5*time.Second) {
+		t.Fatal("the commissioned summary never landed")
+	}
+	_, rep2 := caTurn(t, s, c, in)
+	if len(rep2.Calls) != 1 {
+		t.Fatalf("turn 2's Report carries %d ModelCall rows, want exactly 1 (Calls: %+v)", len(rep2.Calls), rep2.Calls)
+	}
+	got := rep2.Calls[0]
+	if got.Component != "cache_aware_summarizer" {
+		t.Errorf("Component = %q, want cache_aware_summarizer", got.Component)
+	}
+	if got.Strategy != "messages/turn" {
+		t.Errorf("Strategy = %q, want %q (path/trigger)", got.Strategy, "messages/turn")
+	}
+	if got.PromptTokens == 0 && got.CompletionTokens == 0 && got.CacheRead == 0 && got.CacheWrite == 0 {
+		t.Error("the dashboard row carries no usage at all")
+	}
+	if !got.Accepted {
+		t.Error("a landed summary's row should read Accepted")
 	}
 }

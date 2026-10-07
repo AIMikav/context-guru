@@ -542,3 +542,30 @@ func TestCacheAwareWritesNoCheckpointWhenTheStashIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// ⭐ THE REGISTRATION-ORDERING BUG, caught live: a turn that reaches the no_stash_room decline
+// still has real commission material (model resolved, instruction built) — a transient capacity
+// problem, not a reason the keep-alive candidate should go unregistered. Before this was fixed,
+// no_stash_room (and max_request_tokens, and an unverified role) returned BEFORE
+// registerKeepAliveCandidate ran, so a session whose EVERY turn happened to trip one of those
+// checks never got a candidate at all — indistinguishable from a session the component had never
+// touched, and silent, because KeepAliveSubstitute's old two-value return could not say why.
+func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenTheStashIsRefused(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = &capturingModel{out: "<summary>ok</summary>"}
+	refusing := &spyStore{Memory: store.NewMemory(store.Options{MaxEntries: 400})}
+	c := &components.Ctx{Ctx: context.Background(), Session: "ca-refused-ka",
+		Store: refusing, MaxCachedIdx: -1}
+
+	t1, rep := caTurn(t, s, c, caFixture())
+	if len(t1.Input) != len(caFixture()) {
+		t.Fatalf("turn 1 modified the transcript despite the stash refusal")
+	}
+	if rep.Gates["no_stash_room"] == 0 {
+		t.Fatalf("precondition: want no_stash_room (gates: %v)", rep.Gates)
+	}
+	if _, _, _, ok := KeepAliveSubstitute(c.Session); !ok {
+		t.Error("no keep-alive candidate was registered on a turn declined only by a transient " +
+			"stash-capacity check — the candidate should have survived it")
+	}
+}

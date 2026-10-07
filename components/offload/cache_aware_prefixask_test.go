@@ -194,7 +194,7 @@ func TestCacheAwareKeepAliveCandidateWorksViaPrefixAsk(t *testing.T) {
 	if rep.Gates["cache_state_declined_warm"] == 0 {
 		t.Fatalf("precondition: this turn must be declined by cache_state (gates: %v)", rep.Gates)
 	}
-	dispatch, _, ok := KeepAliveSubstitute(ctx.Session)
+	dispatch, _, _, ok := KeepAliveSubstitute(ctx.Session)
 	if !ok {
 		t.Fatal("no keep-alive candidate was registered for a turn with real PrefixAsk commission material")
 	}

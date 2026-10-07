@@ -29,6 +29,7 @@ type keepAliveCandidate struct {
 	s            *CacheAwareSummarizer
 	ctx          *components.Ctx // minimal: Session, Store, Ctx
 	call         summaryCaller
+	path         string
 	span         []bschemas.ChatMessage
 	coveredCount int
 	// cacheState/preExpirySeconds are the component's OWN trigger.cache_state and
@@ -54,6 +55,36 @@ var (
 	keepAliveCand   = map[string]*keepAliveCandidate{}
 )
 
+// KeepAliveSubstituteReason explains why KeepAliveSubstitute declined (ok=false), or why a
+// Dispatch it returned did not commit — so a caller's counters and logs can tell "nothing was
+// ever registered for this session" from "something WAS registered and was lost", which used to
+// be one silent boolean. See fireSummarySubstitute's own comment on why that distinction matters:
+// a session that should have had a candidate and does not is a real bug, while one that never
+// had cache_aware_summarizer in its pipeline at all is the ordinary, overwhelming majority case.
+type KeepAliveSubstituteReason string
+
+const (
+	// KeepAliveReasonNone is the zero value: either ok=true (a Dispatch was returned), or
+	// Dispatch's own result committed — there is nothing to explain.
+	KeepAliveReasonNone KeepAliveSubstituteReason = ""
+	// KeepAliveReasonNoCandidate: no turn has registered material for this session at all — the
+	// component is not in this tenant's pipeline, no turn has reached the registration point
+	// yet, or ClearKeepAliveCandidate ran and nothing has re-registered since. The ordinary case
+	// for the vast majority of sessions.
+	KeepAliveReasonNoCandidate KeepAliveSubstituteReason = "no_candidate"
+	// KeepAliveReasonCheckpointExists: a candidate WAS registered, but a checkpoint already
+	// exists for this session — the next real turn will splice it for free, so spending a call
+	// here would summarize a span nobody is waiting on.
+	KeepAliveReasonCheckpointExists KeepAliveSubstituteReason = "checkpoint_exists"
+	// KeepAliveReasonInFlight: Dispatch collided with a commission already in flight for this
+	// session (the async path, or another keep-alive dispatch) — checked only inside Dispatch
+	// itself via the shared single-flight registry, so it cannot be known at lookup time.
+	KeepAliveReasonInFlight KeepAliveSubstituteReason = "in_flight"
+	// KeepAliveReasonConcurrencyFull: Dispatch was refused by the global concurrency bound this
+	// path shares with the detached async one — the proxy is shedding compaction under load.
+	KeepAliveReasonConcurrencyFull KeepAliveSubstituteReason = "concurrency_full"
+)
+
 // maxKeepAliveCandidates bounds the registry the same way the keeper's own kaEntry map is
 // bounded (proxy/keepalive.go's maxKeepAliveSessions): a session count, not a request-rate
 // knob, so a generous but finite ceiling costs nothing in the ordinary case and fails safe in
@@ -68,13 +99,13 @@ const maxKeepAliveCandidates = 2048
 // substitute, replacing any earlier registration for the session (always safe to replace: the
 // stored copy is only ever read later, between requests, and a newer turn's conversation is a
 // strict superset of an older one's for the same session).
-func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, call summaryCaller,
+func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, call summaryCaller, path string,
 	span []bschemas.ChatMessage, coveredCount int) {
 	if c == nil || c.Session == "" || call == nil {
 		return
 	}
 	cand := &keepAliveCandidate{
-		s: s, ctx: &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}, call: call,
+		s: s, ctx: &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}, call: call, path: path,
 		span:             append([]bschemas.ChatMessage(nil), span...),
 		coveredCount:     coveredCount,
 		cacheState:       s.trigger.CacheState,
@@ -109,13 +140,10 @@ func ClearKeepAliveCandidate(session string) {
 // KeepAliveSubstitute reports whether a session has commission material the idle keep-alive may
 // use instead of a bare ping, and a Dispatch function to run it.
 //
-// ok=false covers three cases the caller cannot and need not distinguish, because the answer is
-// the same for all of them: fall back to an ordinary ping. No turn has registered material for
-// this session (cache_aware_summarizer is not in the pipeline for it, or no turn has reached the
-// registration point yet); or a checkpoint already exists (the next real turn will splice it for
-// free, so spending a call here would summarize a span nobody is waiting on); or dispatch would
-// collide with a commission already in flight (checked inside Dispatch itself, via the shared
-// single-flight registry, so this cannot be known at lookup time without a race).
+// ok=false means fall back to an ordinary ping either way, but reason now says WHY — see
+// KeepAliveSubstituteReason. Dispatch's own in-flight/concurrency refusal cannot be known at
+// lookup time (it is checked inside Dispatch itself, via the shared single-flight registry), so
+// that is reported on KeepAliveSummaryResult.Reason instead, once Dispatch has actually run.
 //
 // Dispatch BLOCKS until the call resolves (or the given timeout elapses) and runs the real model
 // call — the keeper's caller must therefore run it off its own goroutine, exactly as it already
@@ -123,20 +151,20 @@ func ClearKeepAliveCandidate(session string) {
 //
 // info is returned alongside ok=true so the caller can additionally check cache_state against
 // its OWN timing before deciding to dispatch — see KeepAliveCandidateInfo.
-func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, info KeepAliveCandidateInfo, ok bool) {
+func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, info KeepAliveCandidateInfo, reason KeepAliveSubstituteReason, ok bool) {
 	keepAliveCandMu.Lock()
 	cand, exists := keepAliveCand[session]
 	keepAliveCandMu.Unlock()
 	if !exists {
-		return nil, KeepAliveCandidateInfo{}, false
+		return nil, KeepAliveCandidateInfo{}, KeepAliveReasonNoCandidate, false
 	}
 	if _, has := loadCheckpoint(cand.ctx); has {
-		return nil, KeepAliveCandidateInfo{}, false
+		return nil, KeepAliveCandidateInfo{}, KeepAliveReasonCheckpointExists, false
 	}
 	info = KeepAliveCandidateInfo{CacheState: cand.cacheState, PreExpirySeconds: cand.preExpirySeconds}
 	return func(timeout time.Duration) KeepAliveSummaryResult {
-		return cand.s.commissionSync(cand.ctx, cand.call, cand.span, cand.coveredCount, timeout)
-	}, info, true
+		return cand.s.commissionSync(cand.ctx, cand.call, cand.path, cand.span, cand.coveredCount, timeout)
+	}, info, KeepAliveReasonNone, true
 }
 
 // RegisterKeepAliveCandidateForTest installs commission material directly, for proxy's keeper
@@ -156,11 +184,11 @@ func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) K
 // constructing a real component through its registered constructor — "" behaves as `any`,
 // matching a component whose trigger never set cache_state at all.
 func RegisterKeepAliveCandidateForTest(session string, st store.Store,
-	call func(ctx context.Context) (string, error), span []bschemas.ChatMessage, coveredCount int,
+	call func(ctx context.Context) (string, error), path string, span []bschemas.ChatMessage, coveredCount int,
 	cacheState string, preExpirySeconds int) {
 	(&CacheAwareSummarizer{mode: markerFull,
 		trigger: components.Trigger{CacheState: cacheState, PreExpirySeconds: preExpirySeconds},
 	}).registerKeepAliveCandidate(
 		&components.Ctx{Session: session, Store: st, Ctx: context.Background()},
-		call, span, coveredCount)
+		call, path, span, coveredCount)
 }

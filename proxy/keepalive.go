@@ -500,6 +500,22 @@ type keeper struct {
 	// (every strategy-driven K>1 schedule and every narrower pre_expiry_seconds than the
 	// keeper's own Idle produces some of these), not a failure.
 	summarySubstitutePhaseMismatch atomic.Int64
+	// summarySubstituteNoCandidate counts a due ping for which no keep-alive candidate was
+	// registered at all — the ordinary case for the vast majority of sessions (the component
+	// not in the pipeline, or no turn has reached registration yet). Was previously folded into
+	// one silent `return false` indistinguishable from the three counters below it.
+	summarySubstituteNoCandidate atomic.Int64
+	// summarySubstituteCheckpointExists counts a due ping for a session that HAD a registered
+	// candidate but already has a checkpoint — the next real turn splices it for free, so
+	// substituting here would summarize a span nobody needs.
+	summarySubstituteCheckpointExists atomic.Int64
+	// summarySubstituteInFlight/ConcurrencyFull count a Dispatch that was itself refused before
+	// any model call was made — a candidate existed and passed every check above, but collided
+	// with another commission already running for the session, or with the global concurrency
+	// bound. Distinct from summarySubstituteFailed's other causes (a call that ran and did not
+	// commit), which have their own counters already (CacheAwareSummarizerErrors/Timeouts/Empty).
+	summarySubstituteInFlight        atomic.Int64
+	summarySubstituteConcurrencyFull atomic.Int64
 }
 
 // keepAliveDisabled is the operator's kill switch, read once at construction. A single
@@ -1085,8 +1101,23 @@ func (k *keeper) fire(j pingJob) {
 // Fail open throughout, by construction: nothing here can leave this ping unset for the idle
 // span it was due for, because every "no" falls through to the code fire() already runs.
 func (k *keeper) fireSummarySubstitute(j pingJob) bool {
-	dispatch, info, ok := offload.KeepAliveSubstitute(j.session)
+	dispatch, info, reason, ok := offload.KeepAliveSubstitute(j.session)
 	if !ok {
+		// WAS silent — "no candidate" (the ordinary case for most sessions) and "a candidate
+		// existed but a checkpoint already covers it" (routine, but a DIFFERENT fact) used to be
+		// one indistinguishable false. Counted separately so a session that SHOULD have a
+		// candidate and does not (cache_aware_summarizer is in the pipeline, turns are declining
+		// with a cache_state gate that implies registration — see Offload's own comment on
+		// registering unconditionally) is diagnosable instead of looking identical to a session
+		// the component never touched at all.
+		switch reason {
+		case offload.KeepAliveReasonCheckpointExists:
+			k.summarySubstituteCheckpointExists.Add(1)
+		default:
+			k.summarySubstituteNoCandidate.Add(1)
+		}
+		slog.Debug("context-guru: cache_aware_summarizer keep-alive substitute not offered",
+			"tenant", tenantLabel(j.tenant), "session", j.session, "reason", string(reason))
 		return false
 	}
 	e := j.e
@@ -1118,9 +1149,15 @@ func (k *keeper) fireSummarySubstitute(j pingJob) bool {
 	ms := float64(k.now().Sub(start).Microseconds()) / 1000.0
 	if !res.Committed {
 		k.summarySubstituteFailed.Add(1)
+		switch res.Reason {
+		case offload.KeepAliveReasonInFlight:
+			k.summarySubstituteInFlight.Add(1)
+		case offload.KeepAliveReasonConcurrencyFull:
+			k.summarySubstituteConcurrencyFull.Add(1)
+		}
 		slog.Debug("context-guru: cache_aware_summarizer keep-alive substitute produced no "+
 			"summary; pinging normally instead",
-			"tenant", tenantLabel(j.tenant), "session", j.session)
+			"tenant", tenantLabel(j.tenant), "session", j.session, "reason", string(res.Reason))
 		return false
 	}
 	cost := k.recordSummarySubstitute(j, res, ms, start)
@@ -1489,6 +1526,15 @@ type KeepAliveStats struct {
 	// SummarySubstitutePhaseMismatch counts a routine `pre_expiry` candidate declined because
 	// this particular ping did not land inside the component's own pre-expiry window.
 	SummarySubstitutePhaseMismatch int64 `json:"keepalive_summary_substitute_phase_mismatch"`
+	// SummarySubstituteNoCandidate/CheckpointExists/InFlight/ConcurrencyFull split what used to
+	// be one silent "no substitute" outcome — see fireSummarySubstitute. NoCandidate is the
+	// ordinary case for most sessions; the other three, climbing on a session that SHOULD have a
+	// registered candidate, are what makes a registration gap diagnosable instead of looking
+	// identical to the component simply not being in that tenant's pipeline.
+	SummarySubstituteNoCandidate      int64 `json:"keepalive_summary_substitute_no_candidate"`
+	SummarySubstituteCheckpointExists int64 `json:"keepalive_summary_substitute_checkpoint_exists"`
+	SummarySubstituteInFlight         int64 `json:"keepalive_summary_substitute_in_flight"`
+	SummarySubstituteConcurrencyFull  int64 `json:"keepalive_summary_substitute_concurrency_full"`
 }
 
 // PendingPings reports how many tracked sessions still have a ping scheduled ahead of them.
@@ -1547,11 +1593,15 @@ func (k *keeper) Stats() KeepAliveStats {
 	k.mu.Unlock()
 	return KeepAliveStats{Live: live, Pings: k.pings.Load(), Skipped: k.skipped.Load(),
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
-		SpentUSD:                    math.Float64frombits(k.spentUSD.Load()),
-		SummarySubstituted:             k.summarySubstituted.Load(),
-		SummarySubstituteFailed:        k.summarySubstituteFailed.Load(),
-		SummarySubstituteOverBudget:    k.summarySubstituteOverBudget.Load(),
-		SummarySubstitutePhaseMismatch: k.summarySubstitutePhaseMismatch.Load(),
+		SpentUSD:                          math.Float64frombits(k.spentUSD.Load()),
+		SummarySubstituted:                k.summarySubstituted.Load(),
+		SummarySubstituteFailed:           k.summarySubstituteFailed.Load(),
+		SummarySubstituteOverBudget:       k.summarySubstituteOverBudget.Load(),
+		SummarySubstitutePhaseMismatch:    k.summarySubstitutePhaseMismatch.Load(),
+		SummarySubstituteNoCandidate:      k.summarySubstituteNoCandidate.Load(),
+		SummarySubstituteCheckpointExists: k.summarySubstituteCheckpointExists.Load(),
+		SummarySubstituteInFlight:         k.summarySubstituteInFlight.Load(),
+		SummarySubstituteConcurrencyFull:  k.summarySubstituteConcurrencyFull.Load(),
 	}
 }
 

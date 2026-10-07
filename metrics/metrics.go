@@ -804,6 +804,22 @@ type Snapshot struct {
 	CacheAwareSummarizerAsyncStarted int64 `json:"cache_aware_summarizer_async_started"`
 	// detached summaries that reached a checkpoint. The PAIR is the signal: started without committed is a summary paid for and lost
 	CacheAwareSummarizerAsyncCommitted int64 `json:"cache_aware_summarizer_async_committed"`
+	// a session's FIRST turn through components.PrefixAsker (components.ErrNoPrefix) — not a
+	// failure, counted apart from CacheAwareSummarizerErrors for the same reason extract_llm_sweep
+	// separates sweep_no_prefix from sweep_ask_failed
+	CacheAwareSummarizerNoPrefix int64 `json:"cache_aware_summarizer_no_prefix"`
+	// commission calls that reached the model through components.PrefixAsker rather than a
+	// components.MessagesModel — i.e. the Anthropic incoming-model path (#275). Zero here on a
+	// deployment running Anthropic-only traffic means this component is still measuring `off`,
+	// whatever CacheAwareSummarizerDeclined says
+	CacheAwareSummarizerPrefixAskUsed int64 `json:"cache_aware_summarizer_prefix_ask_used"`
+	// ⭐ THE DIRECT ANSWER to "is the call actually reading warm" — this component's whole
+	// argument. CacheAwareSummarizerCacheReadTokens staying at 0 across many calls is the same
+	// "never infer a cache win from placement" signal cheapmodel.CacheUsage's own docstring states
+	// for the cheap-model path, applied to this component's own commission calls (any trigger, any
+	// path) rather than the agent's traffic
+	CacheAwareSummarizerCacheReadTokens  int64 `json:"cache_aware_summarizer_cache_read_tokens"`
+	CacheAwareSummarizerCacheWriteTokens int64 `json:"cache_aware_summarizer_cache_write_tokens"`
 
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
