@@ -29,6 +29,8 @@ func (o OpenAI) CompletePrefixedResponses(ctx context.Context, prefixBody []byte
 	if maxTok == 0 {
 		maxTok = PrefixAskMaxTokens
 	}
+	// Unlike anthropic.go's CompletePrefixed, no fix needed here: Responses' reasoning control is
+	// a qualitative effort level, not a token budget, so there's no field max_output_tokens could contradict.
 	if body, err = sjson.SetBytes(body, "max_output_tokens", maxTok); err != nil {
 		return "", usage, err
 	}
