@@ -248,13 +248,15 @@ func TestThinkingAdjustedMaxTokens(t *testing.T) {
 
 // THE DEFECT, live on claude-sonnet-5[1m] (6/6 failures in one capture): Claude Code sends a
 // mid-conversation `role: system` reminder as the LAST message of the stored request on
-// effectively every turn. CompletePrefixed used to always append the ask AFTER prefixBody's own
-// last message, which moved that system message out of the one position Anthropic allows it away
-// from index 0: immediately before an assistant message, or ending the array. The result was a
-// guaranteed 400: "role 'system' must precede an 'assistant' message or end the array". See
-// insertAskMessage's doc comment for why inserting the ask BEFORE the trailing system run fixes
-// this without touching the cache.
-func TestCompletePrefixedInsertsBeforeATrailingSystemMessage(t *testing.T) {
+// effectively every turn. Appending the ask directly after that message is a guaranteed 400
+// ("role 'system' must precede an 'assistant' message or end the array"). An earlier version of
+// this fix inserted the ask BEFORE the system message instead, which cleared that rule but moved
+// bytes in front of the cache_control breakpoint Claude Code places on exactly that message —
+// measured live, that version turned the cache READ this method exists for into a full WRITE
+// (read=0, write=21,652). This version leaves the system message exactly where it is and appends
+// a short synthetic assistant turn ("Understood.") plus the ask after it instead — measured live,
+// read=21,644, write=0. See insertAskMessage's doc comment for the full comparison.
+func TestCompletePrefixedAppendsAfterATrailingSystemMessage(t *testing.T) {
 	var got []byte
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
@@ -284,35 +286,32 @@ func TestCompletePrefixedInsertsBeforeATrailingSystemMessage(t *testing.T) {
 	}
 
 	msgs := gjson.GetBytes(got, "messages").Array()
-	if len(msgs) != 5 {
-		t.Fatalf("got %d messages, want 5 (4 original + 1 ask): %s", len(msgs), got)
+	if len(msgs) != 6 {
+		t.Fatalf("got %d messages, want 6 (4 original + the synthetic turn + the ask): %s",
+			len(msgs), got)
 	}
-	// THE SHAPE INVARIANT ITSELF: the trailing system message must still end the array, or this
-	// test is reproducing nothing and the live 400 would still happen.
-	if last := msgs[len(msgs)-1]; last.Get("role").String() != "system" {
-		t.Fatalf("the trailing system message no longer ends the array: %s", got)
-	}
-	// THE ASK LANDS IMMEDIATELY BEFORE IT, not at the absolute end.
-	if msgs[3].Get("role").String() != "user" || msgs[3].Get("content").String() != "judge" {
-		t.Fatalf("the ask was not inserted immediately before the trailing system message: %s", got)
-	}
-	// EVERY ORIGINAL MESSAGE IS BYTE-IDENTICAL AND IN ITS ORIGINAL RELATIVE ORDER — this is what
-	// keeps the cache: nothing before the insertion point may change by even a byte.
+	// EVERY ORIGINAL MESSAGE IS BYTE-IDENTICAL AND UNMOVED — this is what keeps the cache: nothing
+	// before (or at) the system message's own position may change by even a byte.
 	want := []struct{ role, content string }{
 		{"user", "first turn"}, {"assistant", "reply"}, {"user", "second turn"},
-		{"user", "judge"},
 		{"system", "<system-reminder>be careful</system-reminder>"},
+		{"assistant", "Understood."},
+		{"user", "judge"},
 	}
 	for i, w := range want {
 		if msgs[i].Get("role").String() != w.role || msgs[i].Get("content").String() != w.content {
 			t.Errorf("messages[%d] = %s, want role=%q content=%q", i, msgs[i].Raw, w.role, w.content)
 		}
 	}
+	// THE ASK IS ALWAYS LAST, which is what keeps this route's own prefill rule satisfied.
+	if last := msgs[len(msgs)-1]; last.Get("role").String() != "user" || last.Get("content").String() != "judge" {
+		t.Fatalf("the ask is not the final message: %s", got)
+	}
 }
 
-// MULTIPLE TRAILING SYSTEM MESSAGES must all stay at the end, with the ask inserted before the
-// whole run rather than between them.
-func TestCompletePrefixedInsertsBeforeMultipleTrailingSystemMessages(t *testing.T) {
+// MULTIPLE TRAILING SYSTEM MESSAGES all stay exactly where they are; the synthetic turn and the
+// ask land after the whole run, not between any of them.
+func TestCompletePrefixedAppendsAfterMultipleTrailingSystemMessages(t *testing.T) {
 	var got []byte
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
@@ -335,14 +334,17 @@ func TestCompletePrefixedInsertsBeforeMultipleTrailingSystemMessages(t *testing.
 		t.Fatalf("CompletePrefixed: %v", err)
 	}
 	msgs := gjson.GetBytes(got, "messages").Array()
-	if len(msgs) != 4 {
-		t.Fatalf("got %d messages, want 4: %s", len(msgs), got)
+	if len(msgs) != 5 {
+		t.Fatalf("got %d messages, want 5: %s", len(msgs), got)
 	}
-	if msgs[1].Get("role").String() != "user" || msgs[1].Get("content").String() != "judge" {
-		t.Fatalf("the ask was not inserted before the trailing system run: %s", got)
-	}
-	if msgs[2].Get("content").String() != "reminder one" || msgs[3].Get("content").String() != "reminder two" {
+	if msgs[1].Get("content").String() != "reminder one" || msgs[2].Get("content").String() != "reminder two" {
 		t.Fatalf("the trailing system run was reordered: %s", got)
+	}
+	if msgs[3].Get("role").String() != "assistant" || msgs[3].Get("content").String() != "Understood." {
+		t.Fatalf("the synthetic turn did not land right after the system run: %s", got)
+	}
+	if msgs[4].Get("role").String() != "user" || msgs[4].Get("content").String() != "judge" {
+		t.Fatalf("the ask did not land last: %s", got)
 	}
 }
 
@@ -383,13 +385,15 @@ func TestInsertAskMessage(t *testing.T) {
 		body     string
 		wantRole []string
 	}{
-		{"no trailing system", `{"messages":[{"role":"user","content":"a"}]}`,
+		{"no trailing system: ask appended alone", `{"messages":[{"role":"user","content":"a"}]}`,
 			[]string{"user", "user"}},
-		{"one trailing system", `{"messages":[{"role":"user","content":"a"},{"role":"system","content":"r"}]}`,
-			[]string{"user", "user", "system"}},
-		{"two trailing system", `{"messages":[{"role":"user","content":"a"},` +
-			`{"role":"system","content":"r1"},{"role":"system","content":"r2"}]}`,
-			[]string{"user", "user", "system", "system"}},
+		{"one trailing system: synthetic turn then ask, both after it",
+			`{"messages":[{"role":"user","content":"a"},{"role":"system","content":"r"}]}`,
+			[]string{"user", "system", "assistant", "user"}},
+		{"two trailing system: the whole run is untouched, synthetic turn and ask follow it",
+			`{"messages":[{"role":"user","content":"a"},` +
+				`{"role":"system","content":"r1"},{"role":"system","content":"r2"}]}`,
+			[]string{"user", "system", "system", "assistant", "user"}},
 		{"empty messages", `{"messages":[]}`, []string{"user"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

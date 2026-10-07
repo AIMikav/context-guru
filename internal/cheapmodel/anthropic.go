@@ -247,14 +247,16 @@ type PrefixUsage struct {
 //     them read a different, smaller entry (19,129) i.e. a separate cache line and a fresh write.
 //
 //   - this route REJECTS assistant prefill ("the conversation must end with a user message"), which
-//     the appended user message satisfies by construction — but it means prefixBody must not be
-//     extended any other way.
+//     the ask satisfies by construction: it is always the LAST message insertAskMessage appends,
+//     even on the trailing-system-message shape below, which inserts one more message BEFORE it
+//     but never after.
 //
-//   - THE APPENDED MESSAGE IS NOT ALWAYS LAST. See insertAskMessage: when prefixBody's own last
-//     message is a `role: system` mid-conversation reminder — which Claude Code sends on
-//     effectively every turn — appending after it is a guaranteed 400 ("role 'system' must
-//     precede an 'assistant' message or end the array"), so the ask goes immediately BEFORE that
-//     trailing system run instead. Every byte before the insertion point is still untouched.
+//   - THE ASK IS NOT ALWAYS THE ONLY THING APPENDED. See insertAskMessage: when prefixBody's own
+//     last message is a `role: system` mid-conversation reminder — which Claude Code sends on
+//     effectively every turn — appending the ask directly after it is a guaranteed 400 ("role
+//     'system' must precede an 'assistant' message or end the array"). insertAskMessage leaves
+//     that system message exactly where it is and appends a short synthetic assistant turn plus
+//     the ask after it, never touching or reordering a single existing byte.
 //
 // Everything else about the body is preserved untouched, because every byte before the appended
 // message is prefix and any edit to it costs the cache read this method exists for. `stream` is the
@@ -421,57 +423,75 @@ func thinkingAdjustedMaxTokens(body []byte, reply int) (want int, capped bool) {
 	return want, false
 }
 
-// insertAskMessage appends `ask` as a new user message to prefixBody's `messages` array, in the
-// one place that keeps the result a VALID Anthropic request: before any trailing run of
-// system-role messages, never after it.
+// insertAskMessage appends `ask` as a new user message to prefixBody's `messages` array. When the
+// array's own last message is a `role: system` mid-conversation reminder, it first appends ONE
+// short synthetic assistant turn ("Understood.") so the result stays a VALID Anthropic request.
+// Nothing already in the array is ever reordered, edited, or removed — only ever appended to.
 //
-// WHY A TRAILING SYSTEM MESSAGE CANNOT BE FOLLOWED. Anthropic's own rule — this codebase already
-// enforces it offline, see schema.ValidateShapeFor's RuleSystemPosition and systemPositionOK — is
-// that a system-role message away from index 0 must either be IMMEDIATELY followed by an
-// assistant message, or END THE ARRAY. Claude Code sends a mid-conversation `role: system`
-// reminder as the request's LAST message on effectively every turn (docs/components/caching.md:
-// "Claude Code marks its own final message on 466 of 472 measured requests"), so the naive fix —
-// always appending at the end — turns that legal, array-ending system message into one followed
-// by our new user message, which satisfies NEITHER branch of the rule. The provider's own 400
-// confirms it character-for-character: "role 'system' must precede an 'assistant' message or end
-// the array" (live, PR for this fix).
+// WHY A TRAILING SYSTEM MESSAGE CANNOT BE FOLLOWED BY THE ASK DIRECTLY. Anthropic's own rule —
+// this codebase already enforces it offline, see schema.ValidateShapeFor's RuleSystemPosition and
+// systemPositionOK — is that a system-role message away from index 0 must either be IMMEDIATELY
+// followed by an assistant message, or END THE ARRAY. Claude Code sends a mid-conversation
+// `role: system` reminder as the request's LAST message on effectively every turn
+// (docs/components/caching.md: "Claude Code marks its own final message on 466 of 472 measured
+// requests"), so appending the ask straight after it is a guaranteed 400 — the provider's own
+// error confirms it character-for-character: "role 'system' must precede an 'assistant' message
+// or end the array".
 //
-// INSERTING BEFORE THE RUN KEEPS THE SHAPE, AND THE CACHE. Moving the ask one slot earlier makes
-// the array end with the untouched system run again, which clears the same rule. Two consecutive
-// user-role messages (the prefix's own last user turn, immediately followed by this ask) are not
-// a problem: `schema.ValidateShapeFor` and docs/components/summarize.md both note that Anthropic
-// has no alternation requirement and explicitly accepts consecutive same-role messages. And this
-// is the SAME shape Claude Code's own ordinary turns already have — [user turn, system reminder]
-// — so inserting the ask as that "user turn" one slot before the reminder reproduces the pattern
-// the provider is already proven to answer correctly, rather than inventing a new one.
+// WHY NOT INSERT THE ASK BEFORE THE SYSTEM MESSAGE INSTEAD (an earlier version of this fix did).
+// That satisfies the position rule too, but it moves the system message's bytes relative to
+// everything before it — anything inserted before a cache_control breakpoint changes the byte
+// sequence the provider hashes UP TO that breakpoint, which is exactly where Claude Code's own
+// entry is keyed (docs/components/caching.md's measurement: the breakpoint sits on the agent's
+// own final message, i.e. on this trailing system reminder). Measured live (PR review): with the
+// ask inserted before it, the prefix ask got read=0, write=21,652 — a full cache WRITE where the
+// read this whole method exists for should have happened. Appending AFTER the system run instead
+// changes nothing before or at the breakpoint, so the entry it covers is untouched; measured live
+// with that version, read=21,644, write=0 — the full main-agent entry, read rather than rewritten.
 //
-// Nothing before the insertion point moves. Every message that was already in the array keeps its
-// EXACT original bytes (gjson.Result.Raw is a substring of prefixBody, not a re-encoding), so the
-// cache_control breakpoint — which docs/components/caching.md's own measurement says Claude Code
-// places on its own final message, i.e. on the system reminder itself in this shape — stays in
-// the same position relative to the array's end and still covers the identical byte prefix. The
-// one case this changes nothing for is the ordinary case with no trailing system message: the
-// loop below finds no run to insert before, k stays at len(msgs), and the result is byte-for-byte
-// the old "append at the end" behaviour.
+// WHY A SYNTHETIC ASSISTANT TURN, NOT SOMETHING ELSE. Two consecutive messages of the same role
+// are legal on Anthropic (`schema.ValidateShapeFor`, docs/components/summarize.md), so a second
+// user message would clear the position rule just as well — but a system message followed by a
+// USER message does not change anything about the rule above, which asks for an ASSISTANT message
+// or the end of the array; the system message here is in neither position unless something
+// assistant-shaped follows it. A short, fixed, content-free string avoids inventing an answer the
+// model never gave; "Understood." was the reviewer's own live-tested text (2 of 2 runs: status
+// 200, read=21,644, write=0).
+//
+// OPEN QUESTION FOR A THINKING-ENABLED SESSION, NOT YET VERIFIED LIVE. Anthropic's docs
+// (https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-with-tool-use): "In
+// extended (manual) mode, the API additionally enforces that the final assistant turn of a
+// thinking-enabled request begins with a thinking block. Adaptive mode relaxes this: no assistant
+// turn needs to start with one." This synthetic assistant message carries no thinking block. On
+// `thinking.type: "adaptive"` (or disabled, or absent) that rule does not apply, so the shape
+// above is unaffected. On `thinking.type: "enabled"` (the manual mode PR #406's
+// thinkingAdjustedMaxTokens exists for, which Claude Code uses on haiku) it is NOT YET KNOWN
+// whether "the final assistant turn" means literally the last assistant message in the array
+// regardless of what follows it (our synthetic one), or only an assistant turn an active
+// tool-use loop is continuing through (which this one is not — it is followed by a fresh user
+// message, not a tool_result). A fabricated thinking block is not an option regardless: the API
+// verifies each thinking block's `signature` cryptographically
+// (https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-encryption), so one
+// this code invents would be rejected, not silently accepted. This needs a live run with
+// thinking.type: "enabled" before it can be called settled either way — see the PR for the
+// current status of that measurement.
 func insertAskMessage(prefixBody []byte, ask string) ([]byte, error) {
 	msgs := gjson.GetBytes(prefixBody, "messages").Array()
-	k := len(msgs) // insertion point: before the trailing run of system messages, if any
-	for k > 0 && msgs[k-1].Get("role").String() == "system" {
-		k--
+	parts := make([]string, 0, len(msgs)+2)
+	for _, m := range msgs {
+		parts = append(parts, m.Raw)
+	}
+	if len(msgs) > 0 && msgs[len(msgs)-1].Get("role").String() == "system" {
+		understoodJSON, err := json.Marshal(map[string]any{"role": "assistant", "content": "Understood."})
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, string(understoodJSON))
 	}
 	askJSON, err := json.Marshal(map[string]any{"role": "user", "content": ask})
 	if err != nil {
 		return nil, err
 	}
-	parts := make([]string, 0, len(msgs)+1)
-	for i, m := range msgs {
-		if i == k {
-			parts = append(parts, string(askJSON))
-		}
-		parts = append(parts, m.Raw)
-	}
-	if k == len(msgs) { // no trailing system run: the old "append at the very end" behaviour
-		parts = append(parts, string(askJSON))
-	}
+	parts = append(parts, string(askJSON))
 	return sjson.SetRawBytes(prefixBody, "messages", []byte("["+strings.Join(parts, ",")+"]"))
 }
