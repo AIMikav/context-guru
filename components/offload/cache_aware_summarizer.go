@@ -276,6 +276,13 @@ var (
 	// cheapmodel.CacheUsage's own docstring states for the cheap-model path.
 	cacheAwareCacheReadTokens  int64
 	cacheAwareCacheWriteTokens int64
+	// cacheAwareSummaryTruncated counts a PAID-FOR call whose raw reply was missing the closing
+	// </summary> tag the prompt asks for — the signature of a reply cut off mid-generation by
+	// the model's own token/thinking budget. Counted and refused rather than committed: see
+	// cacheAwareSummaryIncomplete in cache_aware_async.go for why this has to be checked on the
+	// UNTRUSTED raw text before sanitizeSummary/ensureSummaryTags touch it, or a truncated reply
+	// is indistinguishable from a complete one by the time either of those has run.
+	cacheAwareSummaryTruncated int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
@@ -285,6 +292,7 @@ func CacheAwareSummarizerNoPrefix() int64 { return atomic.LoadInt64(&cacheAwareN
 func CacheAwareSummarizerPrefixAskUsed() int64 {
 	return atomic.LoadInt64(&cacheAwarePrefixAskUsed)
 }
+func CacheAwareSummarizerTruncated() int64 { return atomic.LoadInt64(&cacheAwareSummaryTruncated) }
 
 // CacheAwareSummarizerCacheTokens returns the cumulative cache-read/cache-write tokens of every
 // commission call this component has made, across every trigger and path.

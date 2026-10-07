@@ -90,6 +90,28 @@ func classifyCallErr(ctx context.Context, session string, err error) {
 	logging.From(ctx).Warn("cg.cache_aware_summarizer.call_failed", "session", session, "err", err)
 }
 
+// cacheAwareSummaryIncomplete reports whether a RAW model reply is missing the closing
+// `</summary>` tag the summarizer prompt asks for (summarizer_model_profiles.yaml: "wrapped in
+// <summary></summary> tags"). Checked on `out` as the call returned it — BEFORE sanitizeSummary
+// (which strips every spelling of that tag as an untrusted control string; see its own doc) and
+// BEFORE ensureSummaryTags (which unconditionally re-adds a missing closing tag). Checking after
+// either of those would always see "complete", because the second one manufactures the very tag
+// being tested for: a reply cut off mid-generation by the model's own token or thinking budget
+// would be repaired into a checkpoint that looks exactly like a finished summary and replaces
+// real history with a fragment.
+//
+// `summarize`'s OWN prompt (summarizerUserPrompt) asks for the identical format, so it has the
+// same theoretical exposure — but ensureSummaryTags/sanitizeSummary are summarize's long-shipped,
+// deliberately lenient contract: it already tolerates a model that never wraps in tags at all
+// (every one of its own test fixtures uses untagged stub text on the strength of that leniency).
+// Retrofitting a strict completeness gate onto summarize's accepted contract is a separate,
+// bigger behaviour change this fix does not make — see cache_aware_summarizer's own PR for the
+// reasoning. This check is therefore local to cache_aware_summarizer, not added to the shared
+// ensureSummaryTags/sanitizeSummary helpers themselves.
+func cacheAwareSummaryIncomplete(raw string) bool {
+	return !strings.Contains(raw, "</summary>")
+}
+
 // startAsyncSummary commissions the summary and returns a gate name when it declined to, so the
 // caller can file it. Everything the goroutine needs is read HERE, on the request's goroutine —
 // reading c.Store or calling effectiveMode from inside the goroutine would put a concurrent read
@@ -161,6 +183,12 @@ func (s *CacheAwareSummarizer) startAsyncSummary(c *components.Ctx, call summary
 		}
 		if strings.TrimSpace(out) == "" {
 			atomic.AddInt64(&cacheAwareEmpty, 1)
+			return
+		}
+		if cacheAwareSummaryIncomplete(out) {
+			atomic.AddInt64(&cacheAwareSummaryTruncated, 1)
+			logging.From(baseCtx).Warn("cg.cache_aware_summarizer.summary_truncated",
+				"session", session)
 			return
 		}
 		s.commitAsyncSummary(mode, session, st, spanCopy, out, coveredCount)
@@ -288,6 +316,11 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCal
 	}
 	if strings.TrimSpace(out) == "" {
 		atomic.AddInt64(&cacheAwareEmpty, 1)
+		return res
+	}
+	if cacheAwareSummaryIncomplete(out) {
+		atomic.AddInt64(&cacheAwareSummaryTruncated, 1)
+		logging.From(c.Ctx).Warn("cg.cache_aware_summarizer.summary_truncated", "session", session)
 		return res
 	}
 	committedBefore := atomic.LoadInt64(&cacheAwareAsyncCommitted)

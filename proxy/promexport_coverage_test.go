@@ -188,6 +188,7 @@ var notExportedWhy = map[string]string{
 	"CacheAwareSummarizerPrefixAskUsed":    "NOT EXPORTED YET — the direct signal that this component is actually activating on Anthropic incoming-model traffic (#275) rather than measuring `off`",
 	"CacheAwareSummarizerCacheReadTokens":  "NOT EXPORTED YET — the direct answer to 'is the commission call actually reading warm', this component's whole argument",
 	"CacheAwareSummarizerCacheWriteTokens": "NOT EXPORTED YET — paired with CacheReadTokens; a call that only ever writes is the mechanism failing, not merely being expensive",
+	"CacheAwareSummarizerTruncated":        "NOT EXPORTED YET — a paid-for call whose reply looked cut off and was refused rather than committed; non-zero is lost compaction, never a wrong checkpoint",
 	"SummarizeTimeouts":                    "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",
 	"SummarizeErrors":                      "NOT EXPORTED YET — as above",
 	// The detached summarizer path's health. Listed here rather than exported, following this

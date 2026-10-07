@@ -56,6 +56,7 @@ var statsGoldenTopLevel = []string{
 	"cache_aware_summarizer_prefix_ask_used",
 	"cache_aware_summarizer_cache_read_tokens",
 	"cache_aware_summarizer_cache_write_tokens",
+	"cache_aware_summarizer_truncated",
 
 	"agentdiet_errors",
 	"agentdiet_timeouts",

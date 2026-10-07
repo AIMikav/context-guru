@@ -2160,6 +2160,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap.CacheAwareSummarizerPrefixAskUsed = offload.CacheAwareSummarizerPrefixAskUsed()
 	snap.CacheAwareSummarizerCacheReadTokens, snap.CacheAwareSummarizerCacheWriteTokens =
 		offload.CacheAwareSummarizerCacheTokens()
+	snap.CacheAwareSummarizerTruncated = offload.CacheAwareSummarizerTruncated()
 
 	// Freeze-replay health, same layering: the counters live with the code that owns
 	// them (offload for the replay path, the store for dropped/repaired decisions).

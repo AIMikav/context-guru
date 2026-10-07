@@ -427,3 +427,75 @@ func TestCacheAwareCommissionUsageReachesTheSplicingTurnsReport(t *testing.T) {
 		t.Error("a landed summary's row should read Accepted")
 	}
 }
+
+// ⭐ A REPLY CUT OFF MID-GENERATION MUST NOT BECOME A CHECKPOINT. ensureSummaryTags/
+// sanitizeSummary would otherwise manufacture a complete-looking <summary>...</summary> wrapper
+// around a truncated reply — sanitizeSummary strips any closing tag as an untrusted control
+// string, and ensureSummaryTags then unconditionally adds one back, so by the time either has
+// run a truncated reply and a complete one are byte-indistinguishable. The check has to happen
+// on the RAW text, before either of them.
+func TestCacheAwareRejectsATruncatedSummaryOnTheAsyncPath(t *testing.T) {
+	before := CacheAwareSummarizerTruncated()
+	_, committedBefore, _, _ := CacheAwareAsyncStats()
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	// Missing the closing tag entirely — a reply cut off before the model could finish.
+	s.modelClient = &capturingModel{out: "<summary>explored the handler, got cut off mid"}
+
+	in := caFixture()
+	c := caCtx("ca-truncated")
+	t1, _ := caTurn(t, s, c, in)
+	if len(t1.Input) != len(in) {
+		t.Fatalf("turn 1 must forward untouched")
+	}
+	if !WaitForSummaryForTest(c.Session, 5*time.Second) {
+		t.Fatal("the detached call never resolved")
+	}
+	if CacheAwareSummarizerTruncated() != before+1 {
+		t.Error("a truncated reply was not counted")
+	}
+	if _, committed, _, _ := CacheAwareAsyncStats(); committed != committedBefore {
+		t.Error("a truncated reply committed a checkpoint")
+	}
+	if _, ok := loadCheckpoint(c); ok {
+		t.Error("a checkpoint exists despite the reply being truncated")
+	}
+	// And the next turn must forward untouched rather than splice a fragment.
+	t2, _ := caTurn(t, s, c, in)
+	if len(t2.Input) != len(in) {
+		t.Errorf("turn 2 spliced after a truncated reply: %d -> %d", len(in), len(t2.Input))
+	}
+	// Turn 2 ALSO sees no checkpoint yet, so it recommissions and will truncate again — drain it
+	// before this test returns, or it resolves later and leaks a counter bump into a different
+	// test reading the same process-wide counter.
+	WaitForSummaryForTest(c.Session, 5*time.Second)
+}
+
+// Same property on the keep-alive substitute path (commissionSync), which has its own copy of
+// the check because it is the one caller that cannot use the detached goroutine.
+func TestCacheAwareRejectsATruncatedSummaryOnTheKeepAliveSubstitutePath(t *testing.T) {
+	before := CacheAwareSummarizerTruncated()
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	s.modelClient = &capturingModel{out: "<summary>cut off before the closing tag"}
+	ctx := caGatedCtx("ca-truncated-ka", store.NewMemory(store.Options{MaxEntries: 400}), "warm", 0, false, 0)
+
+	t1, rep := caTurn(t, s, ctx, caTranscript(3))
+	if rep.Gates["cache_state_declined_warm"] == 0 {
+		t.Fatalf("precondition: want cache_state_declined_warm (gates: %v)", rep.Gates)
+	}
+	_ = t1
+	dispatch, _, _, ok := KeepAliveSubstitute(ctx.Session)
+	if !ok {
+		t.Fatal("no keep-alive candidate was registered")
+	}
+	res := dispatch(5 * time.Second)
+	if res.Committed {
+		t.Fatal("a truncated reply committed a checkpoint via the keep-alive substitute")
+	}
+	if CacheAwareSummarizerTruncated() != before+1 {
+		t.Error("a truncated reply was not counted on the keep-alive substitute path")
+	}
+	if _, ok := loadCheckpoint(ctx); ok {
+		t.Error("a checkpoint exists despite the reply being truncated")
+	}
+}

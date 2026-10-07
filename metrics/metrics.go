@@ -820,6 +820,11 @@ type Snapshot struct {
 	// path) rather than the agent's traffic
 	CacheAwareSummarizerCacheReadTokens  int64 `json:"cache_aware_summarizer_cache_read_tokens"`
 	CacheAwareSummarizerCacheWriteTokens int64 `json:"cache_aware_summarizer_cache_write_tokens"`
+	// a PAID-FOR call whose raw reply was missing the closing </summary> tag the prompt asks for
+	// — the signature of a reply cut off mid-generation by the model's own token/thinking budget.
+	// Refused rather than committed, so a non-zero figure here is lost compaction, never a wrong
+	// checkpoint
+	CacheAwareSummarizerTruncated int64 `json:"cache_aware_summarizer_truncated"`
 
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
