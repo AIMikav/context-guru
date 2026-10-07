@@ -712,6 +712,7 @@ recovered via `context_guru_expand` / `GET /expand`.
 | `model.auth` | `x-api-key` | Anthropic only: `x-api-key` \| `bearer`. |
 | `marker_mode` | `full` | `full` (reversible) \| `summary` \| `off`. |
 | `cache_tail_only` | `false` | Restrict new reductions to the uncached tail. See the warning below. |
+| `keep_frozen_after_expand` | `false` | After the agent expands a reduced step, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 `CONTEXT_GURU_AGENTDIET_TIMEOUT` (default `90s`) bounds one reflection call; `/stats` reports
 `agentdiet_timeouts`, `agentdiet_errors` and `agentdiet_call_timeout_ms` beside it. A non-zero

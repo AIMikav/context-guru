@@ -130,6 +130,7 @@ cannot tell which marker":
 | `break_even` | `true` | Apply `S × T > 11.5 × W` with an estimated *T*. Ignored when the context window is unknown, like every other fraction-based threshold. |
 | `keep_head_chars` | 96 | Head-peek left inside the marker so the model knows what was cut without a blind `expand`. `0` for the opaque marker. |
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
+| `keep_frozen_after_expand` | `false` | After the agent expands a cut output, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ## What it deliberately does not do
 

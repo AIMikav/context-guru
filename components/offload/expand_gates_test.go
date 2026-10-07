@@ -176,6 +176,120 @@ func TestOnlyAnAbandonedEstablishedCompactionCountsAsAFlip(t *testing.T) {
 	})
 }
 
+// keepFrozenMaskFor builds a mask offloader with keep_frozen_after_expand turned on, so
+// these tests exercise the NEW path (#407) rather than the default-off one already covered
+// by TestOnlyAnAbandonedEstablishedCompactionCountsAsAFlip.
+func keepFrozenMaskFor(t *testing.T) *Mask {
+	t.Helper()
+	comp, err := newMask([]byte("keep_recent: 1\nmin_tokens: 5\nkeep_frozen_after_expand: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return comp.(*Mask)
+}
+
+// WITH keep_frozen_after_expand ON, AN EXPAND MUST NOT FLIP THE BYTES AT THEIR ORIGINAL
+// POSITION — that flip is the $0.615-for-300-tokens defect #407 reports (session e8f16627,
+// request 3556: cache_read 62,965, cache_write 239,967, because the flip happened deep
+// inside the provider's cached prefix and its ~20-block lookback could not re-anchor past
+// it). The fix keeps replaying the SAME frozen collapse after the expand instead of
+// reverting to the full original — this is the precondition every assertion below depends
+// on, so it is asserted FIRST and explicitly (see
+// ~/.claude/projects/-Users-davidamid-git-context-guru/memory/vacuous-evidence-routes.md on
+// why a passing test that never reached the branch under test proves nothing).
+func TestKeepFrozenAfterExpandKeepsBytesStableAcrossTurns(t *testing.T) {
+	body := strings.Repeat("verbose tool output line\n", 30)
+	st := store.NewMemory(store.Options{})
+	m := keepFrozenMaskFor(t)
+
+	// Turn 1, uncached tail: mask compacts and freezes a decision.
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{tool(body), tool("tail")}}
+	c := &components.Ctx{Session: "s", Store: st, CacheAware: true, MaxCachedIdx: -1}
+	var rep components.Report
+	if _, err := m.Offload(req, &rep, c); err != nil {
+		t.Fatal(err)
+	}
+	frozen := schema.MessageText(req.Input[0])
+	if frozen == body {
+		t.Fatal("turn 1 did not compact, so there is no established compaction for this test to protect")
+	}
+
+	// The agent expands it.
+	MarkKeptVerbatim(st, body)
+
+	before := ExpandPrefixFlips()
+	// Turn 2: the output is now inside the cached prefix. The old behaviour reverted it to
+	// `body` here; the fix must keep sending `frozen`.
+	req2 := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{tool(body), tool("tail")}}
+	c2 := &components.Ctx{Session: "s", Store: st, CacheAware: true, MaxCachedIdx: 0}
+	var rep2 components.Report
+	if _, err := m.Offload(req2, &rep2, c2); err != nil {
+		t.Fatal(err)
+	}
+	// PRECONDITION: reapplyFrozen's kept-verbatim+keep-frozen branch is the one that ran,
+	// not a path that happens to produce the same bytes by coincidence (e.g. a miss that
+	// left the message untouched). GateKeptVerbatim must still be visible — this content WAS
+	// expanded, and an operator watching that gate must still see it — but ExpandPrefixFlips
+	// (the counter that tracks the COST) must not move, because nothing flipped.
+	if rep2.Gates[GateKeptVerbatim] == 0 {
+		t.Fatalf("want %s gated for visibility even though nothing flipped; got %v",
+			GateKeptVerbatim, rep2.Gates)
+	}
+	if got := ExpandPrefixFlips() - before; got != 0 {
+		t.Fatalf("counted %d flips, want 0: keep_frozen_after_expand must not pay the cache-write "+
+			"it exists to avoid", got)
+	}
+	if got := schema.MessageText(req2.Input[0]); got != frozen {
+		t.Fatalf("turn 2 sent %q, want the SAME frozen bytes %q — a change here is exactly the "+
+			"byte flip inside the cached prefix that #407 reports costing $0.615 to restore ~300 tokens",
+			got, frozen)
+	}
+
+	// Turn 3: the same must hold a second time, so the stability is not a one-turn fluke
+	// (e.g. a decision that happens to still equal the input before drifting on the NEXT
+	// replay).
+	req3 := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{tool(body), tool("tail")}}
+	c3 := &components.Ctx{Session: "s", Store: st, CacheAware: true, MaxCachedIdx: 0}
+	var rep3 components.Report
+	if _, err := m.Offload(req3, &rep3, c3); err != nil {
+		t.Fatal(err)
+	}
+	if got := schema.MessageText(req3.Input[0]); got != frozen {
+		t.Fatalf("turn 3 sent %q, want the same frozen bytes %q as turn 2 — the byte at this index "+
+			"must stay fixed on every later turn, not just the first one after the expand", got, frozen)
+	}
+	if got := ExpandPrefixFlips() - before; got != 0 {
+		t.Fatalf("counted %d flips over two post-expand turns, want 0", got)
+	}
+}
+
+// A STORE THAT LOSES THE FREEZE MUST STILL FAIL OPEN TO TODAY'S BEHAVIOUR.
+//
+// keep_frozen_after_expand can only replay a decision that is still in the store. If the
+// freeze itself expired (TTL/pin cap) there is nothing left to replay byte-for-byte, so this
+// must fall back to the pre-#407 path (skipReduce declines a NEW compaction, the original
+// goes out in full) rather than silently drifting into some third behaviour.
+func TestKeepFrozenAfterExpandFailsOpenWhenTheFreezeIsLost(t *testing.T) {
+	body := strings.Repeat("verbose tool output line\n", 30)
+	st := store.NewMemory(store.Options{})
+	m := keepFrozenMaskFor(t)
+
+	MarkKeptVerbatim(st, body) // expanded, but this session never froze a decision for it
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{tool(body), tool("tail")}}
+	c := &components.Ctx{Session: "s", Store: st, CacheAware: true, MaxCachedIdx: 0}
+	var rep components.Report
+	if _, err := m.Offload(req, &rep, c); err != nil {
+		t.Fatal(err)
+	}
+	if got := schema.MessageText(req.Input[0]); got != body {
+		t.Fatalf("got %q, want the original %q: with no frozen decision to replay this must fail "+
+			"open to the original rather than invent a third behaviour", got, body)
+	}
+	if rep.Gates[GateKeptVerbatim] == 0 {
+		t.Fatalf("want %s gated even on the fail-open path; got %v", GateKeptVerbatim, rep.Gates)
+	}
+}
+
 // AND THE PROBE MUST NOT KEEP ALIVE WHAT IT ASKS ABOUT.
 //
 // store.Peek exists for this call site, but a store-side test cannot fail if this call site goes back

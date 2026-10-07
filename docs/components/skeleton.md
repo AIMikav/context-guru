@@ -300,6 +300,7 @@ worthless". Not worth building.
 | `min_tokens` | 80 | Minimum body size (per body) before it is skeletonized. |
 | `marker_mode` | `full` | **`full` is the only accepted value.** `summary`/`off` fail at config load — an unrecoverable code elision is not a mode we offer. |
 | `cold_cache` | `false` | Allow a new elision at any transcript depth on a turn whose prompt cache has provably expired. Off by default. |
+| `keep_frozen_after_expand` | `false` | After the agent expands an elided body, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ## When it's inert
 

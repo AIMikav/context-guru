@@ -51,15 +51,20 @@ func init() { components.Register("skeleton", newSkeleton) }
 // the file's EXTENSION (Read.file_path, or the operand of a cat/head/tail/sed/nl
 // command) rather than from a language token the dump does not carry.
 type Skeleton struct {
-	minTokens int
-	mode      markerMode
-	coldCache bool
+	minTokens             int
+	mode                  markerMode
+	coldCache             bool
+	keepFrozenAfterExpand bool
 }
 
 type skeletonConfig struct {
 	MinTokens  int    `yaml:"min_tokens"`
 	MarkerMode string `yaml:"marker_mode"` // full only (see newSkeleton)
 	ColdCache  bool   `yaml:"cold_cache"`
+	// KeepFrozenAfterExpand keeps replaying a frozen skeleton even after the agent expands
+	// it, instead of letting the body revert to its full form at depth. Off by default; see
+	// keepFrozenAfterExpandField and rossoctl/context-guru#407.
+	KeepFrozenAfterExpand bool `yaml:"keep_frozen_after_expand"`
 }
 
 func newSkeleton(raw []byte) (components.Component, error) {
@@ -79,7 +84,8 @@ func newSkeleton(raw []byte) (components.Component, error) {
 	if mode := parseMarkerMode(cfg.MarkerMode); mode != markerFull {
 		return nil, fmt.Errorf("skeleton: marker_mode %q is unrecoverable (elided code bodies could never be restored); only \"full\" is supported", cfg.MarkerMode)
 	}
-	return &Skeleton{minTokens: cfg.MinTokens, mode: markerFull, coldCache: cfg.ColdCache}, nil
+	return &Skeleton{minTokens: cfg.MinTokens, mode: markerFull, coldCache: cfg.ColdCache,
+		keepFrozenAfterExpand: cfg.KeepFrozenAfterExpand}, nil
 }
 
 func (Skeleton) Name() string                 { return "skeleton" }
@@ -148,7 +154,7 @@ func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Repo
 		// Replay a frozen decision at ANY depth: the agent re-sends the original every
 		// turn, so not re-eliding it would flip the message skeleton→full→skeleton and
 		// churn the provider's KV cache. Same contract as mask/failed_run/readlifecycle.
-		if fk, _, ok := reapplyFrozen(c, rep, s.Name(), m); ok {
+		if fk, _, ok := reapplyFrozen(c, rep, s.Name(), m, s.keepFrozenAfterExpand); ok {
 			emitted++
 			keys = append(keys, fk...)
 			continue
@@ -633,5 +639,6 @@ func init() {
 		{Key: "marker_mode", Type: components.FieldEnum, Default: "full", Options: []string{"full"},
 			Hint: "full only. summary and off leave no stash, which would make the one lossy component whose loss is dangerous permanently lossy."},
 		coldCacheFieldDefault(false), // not a pure function of (content, config): see coldCacheDefault
+		keepFrozenAfterExpandField(),
 	})
 }

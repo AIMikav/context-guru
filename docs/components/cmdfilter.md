@@ -384,6 +384,7 @@ a whole-blob loss points at the expand tool. See [the DSL engine](dsl.md#lossine
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 | `min_size` | `400` | Byte floor; smaller outputs are left alone. See [the size floor](#size-floor). |
 | `agent_filters` | `off` | `off` / `safe` / `lossy` — load the ledger-derived coding-agent filters. See [below](#the-coding-agent-filter-sets-agent_filters). |
+| `keep_frozen_after_expand` | `false` | After the agent expands a filtered output, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ## When it shines
 

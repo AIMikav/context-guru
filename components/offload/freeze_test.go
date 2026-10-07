@@ -143,10 +143,10 @@ func TestFrozenCountersMove(t *testing.T) {
 	c := &components.Ctx{Session: "sCount", Store: st}
 	msg := tool("some tool output")
 	var rep components.Report
-	reapplyFrozen(c, &rep, "mask", &msg) // miss: nothing frozen yet
+	reapplyFrozen(c, &rep, "mask", &msg, false) // miss: nothing frozen yet
 	freeze(c, "mask", "some tool output", "short")
 	msg2 := tool("some tool output")
-	reapplyFrozen(c, &rep, "mask", &msg2) // hit
+	reapplyFrozen(c, &rep, "mask", &msg2, false) // hit
 	h1, m1 := FrozenStats()
 	if h1 <= h0 || m1 <= m0 {
 		t.Fatalf("hits/misses must both advance: %d->%d, %d->%d", h0, h1, m0, m1)

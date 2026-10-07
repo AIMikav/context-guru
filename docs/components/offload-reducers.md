@@ -134,6 +134,7 @@ Lossy but reversible — superseded runs are stashed and recovered via `context_
 | `min_tokens` | 100 | Skip runs smaller than this token count. |
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 | `cold_cache` | `false` | On a turn whose prompt cache has **provably expired** (idle past the provider TTL), act at any depth instead of only in the uncached tail. Free when the cache really is gone — the whole transcript is re-billed anyway — and the decision is frozen so later warm turns replay it. Off by default because a *wrong* cold reading costs a cache-write of the whole suffix. See [Freeze / cold_cache](../design.md#the-one-turn-where-depth-is-free-cold_cache). |
+| `keep_frozen_after_expand` | `false` | After the agent expands this run's collapse, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ### When it shines
 
@@ -385,6 +386,7 @@ Lossy but reversible — masked outputs are stashed and recovered via `context_g
 | `keep_head_chars` | 96 | Characters of the hidden output left inside the marker as a one-line head-peek, so the model knows *what* was masked without a blind `expand` round trip — evidence showed a bare marker on a masked source-file read forces needless expands. Set `0` for the opaque marker (≈2pp more savings). |
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 | `cold_cache` | `false` | On a turn whose prompt cache has **provably expired** (idle past the provider TTL), act at any depth instead of only in the uncached tail. Free when the cache really is gone — the whole transcript is re-billed anyway — and the decision is frozen so later warm turns replay it. Off by default because a *wrong* cold reading costs a cache-write of the whole suffix. See [Freeze / cold_cache](../design.md#the-one-turn-where-depth-is-free-cold_cache). |
+| `keep_frozen_after_expand` | `false` | After the agent expands a masked output, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ### When it's inert
 
@@ -397,7 +399,7 @@ component. It now names one of these on every message it passes over, visible pe
 | `within_keep_recent` | the request holds no more tool outputs than `keep_recent`, so nothing is "older" |
 | `below_min_tokens` | the output is smaller than `min_tokens` |
 | `already_marked` | already offloaded by an earlier component — benign, that content is compacted already |
-| `kept_verbatim_after_expand` | the agent expanded this content, so it must not be re-compacted. The first turn this appears is the turn the message reverts to its full form inside the cached prefix — counted as `expand_prefix_flips`. |
+| `kept_verbatim_after_expand` | the agent expanded this content, so it must not be re-compacted. With `keep_frozen_after_expand` off (the default) the first turn this appears is the turn the message reverts to its full form inside the cached prefix — counted as `expand_prefix_flips`. With it on, the SAME frozen bytes keep being replayed and `expand_prefix_flips` never counts this content; see [#407](https://github.com/rossoctl/context-guru/issues/407). |
 | `cached_prefix` | the output is inside the provider's cached prefix, where a new mask would flip already-cached content and force a cache-write of the suffix. This is the gate `cold_cache` lifts on a provably-expired cache |
 | `non_text_blocks` | a text rewrite would drop the message's non-text blocks |
 | `marker_no_win` | marker + head-peek would not be smaller than the output itself |
@@ -496,6 +498,7 @@ Lossy but reversible — the full original is stashed and recovered via `context
 | `max_frac` | 0 (off) | Threshold as a **fraction of the model's context window**. When the window is known this wins over `max_tokens`. |
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 | `cold_cache` | `false` | On a turn whose prompt cache has **provably expired** (idle past the provider TTL), act at any depth instead of only in the uncached tail. Free when the cache really is gone — the whole transcript is re-billed anyway — and the decision is frozen so later warm turns replay it. Off by default because a *wrong* cold reading costs a cache-write of the whole suffix. See [Freeze / cold_cache](../design.md#the-one-turn-where-depth-is-free-cold_cache). |
+| `keep_frozen_after_expand` | `false` | After the agent expands a collapsed output, keep replaying the SAME frozen bytes at this message's original position instead of reverting it to the full original there — a flip that changes bytes deep inside the provider's cached prefix and forces a cache-write of the whole suffix (measured: $0.615 to restore ~300 tokens, [#407](https://github.com/rossoctl/context-guru/issues/407)). The agent still gets the content back, from the expand tool's own answer at the fixed point right after the turn that asked. Off by default until measured on real traffic. |
 
 ### When it shines
 
@@ -692,6 +695,7 @@ components:
     stale_at_depth: false      # offload a stale Read inside the cached prefix (net negative — above)
     cold_cache: false          # act at any depth on a turn idle past the provider cache TTL
     marker_mode: full          # full | summary | off
+    keep_frozen_after_expand: false  # keep replaying a frozen offload after an expand (#407)
 ```
 
 Gate reasons on `/stats`: `no_file_reads`, `fresh_read`, `non_text_blocks`,
