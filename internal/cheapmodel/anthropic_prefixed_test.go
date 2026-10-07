@@ -76,9 +76,9 @@ func TestCompletePrefixedRaisesMaxTokensAboveTheThinkingBudget(t *testing.T) {
 // the MODEL's own output cap -- a new 400 with a different message ("max_tokens: 79999 > 64000,
 // which is the maximum allowed number of output tokens") in place of the one this fix exists to
 // avoid. Claude Code with CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 and MAX_THINKING_TOKENS=63999 on
-// claude-haiku-4-5 is exactly this shape; measured live, max_tokens: 64000 (the body's own,
-// already-proven-valid value) succeeded where 79999 did not. See thinkingAdjustedMaxTokens's doc
-// comment for the full trade-off this ceiling accepts.
+// claude-haiku-4-5 is exactly this shape; 64000 is the value the provider accepted on the agent's
+// own seed call for this exact model and request, which is why it is the fallback ceiling. See
+// thinkingAdjustedMaxTokens's doc comment for the full trade-off this ceiling accepts.
 func TestCompletePrefixedCapsAtTheBodysOwnMaxTokensWhenWantWouldExceedTheModelsCap(t *testing.T) {
 	var got []byte
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -166,75 +166,63 @@ func TestCompletePrefixedLeavesNoThinkingUnaffected(t *testing.T) {
 	}
 }
 
-// A TRUNCATED REPLY MUST FAIL, NOT PARSE AS "NOTHING WAS SPENT". On the ceiling branch above, the
-// reply allowance can shrink to almost nothing, so the model can still run out of room — the
-// provider reports stop_reason: "max_tokens" rather than a 400. CompletePrefixed must turn that
-// into an error so the caller takes its normal failure path (sweep_ask_failed, the WARN added in
-// #401, fallback-or-decline) instead of reading a clipped JSON array as a clean verdict.
-func TestCompletePrefixedFailsOnATruncatedReply(t *testing.T) {
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[{\"i\":0"}],`+
-			`"stop_reason":"max_tokens","usage":{"input_tokens":40,"output_tokens":16000}}`)
-	}))
-	defer up.Close()
-
-	prefixBody := []byte(`{"model":"claude-haiku-4-5","max_tokens":32000,` +
-		`"thinking":{"type":"enabled","budget_tokens":31999},` +
-		`"messages":[{"role":"user","content":"carry on"}]}`)
-	cli := Anthropic{BaseURL: up.URL, Model: "claude-haiku-4-5"}
-	reply, usage, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge")
-	if err == nil {
-		t.Fatalf("a stop_reason=max_tokens reply was accepted as a verdict: reply=%q", reply)
-	}
-	if reply != "" {
-		t.Fatalf("a failed call returned reply text anyway: %q", reply)
-	}
-	// Usage is still billed: the tokens were spent whether or not the reply was usable.
-	if usage.Output != 16000 {
-		t.Fatalf("usage.Output = %d, want 16000 (truncation does not mean free)", usage.Output)
-	}
-}
+// A TRUNCATED REPLY IS NOT TURNED INTO AN ERROR HERE. On the ceiling branch above, the reply
+// allowance can shrink to almost nothing, so the model can still come back cut off
+// (stop_reason: "max_tokens"). CompletePrefixed used to turn that into an error; it no longer
+// does, because the caller (extract_sweep.go) already detects a cut-off reply itself for free --
+// it fails extract.ParseVerdicts, which reports ReplyWasTruncated=true, and the sweep declines
+// under sweep_reply_truncated with no extra call. Turning it into an error here instead routed it
+// through sweep_ask_failed, which runs a second, full-price fallback by default -- a cost
+// regression caught in review. This is pinned at the CompletePrefixed level in
+// TestCompletePrefixedCapsAtTheBodysOwnMaxTokensWhenWantWouldExceedTheModelsCap, which does not
+// assert an error on its (non-truncated) reply; a dedicated truncated-reply test was removed with
+// this revert, since asserting "no special-case error" would just restate the absence of code.
 
 // thinkingAdjustedMaxTokens unit-level: pins the arithmetic directly, independent of the HTTP
 // plumbing above.
 func TestThinkingAdjustedMaxTokens(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		body string
-		want int
+		name       string
+		body       string
+		want       int
+		wantCapped bool
 	}{
 		{"enabled with a large budget, no orig max_tokens on the body",
-			`{"thinking":{"type":"enabled","budget_tokens":31999}}`, 31999 + PrefixAskMaxTokens},
+			`{"thinking":{"type":"enabled","budget_tokens":31999}}`, 31999 + PrefixAskMaxTokens, false},
 		{"enabled with a small budget", `{"thinking":{"type":"enabled","budget_tokens":10}}`,
-			10 + PrefixAskMaxTokens},
-		{"adaptive", `{"thinking":{"type":"adaptive"}}`, PrefixAskMaxTokens},
-		{"disabled", `{"thinking":{"type":"disabled"}}`, PrefixAskMaxTokens},
-		{"absent", `{}`, PrefixAskMaxTokens},
+			10 + PrefixAskMaxTokens, false},
+		{"adaptive", `{"thinking":{"type":"adaptive"}}`, PrefixAskMaxTokens, false},
+		{"disabled", `{"thinking":{"type":"disabled"}}`, PrefixAskMaxTokens, false},
+		{"absent", `{}`, PrefixAskMaxTokens, false},
 		// Reviewer's minor note: "enabled" with budget_tokens missing is 0 + reply. The API would
 		// reject such a body anyway (thinking.enabled requires a budget), so this is not a shape
 		// CompletePrefixed must defend against — just pinned so the fall-through reads as a
 		// choice, not an oversight.
-		{"enabled with budget_tokens missing", `{"thinking":{"type":"enabled"}}`, PrefixAskMaxTokens},
+		{"enabled with budget_tokens missing", `{"thinking":{"type":"enabled"}}`, PrefixAskMaxTokens, false},
 		// The reviewer's live-measured 64000/63999 shape: the raw want (63999+16000=79999)
-		// exceeds the model's cap, so the body's own max_tokens (64000, already proven valid for
-		// this exact request) is used instead.
+		// exceeds the model's cap, so the body's own max_tokens (64000, the value the provider
+		// accepted on the agent's own seed call for this exact request) is used instead.
 		{"orig max_tokens caps a want that would exceed the model's output limit",
-			`{"thinking":{"type":"enabled","budget_tokens":63999},"max_tokens":64000}`, 64000},
+			`{"thinking":{"type":"enabled","budget_tokens":63999},"max_tokens":64000}`, 64000, true},
 		// orig == budget is NOT a valid ceiling (it would equal the budget, violating the
 		// provider's strict ">" requirement), so the strict "orig > budget" guard must reject it
 		// and fall through to the computed want.
 		{"orig max_tokens equal to the budget is not used as a ceiling",
 			`{"thinking":{"type":"enabled","budget_tokens":31999},"max_tokens":31999}`,
-			31999 + PrefixAskMaxTokens},
+			31999 + PrefixAskMaxTokens, false},
 		// orig below the computed want but ALSO below the budget: not a valid ceiling either
 		// (an orig that doesn't even clear the budget proves nothing), so it must not be used.
 		{"orig max_tokens below the budget is not used as a ceiling",
 			`{"thinking":{"type":"enabled","budget_tokens":31999},"max_tokens":100}`,
-			31999 + PrefixAskMaxTokens},
+			31999 + PrefixAskMaxTokens, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := thinkingAdjustedMaxTokens([]byte(tc.body), PrefixAskMaxTokens); got != tc.want {
+			got, capped := thinkingAdjustedMaxTokens([]byte(tc.body), PrefixAskMaxTokens)
+			if got != tc.want {
 				t.Errorf("thinkingAdjustedMaxTokens = %d, want %d", got, tc.want)
+			}
+			if capped != tc.wantCapped {
+				t.Errorf("capped = %v, want %v", capped, tc.wantCapped)
 			}
 		})
 	}

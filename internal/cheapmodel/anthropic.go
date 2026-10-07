@@ -19,6 +19,7 @@ import (
 
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/internal/adjudicate"
+	"github.com/rossoctl/context-guru/internal/logging"
 )
 
 // Anthropic calls a small Anthropic model with a single user prompt and returns the
@@ -268,7 +269,13 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 	if maxTok == 0 {
 		maxTok = PrefixAskMaxTokens
 	}
-	maxTok = thinkingAdjustedMaxTokens(body, maxTok)
+	var capped bool
+	maxTok, capped = thinkingAdjustedMaxTokens(body, maxTok)
+	if capped {
+		// Signal only -- never a failure path. See thinkingAdjustedMaxTokens's doc comment for
+		// the trade-off this branch accepts (a smaller reply allowance than usual).
+		logging.From(ctx).Debug("cg.cheapmodel.prefixed_ceiling_applied", "model", a.Model, "max_tokens", maxTok)
+	}
 	if body, err = sjson.SetBytes(body, "max_tokens", maxTok); err != nil {
 		return "", u, err
 	}
@@ -311,8 +318,7 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content"`
-		StopReason string `json:"stop_reason"`
-		Usage      struct {
+		Usage struct {
 			InputTokens      int `json:"input_tokens"`
 			OutputTokens     int `json:"output_tokens"`
 			CacheCreationTok int `json:"cache_creation_input_tokens"`
@@ -326,16 +332,20 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 		Fresh: out.Usage.InputTokens, Output: out.Usage.OutputTokens}
 	recordUsageCache(ctx, a.Model, out.Usage.InputTokens, out.Usage.OutputTokens,
 		out.Usage.CacheCreationTok, out.Usage.CacheReadTok)
-	// A TRUNCATED REPLY IS NOT A VERDICT. thinkingAdjustedMaxTokens's ceiling can leave the reply
-	// only the tokens thinking did not spend, so a budget-heavy turn can still run out of room —
-	// the provider reports it as stop_reason: "max_tokens" rather than a 400. Returning the clipped
-	// text would hand the caller a cut-off JSON array that may parse as "nothing was spent" purely
-	// because the closing bracket never arrived. Fail the call instead: the usage above is still
-	// billed (the tokens were spent either way), but the caller takes the same sweep_ask_failed /
-	// WARN / fallback-or-decline path as any other prefix-ask failure (see extract_sweep.go).
-	if out.StopReason == "max_tokens" {
-		return "", u, fmt.Errorf("cheapmodel: prefixed reply truncated (stop_reason: max_tokens)")
-	}
+	// A TRUNCATED REPLY IS NOT RETURNED AS AN ERROR HERE, on purpose. thinkingAdjustedMaxTokens's
+	// ceiling can leave the reply only the tokens thinking did not spend, so a budget-heavy turn
+	// can still run out of room and come back cut off. That used to be turned into an error in
+	// this method (stop_reason: "max_tokens" -> error), which looked right but cost more: the
+	// caller (extract_sweep.go) already detects a cut-off reply itself -- it fails to parse as a
+	// verdict, extract.ParseVerdicts reports ok=false, ReplyWasTruncated=true, and the sweep
+	// declines for FREE under the sweep_reply_truncated gate. Turning it into an error here
+	// instead routes it through sweep_ask_failed, which by default runs a second, full-price
+	// fallback call with the outputs copied into the prompt -- on every truncated ask, not only
+	// the ceiling case; this component's own history notes cut-off replies were once 70% of
+	// calls. It also hides sweep_reply_truncated, the counter that distinguishes "raise the
+	// budget" from "fix the prompt", behind a reading that looks like a transport failure. So the
+	// clipped text is returned as a normal reply, same as before thinkingAdjustedMaxTokens: the
+	// cost of a truncation is left where it already was, as a free decline.
 	// OUR TOOL'S INPUT BEATS TEXT. When the prefix advertises the structured-answer tool the model uses
 	// it of its own accord, and the input arrives already schema-shaped — which removes three failure
 	// modes the text path had: prose instead of JSON, verdicts for only part of the batch, and an array
@@ -403,14 +413,19 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 // `adaptive` thinking carries no budget_tokens and is passed through unchanged, as is anything else
 // (disabled, or no thinking block at all): only "enabled" ties max_tokens to a number this call does
 // not otherwise know.
-func thinkingAdjustedMaxTokens(body []byte, reply int) int {
+//
+// `capped` reports whether the fallback branch fired, purely as a SIGNAL for the caller to log --
+// it carries no failure of its own and must never be read as one. See the caller for why: the
+// smaller reply allowance this branch accepts is already counted elsewhere (sweep_reply_truncated)
+// when it actually costs something.
+func thinkingAdjustedMaxTokens(body []byte, reply int) (want int, capped bool) {
 	if gjson.GetBytes(body, "thinking.type").String() != "enabled" {
-		return reply
+		return reply, false
 	}
 	budget := int(gjson.GetBytes(body, "thinking.budget_tokens").Int())
-	want := budget + reply
+	want = budget + reply
 	if orig := int(gjson.GetBytes(body, "max_tokens").Int()); orig > budget && orig < want {
-		return orig
+		return orig, true
 	}
-	return want
+	return want, false
 }
