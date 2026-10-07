@@ -154,6 +154,13 @@ const dashTimeoutMsg = "dashboard query timed out; try again in a moment"
 type jsonCache struct {
 	mu      sync.Mutex
 	entries map[string]jsonCacheEntry
+	// refreshing marks a key with a background refresh already running, so load() can keep
+	// serving its (otherwise too old) body instead of declaring it absent, and serveJSON can
+	// avoid starting a second refresh alongside one already in flight. Without this, every
+	// stale reader spawned its OWN goroutine running the exact same compute concurrently — see
+	// serveJSON — which is both wasted work and the thing that was turning an isolated ~1s query
+	// into a 40s one under real concurrent load.
+	refreshing map[string]bool
 }
 
 type jsonCacheEntry struct {
@@ -175,8 +182,12 @@ func (c *jsonCache) get(key string) ([]byte, bool) {
 // stale-while-revalidate needs: the difference between "no body" and "a body worth serving while a
 // better one is computed" is the difference between a reader waiting six seconds and not waiting.
 //
-// A body past dashCacheTTL+dashCacheStale is reported as absent, so the staleness cap is enforced
-// here rather than trusted to each caller.
+// A body past dashCacheTTL+dashCacheStale is reported as absent, UNLESS a refresh for this key is
+// already running — in which case the alternative to this stale body is not a fresher one, it is
+// blocking the caller on a brand-new compute while the one already running finishes anyway. A
+// refresh that hangs is still bounded: refreshJSON's own context has dashComputeTimeout, and
+// endRefresh runs (via defer) the moment it returns either way, so this cannot serve a body
+// forever — only up to dashCacheTTL+dashCacheStale+dashComputeTimeout past when it was written.
 func (c *jsonCache) load(key string) (body []byte, fresh bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -185,10 +196,32 @@ func (c *jsonCache) load(key string) (body []byte, fresh bool) {
 		return nil, false
 	}
 	age := time.Since(e.at)
-	if age >= dashCacheTTL+dashCacheStale {
+	if age >= dashCacheTTL+dashCacheStale && !c.refreshing[key] {
 		return nil, false
 	}
 	return e.body, age < dashCacheTTL
+}
+
+// beginRefresh claims the right to refresh key, returning false if another refresh for it is
+// already running. Paired with endRefresh (always via defer), so a panic inside compute still
+// releases the claim rather than wedging the key in "refreshing" forever.
+func (c *jsonCache) beginRefresh(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refreshing == nil {
+		c.refreshing = make(map[string]bool)
+	}
+	if c.refreshing[key] {
+		return false
+	}
+	c.refreshing[key] = true
+	return true
+}
+
+func (c *jsonCache) endRefresh(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.refreshing, key)
 }
 
 func (c *jsonCache) set(key string, body []byte) {
@@ -237,10 +270,15 @@ func writeCachedJSON(w http.ResponseWriter, body []byte, state string) {
 // Three cases, and only the third is allowed to cost the reader anything:
 //
 //   - FRESH: serve it. X-Cache: hit.
-//   - STALE but inside dashCacheStale: serve it immediately and compute the replacement behind the
-//     response. X-Cache: stale. This is the case that was missing, and it is the common one — with
-//     a TTL shorter than the query, essentially every request landed here and was treated as cold.
-//   - COLD: compute, and collapse every concurrent request for the same key onto ONE computation.
+//   - STALE, including past dashCacheStale while a refresh is already running: serve the body
+//     immediately, X-Cache: stale, and start (at most) ONE refresh behind the response —
+//     jsonCache.beginRefresh gates it, so a second concurrent stale reader for the same key joins
+//     the refresh already in flight instead of starting its own. This is the case that was
+//     missing, and it is the common one — with a TTL shorter than the query, essentially every
+//     request landed here and was treated as cold, and before the refresh gate each one of them
+//     ALSO started its own duplicate background compute.
+//   - COLD (no entry at all, or one old enough that nothing is even refreshing it): compute, and
+//     collapse every concurrent request for the same key onto ONE computation.
 //     Without collapsing, N readers arriving together each ran the whole query; they then contended
 //     for the same pool and every one of them got slower, so the busiest moment was the slowest —
 //     the shape that turns a 6s query into a 10s timeout.
@@ -256,7 +294,16 @@ func (a *API) serveJSON(w http.ResponseWriter, r *http.Request, c *jsonCache, ke
 			writeCachedJSON(w, body, "hit")
 			return
 		}
-		go a.refreshJSON(c, key, compute)
+		// Only the first stale reader for this key starts a refresh; every other concurrent
+		// stale reader (and every reader arriving after the TTL+stale cap, now that load() keeps
+		// serving this body while refreshing[key] is true) just gets the same body. Before this
+		// gate, every stale read spawned its OWN goroutine running the full compute, so N
+		// concurrent stale readers meant N concurrent recomputes contending for the same SQLite
+		// connection pool at once — see dashCacheStale's own comment for why that shape turns a
+		// query that is fast in isolation into one that times out under real traffic.
+		if c.beginRefresh(key) {
+			go a.refreshJSON(c, key, compute)
+		}
 		writeCachedJSON(w, body, "stale")
 		return
 	}
@@ -296,6 +343,10 @@ func (a *API) serveJSON(w http.ResponseWriter, r *http.Request, c *jsonCache, ke
 // is generous rather than dashHandlerTimeout because nobody is waiting — the only thing that must
 // not happen is a refresh living forever and holding a connection.
 func (a *API) refreshJSON(c *jsonCache, key string, compute func(db *DB) ([]byte, error)) {
+	// Released unconditionally, including on a panic recovered elsewhere up the goroutine's
+	// call stack: a key wedged "refreshing" forever would mean load() keeps serving an
+	// ever-staler body past the TTL+stale cap with nothing ever refreshing it again.
+	defer c.endRefresh(key)
 	ctx, cancel := context.WithTimeout(context.Background(), dashComputeTimeout)
 	defer cancel()
 	body, err := compute(a.rec.DB().WithContext(ctx))
@@ -1032,10 +1083,83 @@ func atoiDefault(s string, def int) int {
 	return n
 }
 
+// statsLean reports whether ?lean=1 was passed — see the stats handler's lean branch below.
+func statsLean(r *http.Request) bool {
+	return r.URL.Query().Get("lean") == "1"
+}
+
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	f, p, ok := a.scope(r)
 	if !ok {
 		a.unauthorized(w)
+		return
+	}
+	if statsLean(r) {
+		// ?lean=1 answers every field the status line's _fetch_stats actually reads
+		// (context-guru-plugin/scripts/statusline.py: total_saved_usd, saved_unique,
+		// cg_latency_ms_avg, upstream_ms_avg, keepalive_net_usd, keepalive_misses_avoided) at
+		// FULL precision, not an approximation — see the review of PR #403 for why this needs
+		// saying plainly rather than as "slightly conservative". The full handler below runs
+		// four things: Overview, CachesplitHistoricalUSD, TierCosts and DeclCreditFor.
+		// DeclCreditFor is two halves (dash/declcredit.go): FilterUSD, a single filtered SQL
+		// query exactly like CachesplitHistoricalUSD, folds into TotalSavedUSD; SelfUSD, which
+		// needs SelfRemovals' full-tenant scan over tool_declarations (dash/toolapi.go,
+		// IGNORING the session filter by design — self-removal is a cross-session signal),
+		// folds ONLY into TotalReducedUSD, a field this response never carries. So the one
+		// expensive call among the four (SelfRemovals) contributes NOTHING to total_saved_usd,
+		// and can be skipped here with no loss: this path runs Overview, CachesplitHistoricalUSD
+		// and DeclFilterSavings (the measured half only, bypassing DeclCreditFor's call into
+		// SelfRemovals entirely) and adds their USD into TotalSavedUSD exactly as the full
+		// handler does. TierCosts is skipped because nothing here reads it, not because it is
+		// expensive — measured at low single-digit milliseconds, same ballpark as the other two.
+		a.serveJSON(w, r, &a.statsCache, cacheKey(p, r), func(db *DB) ([]byte, error) {
+			var (
+				o              *Overview
+				overviewErr    error
+				cachesplitHist *CachesplitHistorical
+				filterSaving   *DeclFilterSaving
+			)
+			var g errgroup.Group
+			g.Go(func() error {
+				o, overviewErr = db.Overview(f)
+				return nil // see the full handler below for why this is never folded in here
+			})
+			if a.pricer != nil {
+				g.Go(func() error {
+					if h, err := db.CachesplitHistoricalUSD(f, a.pricer); err == nil {
+						cachesplitHist = &h
+					}
+					return nil
+				})
+				g.Go(func() error {
+					if fs, err := db.DeclFilterSavings(f, a.priceFn(r)); err == nil {
+						filterSaving = fs
+					} else {
+						slog.Warn("dash: lean declaration-filter credit unavailable", "err", err)
+					}
+					return nil
+				})
+			}
+			g.Wait() //nolint:errcheck // every goroutine above always returns nil
+			if overviewErr != nil {
+				return nil, overviewErr
+			}
+			if cachesplitHist != nil {
+				o.CachesplitHistorical = cachesplitHist
+				o.TotalSavedUSD += cachesplitHist.USD
+			}
+			if filterSaving != nil {
+				// Unconditional on filterSaving.Priced, matching SetDeclCredit (dash/overview.go)
+				// exactly: Priced is false when ANY ONE request in scope used an unpriced model,
+				// but USD is still the priced SUBSET's real dollar figure, not a fabricated one —
+				// see DeclFilterSaving's own comment. Gating on Priced here (as an earlier version
+				// of this branch did) silently dropped the WHOLE credit over one unpriced model
+				// anywhere in scope, which SetDeclCredit never does and lean must not either.
+				o.TotalSavedUSD += filterSaving.USD
+			}
+			o.Waterfall = o.waterfall()
+			return json.Marshal(o)
+		})
 		return
 	}
 	a.serveJSON(w, r, &a.statsCache, cacheKey(p, r), func(db *DB) ([]byte, error) {

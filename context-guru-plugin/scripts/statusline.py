@@ -24,6 +24,17 @@ follow from that, and both are enforced structurally rather than by discipline:
   therefore the sum of the two bounds, a couple of seconds — not unbounded. Every exit is 0; on
   any error this prints whatever partial line it already has, or nothing.
 
+`cg!` means UNREACHABLE, specifically — refused, DNS failure, anything that is not "answered, just
+not within 0.6s". A proxy that is merely slow (its own aggregate endpoint can legitimately take
+some time under load, especially behind many concurrent readers — see dash/api.go's jsonCache)
+renders the last good cached numbers with a small stale marker instead, or, with no cache yet to
+fall back on, a short "stats loading…"; if a cache DOES exist but has gone stale enough that
+every fetch since has still timed out, "cg? not responding" instead — reachable, unlike `cg!`,
+but no longer plausibly just slow either. See _fetch_stats and its STATS_* result codes for all
+four. This used to not be true: EVERY URLError/OSError, including a plain `TimeoutError`,
+rendered `cg!`, so a slow-but-healthy proxy looked exactly like a dead one on every render until
+the aggregate happened to answer in under 0.6s.
+
 Self-gating: exactly like the SessionStart/UserPromptSubmit hooks, this does nothing in a project
 that is not routed through OUR proxy. The gate is settings.resolve_routed_port, which every port
 consumer in this plugin now shares: it reads the port off $ANTHROPIC_BASE_URL — the env block that
@@ -44,6 +55,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sys
 import tempfile
 import time
@@ -64,6 +76,16 @@ HTTP_TIMEOUT_SECONDS = 0.6
 # can re-render on every token during a stream, and this is what stops that from becoming a
 # request-per-render storm against the proxy.
 STATS_CACHE_TTL_SECONDS = 2.0
+
+# How long a cached response may still be shown, marked stale, when a fresh fetch TIMES OUT rather
+# than being refused outright. The proxy's own aggregate endpoint can legitimately take tens of
+# seconds under load (dash/api.go's jsonCache serves a stale body itself while it recomputes, but a
+# reader can still arrive in the gap before that recompute lands) — that is a slow proxy, not a
+# down one, and showing the last real numbers with a small marker is strictly more honest than
+# either blocking this render or claiming the proxy is unreachable. Ten minutes is generous
+# relative to STATS_CACHE_TTL_SECONDS precisely because it is the FALLBACK for the case the fast
+# path failed to refresh in time, not the normal path.
+STALE_STATS_MAX_AGE_SECONDS = 600
 
 # There is deliberately NO default port constant here any more. A statusLine command is not a hook,
 # so CLAUDE_PLUGIN_OPTION_PORT never reaches it, which made a "fallback" of 8787 the answer on every
@@ -344,43 +366,121 @@ def _stats_cache_path(port: str, session_id: str | None) -> str:
     return os.path.join(tempfile.gettempdir(), f"context-guru-statusline-{port}{suffix}.json")
 
 
-def _fetch_stats(port: str, session_id: str | None) -> tuple[dict | None, bool]:
-    """Returns (stats, proxy_down). stats is None when unavailable for any reason; proxy_down is
-    True only when the proxy could not be reached at all (vs. answered but had nothing useful —
-    e.g. the dashboard flag is off, or sent something this script cannot parse).
+# _fetch_stats' second return value. "down" is the only one that should ever render `cg!` — see
+# the module docstring. The other three all mean "the proxy answered, or at least exists", just
+# with varying amounts of fresh data behind the answer.
+STATS_OK = "ok"  # a fresh fetch landed, or a within-TTL cache hit answered without a fetch at all
+STATS_TIMEOUT = "timeout"  # urlopen's own clock ran out; the proxy is probably just slow right now
+STATS_HUNG = "hung"  # timing out AND it has been going on long enough that "just slow" has
+# stopped being the likely explanation — see STALE_STATS_MAX_AGE_SECONDS below. Distinguished
+# from STATS_TIMEOUT (which still renders "stats loading…", the right read for "nothing heard
+# yet, could be starting up") only by there having been a WORKING cache before: this fires once
+# that cache is older than this script would ever serve it, and every fetch since has still
+# timed out rather than coming back refused or answering.
+STATS_DOWN = "down"  # refused, DNS failure, or anything else that means NOT REACHABLE
+STATS_EMPTY = "empty"  # reached the proxy; it had nothing usable (dashboard off, bad payload)
+
+
+def _timeout_result(cached: dict | None, cached_age: float | None) -> tuple[dict | None, str]:
+    """What a timed-out fetch should return, given whatever was cached before it. Shared by both
+    of _fetch_stats' timeout sites (the direct socket.timeout/TimeoutError and the one URLError
+    wraps around a connect-phase timeout) so the two can never answer this differently.
+
+    Three outcomes:
+    * No cache at all (a fresh install, or right after a restart): STATS_TIMEOUT, stats None —
+      "stats loading…". Nothing heard from the proxy yet is not evidence it is wedged.
+    * A cache that is still within STALE_STATS_MAX_AGE_SECONDS: STATS_TIMEOUT, stats the cached
+      body — the proxy answered recently enough that "merely slow right now" is still the better
+      read, so those numbers are served with a stale marker rather than withheld.
+    * A cache older than that, with the fetch that would have refreshed it STILL timing out:
+      STATS_HUNG, stats None. There WAS a working proxy, and every attempt to reach it since has
+      timed out rather than coming back refused or answered — long enough that "slow" has
+      stopped being the likely explanation. Distinct from STATS_TIMEOUT's wording on purpose:
+      "loading…" reads as transient and about to resolve itself; this does not pretend that.
+    """
+    if cached is None:
+        return None, STATS_TIMEOUT
+    if cached_age is not None and cached_age < STALE_STATS_MAX_AGE_SECONDS:
+        return cached, STATS_TIMEOUT
+    return None, STATS_HUNG
+
+
+def _fetch_stats(port: str, session_id: str | None) -> tuple[dict | None, str]:
+    """Returns (stats, status) — see STATS_OK / STATS_TIMEOUT / STATS_HUNG / STATS_DOWN /
+    STATS_EMPTY above. stats is None except on STATS_OK, and on STATS_TIMEOUT when a
+    recent-enough cached body from a PAST successful fetch exists (see
+    STALE_STATS_MAX_AGE_SECONDS) — a timeout means this particular render did not get fresh
+    numbers, not that no numbers exist.
 
     Scoped to `session_id` (the dashboard's existing `?session=` filter, dash/query.go's
     Filter.Session — nothing new added to the proxy) so the savings figure returned pairs with
     THIS session's own cost/tokens rather than the proxy's whole retained window, which is what
     /api/stats reports unscoped and is process-wide across every project routed through this
     proxy — see _default_segment for why mixing the two would be dishonest.
+
+    `lean=1` asks the proxy to answer from its cheap path (dash/api.go's statsLean): every field
+    this script reads, at full precision, without running the one call among /api/stats' four
+    (DeclCreditFor's SelfRemovals, dash/toolapi.go) that does a full scan over tool_declarations
+    for the WHOLE tenant regardless of the session filter — the rest are comparably cheap and are
+    skipped only because this script does not read what they add. SelfRemovals was NOT the actual
+    cause of the 38-45s timeouts this function recovers from, though: on a copy of the affected
+    deployment's dashboard DB, every one of those four calls measured well under a second run in
+    isolation. The real cause was dash/api.go's jsonCache spawning a brand-new goroutine running
+    the FULL /api/stats compute on every single stale-cache read with no deduplication, so under
+    real concurrent traffic many duplicate recomputes queued behind one SQLite connection pool at
+    once — fixed on the proxy side by jsonCache.beginRefresh/endRefresh, which this script has no
+    visibility into or control over. `lean=1` is therefore a reduction in how much work piles up
+    behind that fix, not a workaround for it; it is not a substitute for the proxy-side fix.
     """
     cache_path = _stats_cache_path(port, session_id)
+    cached, cached_age = None, None
     try:
         st = os.stat(cache_path)
-        if time.time() - st.st_mtime < STATS_CACHE_TTL_SECONDS:
-            with open(cache_path, encoding="utf-8") as fh:
-                return json.load(fh), False
+        cached_age = time.time() - st.st_mtime
+        with open(cache_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached_age < STATS_CACHE_TTL_SECONDS:
+            return cached, STATS_OK
     except (OSError, ValueError):
-        pass  # no usable cache; fetch for real
+        cached, cached_age = None, None  # no usable cache; fetch for real
 
-    url = f"http://127.0.0.1:{port}/api/stats"
+    url = f"http://127.0.0.1:{port}/api/stats?lean=1"
     if session_id:
-        url += "?session=" + urllib.parse.quote(session_id, safe="")
+        url += "&session=" + urllib.parse.quote(session_id, safe="")
     try:
         with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as resp:
             body = resp.read(1 << 20)  # bounded: the real payload is a few KB
+    except (socket.timeout, TimeoutError):
+        # Caught ahead of the OSError branch below ON PURPOSE: both of these ARE OSErrors
+        # (TimeoutError always; socket.timeout too, pre-3.10, where it is a distinct subclass
+        # rather than TimeoutError itself — Python 3.10+ makes them literally the same object,
+        # but this script has to run under whatever python3 the user has), so without this
+        # clause first every slow-but-healthy proxy read the same as a dead one. This was
+        # measured for real: a diagnostic capture on a live proxy showed ~10 of these in 10
+        # minutes, every one a timeout at exactly HTTP_TIMEOUT_SECONDS with the proxy otherwise
+        # healthy, no connection ever refused. This is the READ-phase timeout — urlopen raises it
+        # directly once the connection succeeded but no response arrived in time.
+        return _timeout_result(cached, cached_age)
     except urllib.error.HTTPError:
-        return None, False  # reached the proxy; it just has nothing (e.g. --dashboard is off)
-    except (urllib.error.URLError, OSError):
-        return None, True  # refused, timed out, or otherwise unreachable: the proxy is down
+        return None, STATS_EMPTY  # reached the proxy; it just has nothing (e.g. --dashboard is off)
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (socket.timeout, TimeoutError)):
+            # The CONNECT-phase timeout: urlopen wraps it in a URLError instead of raising it
+            # directly (unlike the read-phase case above), so it has to be unwrapped here rather
+            # than caught by the clause above — same meaning either way, the clock ran out, not a
+            # refusal. Rare on loopback (a refused connect fails instantly), but a saturated
+            # accept queue on a healthy-but-overloaded proxy can produce exactly this.
+            return _timeout_result(cached, cached_age)
+        return None, STATS_DOWN  # refused, DNS failure, or anything else NOT a timeout
+    except OSError:
+        return None, STATS_DOWN  # anything else unreachable: the proxy really is down
 
     try:
         stats = json.loads(body)
     except (ValueError, TypeError):
-        return None, False
+        return None, STATS_EMPTY
     if not isinstance(stats, dict):
-        return None, False
+        return None, STATS_EMPTY
 
     try:
         tmp = cache_path + f".{os.getpid()}.tmp"
@@ -389,7 +489,7 @@ def _fetch_stats(port: str, session_id: str | None) -> tuple[dict | None, bool]:
         os.replace(tmp, cache_path)
     except OSError:
         pass  # caching is an optimization; failing to write one is not this script's problem
-    return stats, False
+    return stats, STATS_OK
 
 
 def _session_totals(payload: dict) -> tuple[float | None, float | None]:
@@ -537,14 +637,41 @@ def main() -> None:
     if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
         session_id = None  # absent, or not the shape Claude Code actually sends: don't trust it
 
-    stats, proxy_down = _fetch_stats(port, session_id)
-    if proxy_down:
+    stats, status = _fetch_stats(port, session_id)
+    if status == STATS_DOWN:
         line = "cg!"  # three characters: the proxy is unreachable, nothing else is worth saying
         update_seg = _update_available_segment()  # local file only — independent of the proxy
         if update_seg:
             line += " | " + update_seg
         print(line)
         return
+    if status == STATS_TIMEOUT and stats is None:
+        # The proxy did not answer in time and there is no recent-enough cached answer to fall
+        # back on (the common case right after the proxy itself restarted). This is NOT `cg!`:
+        # the proxy may be perfectly healthy and merely slow on this one aggregate — see
+        # _fetch_stats' docstring — and claiming it is down when it is not sends whoever reads
+        # this looking in the wrong place. It will redraw with real numbers on its own; nothing
+        # here needs to retry or wait for that.
+        line = "cg: stats loading…"
+        update_seg = _update_available_segment()
+        if update_seg:
+            line += " | " + update_seg
+        print(line)
+        return
+    if status == STATS_HUNG:
+        # Unlike STATS_TIMEOUT above, there WAS a working proxy and every fetch since has kept
+        # timing out for long enough (STALE_STATS_MAX_AGE_SECONDS) that "merely slow" has stopped
+        # being the better read. Still not `cg!` — this is reachable at the TCP level, which a
+        # refused connection is not — but "loading…" would be dishonest here: this is not a
+        # render that is about to resolve itself on the next tick the way a genuinely slow proxy
+        # is, so it gets a distinct marker rather than reusing either wording.
+        line = "cg? not responding"
+        update_seg = _update_available_segment()
+        if update_seg:
+            line += " | " + update_seg
+        print(line)
+        return
+    stale = status == STATS_TIMEOUT  # stats is real, but from a past fetch, not this one
 
     # The context bar is payload-only (no fetch) so it renders even when stats do not; the rest
     # need `stats`. Priority is savings-vs-session-total first and always on; the cache TTL
@@ -575,7 +702,12 @@ def main() -> None:
     recommend_seg = _recommend_segment(payload)
     if recommend_seg:
         parts.append(recommend_seg)
-    print(" | ".join(parts))
+    line = " | ".join(parts)
+    if stale and line:
+        # A small, honest marker that every number to its left is from the last successful
+        # fetch rather than this render — never withheld, never dressed up as fresh.
+        line += f" {DIM}⏳{RESET}"
+    print(line)
 
 
 if __name__ == "__main__":

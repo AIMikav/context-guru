@@ -2113,6 +2113,38 @@ func statsStub(t *testing.T, body string) (port string) {
 	return fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
 }
 
+// toggleStub is statsStub plus a lever: it answers normally with `body` until stall() is
+// called, after which every request on the SAME port is held open and never answered (same
+// accept-and-never-respond shape as stallingPort). One port throughout is the point — it is
+// what lets a test prime this script's own on-disk /api/stats cache against a live answer and
+// then exercise the timeout path against the SAME cache key, which is exactly the real
+// sequence (a healthy proxy that becomes slow under load) rather than two unrelated ports.
+func toggleStub(t *testing.T, body string) (port string, stall func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stalled atomic.Bool
+	block := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
+		if stalled.Load() {
+			<-block // released only by this helper's cleanup, below
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go srv.Serve(ln) //nolint:errcheck
+	t.Cleanup(func() {
+		close(block)
+		srv.Close()
+	})
+	return fmt.Sprint(ln.Addr().(*net.TCPAddr).Port), func() { stalled.Store(true) }
+}
+
 // routedEnv is the one env var that makes statusline.py act at all: it self-gates on
 // ANTHROPIC_BASE_URL naming our own port, exactly like the two hooks above.
 func routedEnv(port string) map[string]string {
@@ -2180,22 +2212,196 @@ func TestStatuslineIsSilentWhereRoutingIsNotConfigured(t *testing.T) {
 	}
 }
 
-// TestStatuslineReportsADownProxyInThreeCharacters covers the ACCEPT-AND-STALL shape, the same
-// one stallingPort exists for above: a hung proxy, a half-open socket, or an unrelated service on
-// the port all look like this to a client, and none of them are exotic. The render path must
+// TestStatuslineReportsLoadingNotDownOnATimeout covers the ACCEPT-AND-STALL shape: a connection
+// that succeeds and then never answers. This USED to render `cg!`, on the premise that it is
+// indistinguishable from a hung proxy or a half-open socket — but it is ALSO exactly what a
+// live, healthy proxy looks like from this script's point of view when its own /api/stats
+// aggregate is simply slow under load (dash/api.go's jsonCache: a stale body is served
+// immediately except in the gap right after startup, or past dashCacheStale with no refresh
+// result in yet). A real diagnostic capture against a live v0.4.2 proxy showed ~10 of these in
+// 10 minutes, proxy healthy throughout. Rendering `cg!` here told the user their proxy was down
+// when it was not, which is strictly worse than a render that admits it has no fresh numbers
+// yet. With no cached body to fall back on (the case here — nothing has ever answered this
+// port), that admission is "stats loading…", not a down indicator. The render path must still
 // notice inside its own short timeout rather than hang the status line.
-func TestStatuslineReportsADownProxyInThreeCharacters(t *testing.T) {
+func TestStatuslineReportsLoadingNotDownOnATimeout(t *testing.T) {
 	port := stallingPort(t)
 	out, code, elapsed := runStatusline(t, routedEnv(port), "{}")
 	if code != 0 {
 		t.Errorf("exit %d; must never fail a render", code)
 	}
-	if strings.TrimSpace(out) != "cg!" {
-		t.Errorf("got %q, want the down indicator %q", strings.TrimSpace(out), "cg!")
+	if strings.TrimSpace(out) != "cg: stats loading…" {
+		t.Errorf("got %q, want the loading indicator %q (NOT the down indicator — the proxy may be "+
+			"perfectly healthy and merely slow)", strings.TrimSpace(out), "cg: stats loading…")
 	}
 	if elapsed > 2*time.Second {
 		t.Errorf("took %v against a stalling port; the HTTP fetch carries its own ~0.6s timeout, "+
 			"so this should return in well under the script's own 2s backstop", elapsed)
+	}
+}
+
+// TestStatuslineServesStaleStatsOnATimeoutRatherThanLoading is the other half of the timeout
+// path: when a PAST fetch did succeed and was cached (the normal case — this script is invoked
+// on almost every render, so a cold cache is rare), a later timeout must still render those
+// numbers, marked stale, rather than falling back to "stats loading…" and throwing away data
+// that was real a moment ago.
+func TestStatuslineServesStaleStatsOnATimeoutRatherThanLoading(t *testing.T) {
+	tmp := t.TempDir()
+	port, stall := toggleStub(t, `{"total_saved_usd": 0.03, "saved_unique": 12000}`)
+	stdin := statuslinePayload("sess-stale", 0.41, 180000, 7000)
+	env := routedEnv(port)
+	env["TMPDIR"] = tmp
+
+	py := requireTool(t, "python3")
+	run := func() string {
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp)
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("running statusline.py: %v (%s)", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Priming call: the stub is still answering, so this both renders the live figure and
+	// writes it to this script's own on-disk /api/stats cache.
+	if got := run(); !strings.Contains(got, "$0.03/12.0k saved") {
+		t.Fatalf("priming call: got %q, want the live savings figure", got)
+	}
+
+	// Backdate the cache file past STATS_CACHE_TTL_SECONDS (2s) so the next call actually
+	// attempts a fresh fetch instead of serving the just-written in-TTL copy — but still well
+	// inside STALE_STATS_MAX_AGE_SECONDS (600s), matching "a cache a few renders old", not "a
+	// cache from an hour ago".
+	cachePath := filepath.Join(tmp, fmt.Sprintf("context-guru-statusline-%s-sess-stale.json", port))
+	old := time.Now().Add(-5 * time.Second)
+	if err := os.Chtimes(cachePath, old, old); err != nil {
+		t.Fatalf("backdating the stats cache file: %v", err)
+	}
+
+	stall() // same port, same cache key — now it accepts and never answers
+	got := run()
+	if !strings.Contains(got, "$0.03/12.0k saved") {
+		t.Errorf("got %q; want the cached savings figure still rendered from the earlier fetch", got)
+	}
+	if !strings.Contains(got, "⏳") {
+		t.Errorf("got %q; want a stale marker since these numbers are from a past fetch, not this one", got)
+	}
+	if got == "cg!" || strings.Contains(got, "cg!") {
+		t.Errorf("got %q; a cached-but-stale render must never look like the down indicator", got)
+	}
+}
+
+// TestStatuslineReportsNotRespondingOnceAStaleFetchHangsTooLong is the review's third finding,
+// second half: once a cached body is older than STALE_STATS_MAX_AGE_SECONDS and the fetch meant
+// to refresh it STILL times out, "stats loading…" stops being honest — there WAS a working
+// proxy, and reaching it has been failing for a long time, not "about to resolve on the next
+// render". It must render a distinct marker, not either of the other two: `cg!` (which claims a
+// refusal that never happened — this port is reachable) or "loading…" (which undersells how
+// long this has been going on).
+func TestStatuslineReportsNotRespondingOnceAStaleFetchHangsTooLong(t *testing.T) {
+	tmp := t.TempDir()
+	port, stall := toggleStub(t, `{"total_saved_usd": 0.03, "saved_unique": 12000}`)
+	stdin := statuslinePayload("sess-hung", 0.41, 180000, 7000)
+	env := routedEnv(port)
+	env["TMPDIR"] = tmp
+
+	py := requireTool(t, "python3")
+	run := func() string {
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp)
+		for k, v := range env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("running statusline.py: %v (%s)", err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if got := run(); !strings.Contains(got, "$0.03/12.0k saved") {
+		t.Fatalf("priming call: got %q, want the live savings figure", got)
+	}
+
+	// Backdate well past STALE_STATS_MAX_AGE_SECONDS (read from the script itself, not retyped
+	// here, so the two cannot silently drift apart).
+	maxAge := statslineConstInt(t, "STALE_STATS_MAX_AGE_SECONDS")
+	cachePath := filepath.Join(tmp, fmt.Sprintf("context-guru-statusline-%s-sess-hung.json", port))
+	old := time.Now().Add(-time.Duration(maxAge+60) * time.Second)
+	if err := os.Chtimes(cachePath, old, old); err != nil {
+		t.Fatalf("backdating the stats cache file: %v", err)
+	}
+
+	stall()
+	got := run()
+	if got != "cg? not responding" {
+		t.Errorf("got %q, want %q", got, "cg? not responding")
+	}
+}
+
+// statslineConstInt reads an integer module-level constant out of statusline.py by actually
+// importing it, so a test asserting a boundary (here, STALE_STATS_MAX_AGE_SECONDS) cannot drift
+// from the real value the way a retyped literal could.
+func statslineConstInt(t *testing.T, name string) int {
+	t.Helper()
+	py := requireTool(t, "python3")
+	script := `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("statusline", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(int(getattr(m, sys.argv[2])))
+`
+	out, err := exec.Command(py, "-c", script, filepath.Join(scriptsDir(t), "statusline.py"), name).CombinedOutput()
+	if err != nil {
+		t.Fatalf("reading %s from statusline.py: %v\n%s", name, err, out)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("%s is not an int: %q", name, out)
+	}
+	return n
+}
+
+// TestStatuslineTreatsAConnectPhaseTimeoutAsATimeoutNotDown is the review's third finding,
+// first half: a timeout during urlopen's CONNECT phase reaches Python wrapped as
+// urllib.error.URLError(reason=socket.timeout(...)) rather than raised directly the way a
+// READ-phase timeout is (the shape every other test in this file exercises, via toggleStub/
+// stallingPort, both of which accept the TCP connection first). Reproducing a genuine
+// connect-phase timeout needs an unroutable network path, which is not reliable to construct in
+// a test — so this drives the real _fetch_stats function with urlopen replaced by a stub that
+// raises exactly the shape urllib actually raises there, and checks the real except clauses
+// route it to STATS_TIMEOUT rather than STATS_DOWN.
+func TestStatuslineTreatsAConnectPhaseTimeoutAsATimeoutNotDown(t *testing.T) {
+	py := requireTool(t, "python3")
+	script := `
+import importlib.util, sys, socket, urllib.error
+spec = importlib.util.spec_from_file_location("statusline", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+def fake_urlopen(url, timeout=None):
+    raise urllib.error.URLError(socket.timeout("timed out"))
+
+m.urllib.request.urlopen = fake_urlopen
+stats, status = m._fetch_stats("9", None)
+assert stats is None, stats
+print(status)
+`
+	out, err := exec.Command(py, "-c", script, filepath.Join(scriptsDir(t), "statusline.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running the stub: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	if got != "timeout" {
+		t.Errorf("got status %q, want %q (STATS_TIMEOUT) — a connect-phase timeout must not be "+
+			"mistaken for a refusal", got, "timeout")
 	}
 }
 
@@ -2499,8 +2705,27 @@ func TestStatuslineScopesStatsToItsOwnSession(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	if gotQuery != "session=abc-123-session" {
-		t.Errorf("got query %q, want %q", gotQuery, "session=abc-123-session")
+	if gotQuery != "lean=1&session=abc-123-session" {
+		t.Errorf("got query %q, want %q", gotQuery, "lean=1&session=abc-123-session")
+	}
+}
+
+// TestStatuslineAlwaysRequestsTheLeanPath proves ?lean=1 is sent even with no session_id to
+// scope to — the fast path (dash/api.go's statsLean) answers from Overview() alone, skipping
+// the three priced aggregates that measured 38-45s on a production-sized dashboard DB and were
+// the actual cause of this script's timeouts, and there is no reason this script would ever
+// want the slow, full response: it reads nothing those three aggregates add.
+func TestStatuslineAlwaysRequestsTheLeanPath(t *testing.T) {
+	var gotQuery string
+	port := statsStubCapturingQuery(t, `{"total_saved_usd": 0.01, "saved_unique": 1}`, &gotQuery)
+	// No session_id in the payload at all this time.
+	_, code, _ := runStatusline(t, routedEnv(port), `{"cost":{"total_cost_usd":0.1},`+
+		`"context_window":{"total_input_tokens":1000,"total_output_tokens":100}}`)
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if gotQuery != "lean=1" {
+		t.Errorf("got query %q, want %q", gotQuery, "lean=1")
 	}
 }
 
@@ -2548,9 +2773,9 @@ func TestStatuslineRejectsAMalformedSessionId(t *testing.T) {
 	if strings.Contains(gotQuery, "someone-elses-session") {
 		t.Fatalf("got query %q — an unsanitised session_id reached the request", gotQuery)
 	}
-	if gotQuery != "" {
-		t.Errorf("got query %q, want an unscoped request (empty query) for a session_id this "+
-			"script does not trust", gotQuery)
+	if gotQuery != "lean=1" {
+		t.Errorf("got query %q, want an unscoped request (just lean=1, no &session=) for a "+
+			"session_id this script does not trust", gotQuery)
 	}
 }
 
@@ -2569,9 +2794,9 @@ func TestStatuslineCachesPerSession(t *testing.T) {
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.RawQuery {
-		case "session=sess-a":
+		case "lean=1&session=sess-a":
 			w.Write([]byte(`{"total_saved_usd": 0.01, "saved_unique": 100}`))
-		case "session=sess-b":
+		case "lean=1&session=sess-b":
 			w.Write([]byte(`{"total_saved_usd": 9.99, "saved_unique": 9000}`))
 		default:
 			t.Errorf("unexpected query %q", r.URL.RawQuery)
