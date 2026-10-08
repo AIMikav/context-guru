@@ -808,6 +808,10 @@ type Snapshot struct {
 	// failure, counted apart from CacheAwareSummarizerErrors for the same reason extract_llm_sweep
 	// separates sweep_no_prefix from sweep_ask_failed
 	CacheAwareSummarizerNoPrefix int64 `json:"cache_aware_summarizer_no_prefix"`
+	// a decline because the PrefixAsk path's stashed body does not cover the span this turn was
+	// about to commission a summary for — the stale-prefix guard, distinct from NoPrefix ("the
+	// session has sent nothing" vs. "something is stashed and it is the wrong something")
+	CacheAwareSummarizerStalePrefix int64 `json:"cache_aware_summarizer_stale_prefix"`
 	// commission calls that reached the model through components.PrefixAsker rather than a
 	// components.MessagesModel — i.e. the Anthropic incoming-model path (#275). Zero here on a
 	// deployment running Anthropic-only traffic means this component is still measuring `off`,

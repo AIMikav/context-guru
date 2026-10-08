@@ -1607,7 +1607,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// KEYED BY THE SCOPED SESSION ID, which is what serve receives (tr.Session) and what a
 			// component reads as Ctx.Session. Keying it by the raw header instead would make every
 			// Ask miss while the mechanism looked switched on.
-			h.sent.put(session, body)
+			h.sent.put(session, provider, body)
 		}
 		if err != nil {
 			// LOG it, and record it on the captured row. An upstream failure used to be
@@ -2165,6 +2165,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	caStarted, caCommitted, _, _ := offload.CacheAwareAsyncStats()
 	snap.CacheAwareSummarizerAsyncStarted, snap.CacheAwareSummarizerAsyncCommitted = caStarted, caCommitted
 	snap.CacheAwareSummarizerNoPrefix = offload.CacheAwareSummarizerNoPrefix()
+	snap.CacheAwareSummarizerStalePrefix = offload.CacheAwareSummarizerStalePrefix()
 	snap.CacheAwareSummarizerPrefixAskUsed = offload.CacheAwareSummarizerPrefixAskUsed()
 	snap.CacheAwareSummarizerCacheReadTokens, snap.CacheAwareSummarizerCacheWriteTokens =
 		offload.CacheAwareSummarizerCacheTokens()

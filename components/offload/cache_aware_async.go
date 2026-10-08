@@ -82,6 +82,11 @@ func classifyCallErr(ctx context.Context, session string, err error) {
 		atomic.AddInt64(&cacheAwareNoPrefix, 1)
 		return
 	}
+	if errors.Is(err, components.ErrStalePrefix) {
+		atomic.AddInt64(&cacheAwareStalePrefix, 1)
+		logging.From(ctx).Debug("cg.cache_aware_summarizer.stale_prefix", "session", session)
+		return
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		atomic.AddInt64(&cacheAwareTimeouts, 1)
 	} else {
@@ -249,6 +254,12 @@ func (s *CacheAwareSummarizer) commitAsyncSummary(mode markerMode, session strin
 type KeepAliveSummaryResult struct {
 	Model                                     string
 	FreshInput, Output, CacheWrite, CacheRead int
+	// CacheWrite1h is the SUBSET of CacheWrite this call billed at the one-hour write premium
+	// (the `1-hour-head` cache strategy's own breakpoint) — never an addition to CacheWrite. The
+	// keeper's recordSummarySubstitute needs this to price the call with
+	// modelinfo.Price.CostWithCacheWrite1h the same way record1 prices an ordinary ping, instead
+	// of folding every write into the five-minute rate.
+	CacheWrite1h int
 	// Committed is false either because the call could not be started (another commission —
 	// async or keep-alive — is already in flight for this session, or the global concurrency
 	// bound is full), or because it ran and produced nothing usable (error, timeout, empty
@@ -312,7 +323,8 @@ func (s *CacheAwareSummarizer) commissionSync(c *components.Ctx, call summaryCal
 	_, in, outTok := callSink.Totals()
 	cw, cr := callSink.CacheTotals()
 	res := KeepAliveSummaryResult{Model: callSink.Model(),
-		FreshInput: int(in), Output: int(outTok), CacheWrite: int(cw), CacheRead: int(cr)}
+		FreshInput: int(in), Output: int(outTok), CacheWrite: int(cw), CacheRead: int(cr),
+		CacheWrite1h: int(callSink.CacheWrite1h())}
 	recordCacheAwareCacheTokens(callSink)
 	deferUsage(st, session, "cache_aware_summarizer", path, "keepalive_substitute", callMs, callSink)
 	if err != nil {

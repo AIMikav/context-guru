@@ -83,10 +83,13 @@ var summarizerProfilesYAML []byte
 // live (phase PreExpiry) is held RESERVED (sumCheckpoint.Reserved) rather than spliced — warm
 // turns keep forwarding the full history untouched, because splicing it now would be the exact
 // cache-destructive rewrite this mode exists to avoid. While reserved, an idle keep-alive ping
-// still pings the FULL history (that is what the provider actually has cached); once the
-// reserve's own tail grows past resummarize_tokens, a ping is spent on a FRESH summary instead
-// — refreshing the reserve — rather than on a plain read of a prefix the reserve no longer
-// matches. Only a turn whose phase is Cold (the cache is actually gone) or Unknown (no
+// still pings the FULL history (that is what the provider actually has cached); whether a ping
+// is instead spent refreshing the reserve with a FRESH summary is no longer a token-count
+// comparison against resummarize_tokens — since #415 it is a money gate (expected saving on the
+// eventual cold return against the refresh call's own projected cost; see
+// checkpointRefreshOpportunity and fireSummarySubstitute) — rather than on a plain read of a
+// prefix the reserve no longer matches. Only a turn whose phase is Cold (the cache is actually
+// gone) or Unknown (no
 // cache-aware tracking exists on this request at all, so there is nothing live to protect)
 // graduates the reserve: splices it, tail and all, and marks it live from then on — see
 // cacheAwareApplyPhase. From that turn forward the session behaves exactly like `any` for that
@@ -329,6 +332,14 @@ var (
 	// separate from sweep_ask_failed: the two mean "nothing to attend" and "the read failed",
 	// which call for opposite attention.
 	cacheAwareNoPrefix int64
+	// cacheAwareStalePrefix counts a decline because the PrefixAsk path's stashed body does not
+	// (yet, or any longer) cover the span this turn is about to commission a summary for — see
+	// the stale-prefix guard in Offload and components.PrefixCoverage. Not the same failure as
+	// cacheAwareNoPrefix: that is "nothing stashed at all" (every session's first turn, routine),
+	// this is "something IS stashed and it is the wrong something" (a body the host's stash
+	// dropped for being oversized, or a race against this session's own concurrent turn) —
+	// caught before paying for the call rather than after.
+	cacheAwareStalePrefix int64
 	// cacheAwarePrefixAskUsed counts turns that reached the model step via components.PrefixAsker
 	// rather than a components.MessagesModel — i.e. every turn that activated on a route whose
 	// client has no MessagesModel at all, which on this deployment IS the Anthropic
@@ -364,6 +375,9 @@ func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareC
 func CacheAwareSummarizerTimeouts() int64 { return atomic.LoadInt64(&cacheAwareTimeouts) }
 func CacheAwareSummarizerErrors() int64   { return atomic.LoadInt64(&cacheAwareErrors) }
 func CacheAwareSummarizerNoPrefix() int64 { return atomic.LoadInt64(&cacheAwareNoPrefix) }
+func CacheAwareSummarizerStalePrefix() int64 {
+	return atomic.LoadInt64(&cacheAwareStalePrefix)
+}
 func CacheAwareSummarizerPrefixAskUsed() int64 {
 	return atomic.LoadInt64(&cacheAwarePrefixAskUsed)
 }
@@ -813,7 +827,34 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		path = "prefix_ask"
 		atomic.AddInt64(&cacheAwarePrefixAskUsed, 1)
 		asker, session, instructionText := c.PrefixAsk, c.Session, schema.MessageText(instruction)
+		// requiredCount/requiredHash freeze THIS turn's own idea of what span the eventual call
+		// must cover — computed now, synchronously, while msgs is still exactly what this turn
+		// saw. The call itself runs later: detached (startAsyncSummary) or substituted for an
+		// idle ping (commissionSync), sometimes turns after this one returns. See the
+		// STALE-PREFIX GUARD comment below for why the check belongs IN the call rather than
+		// here: at this point in Offload, the host's stash still holds (at most) the PREVIOUS
+		// turn's body — THIS turn's own body is not stashed until after Offload returns — so a
+		// check made HERE would fail on every ordinary turn whose own span simply grew past
+		// what the previous turn's stash held, not only the stale one. By the time the call
+		// actually runs, the host has had the chance to stash at least this turn's own
+		// forwarded body.
+		requiredCount, requiredHash := end, spanHash(msgs[:end])
 		call = func(ctx context.Context) (string, error) {
+			// STALE-PREFIX GUARD. The PrefixAsk path answers from whatever body the host's
+			// stash holds for this session, which this component never built and cannot
+			// otherwise verify. That body can be the wrong one — proxy's sentStash drops a
+			// body over its own size cap rather than updating it, so a session whose turn grew
+			// past that cap can leave an OLDER, shorter body in the stash — and Ask would
+			// silently answer from a transcript that does not cover `requiredCount`, producing
+			// a checkpoint that CLAIMS to cover msgs[start:end] while the model never saw most
+			// of it. Checked here, immediately before paying for the call, against the
+			// asker's own reported coverage (components.PrefixCoverage); an asker that does not
+			// implement it is trusted as before — this guard exists to catch a NEW failure
+			// mode, not to narrow who may answer.
+			if pc, ok := asker.(components.PrefixCoverage); ok &&
+				!pc.CoversSpan(session, requiredCount, requiredHash) {
+				return "", components.ErrStalePrefix
+			}
 			reply, _, err := asker.Ask(ctx, session, instructionText)
 			// usage is NOT read here: PrefixAsker.Ask's underlying CompletePrefixed/
 			// CompletePrefixedResponses already records cache_read/cache_write into the ambient
