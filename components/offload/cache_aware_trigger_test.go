@@ -759,3 +759,93 @@ func TestCacheAwareAllowsResummarizeTokensZeroUnderEitherCacheState(t *testing.T
 		t.Errorf("resummarize_tokens: 0 with cache_state: any was rejected: %v", err)
 	}
 }
+
+// caThinkingMsg is an assistant turn carrying a thinking block (bifrost's normalized form of
+// Anthropic's `thinking` content, a `Reasoning` string on ChatAssistantMessage).
+func caThinkingMsg(text string) bschemas.ChatMessage {
+	reasoning := "worked through the problem before answering"
+	return bschemas.ChatMessage{Role: bschemas.ChatMessageRoleAssistant,
+		ChatAssistantMessage: &bschemas.ChatAssistantMessage{Reasoning: &reasoning},
+		Content:              &bschemas.ChatMessageContent{ContentStr: &text}}
+}
+
+// ⭐ ISSUE: Anthropic's own "Thinking block preservation by model" strips every earlier
+// thinking block from a last-turn-only model's cached context the moment a non-tool-result
+// message is appended — exactly this component's own instruction. Live-measured on
+// claude-haiku-4-5: the commission's own cache read landed ~2,100-2,150 tokens short of the
+// real turn immediately before it, in two independent sessions. The gate declines before
+// paying for that degraded read at all.
+func TestCacheAwareDeclinesOnALastTurnOnlyModelWithAnEarlierThinkingBlock(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	model := &capturingModel{out: "<summary>ok</summary>"}
+	s.modelClient = model
+	msgs := append([]bschemas.ChatMessage{}, caFixture()...)
+	// An earlier (not-last) assistant turn carrying a thinking block.
+	msgs = append(msgs[:1], append([]bschemas.ChatMessage{caThinkingMsg("thinking about it")}, msgs[1:]...)...)
+	c := caCtx("ca-thinking-haiku")
+	c.ModelName = "claude-haiku-4-5"
+	var rep components.Report
+	req := &bschemas.BifrostChatRequest{Input: msgs}
+	if _, err := s.Offload(req, &rep, c); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["thinking_would_be_stripped"] == 0 {
+		t.Fatalf("want gate thinking_would_be_stripped (gates: %v)", rep.Gates)
+	}
+	if model.calls != 0 {
+		t.Errorf("a declined commission still called the model (%d calls)", model.calls)
+	}
+	if CacheAwareSummarizerThinkingWouldStrip() == 0 {
+		t.Error("the decline was not counted")
+	}
+}
+
+// The identical transcript on Sonnet 5 (keep-all, per the same doc page) must proceed — the
+// gate is model-specific, not a blanket refusal on any thinking block anywhere.
+func TestCacheAwareProceedsOnAKeepAllModelWithAnEarlierThinkingBlock(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	model := &capturingModel{out: "<summary>ok</summary>"}
+	s.modelClient = model
+	msgs := append([]bschemas.ChatMessage{}, caFixture()...)
+	msgs = append(msgs[:1], append([]bschemas.ChatMessage{caThinkingMsg("thinking about it")}, msgs[1:]...)...)
+	c := caCtx("ca-thinking-sonnet")
+	c.ModelName = "claude-sonnet-5"
+	var rep components.Report
+	req := &bschemas.BifrostChatRequest{Input: msgs}
+	if _, err := s.Offload(req, &rep, c); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["thinking_would_be_stripped"] != 0 {
+		t.Fatalf("Sonnet 5 is keep-all; must not be gated (gates: %v)", rep.Gates)
+	}
+	if !WaitForSummaryForTest(c.Session, 5*time.Second) {
+		t.Fatal("the commission never landed")
+	}
+	if model.calls != 1 {
+		t.Errorf("want 1 model call, got %d", model.calls)
+	}
+}
+
+// claude-haiku-4-5 with NO thinking blocks anywhere has nothing the gate protects — it must
+// proceed exactly like any other turn.
+func TestCacheAwareProceedsOnALastTurnOnlyModelWithNoThinkingBlocks(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	model := &capturingModel{out: "<summary>ok</summary>"}
+	s.modelClient = model
+	c := caCtx("ca-thinking-none")
+	c.ModelName = "claude-haiku-4-5"
+	var rep components.Report
+	req := &bschemas.BifrostChatRequest{Input: caFixture()}
+	if _, err := s.Offload(req, &rep, c); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["thinking_would_be_stripped"] != 0 {
+		t.Fatalf("no thinking block exists; must not be gated (gates: %v)", rep.Gates)
+	}
+	if !WaitForSummaryForTest(c.Session, 5*time.Second) {
+		t.Fatal("the commission never landed")
+	}
+	if model.calls != 1 {
+		t.Errorf("want 1 model call, got %d", model.calls)
+	}
+}

@@ -896,6 +896,11 @@ cold — it was tried, and it cost more than it saved.
   running, the reserve just sits there (refreshed only when it is worth it — see above). It gets
   used only after pinging stops: the session's ping budget runs out, keep-alive is off, or the
   session sits idle longer than keep-alive covers.
+- **On some models, an earlier thinking block costs the whole cache read.** A few models —
+  `claude-haiku-4-5` is the one measured — keep only the LAST turn's thinking block, and
+  appending this component's own instruction strips every earlier one at once, which also
+  shrinks the cache the backend actually reads. On those models this component declines rather
+  than pay for a smaller read than expected.
 
 #### When to use `summarize` instead
 

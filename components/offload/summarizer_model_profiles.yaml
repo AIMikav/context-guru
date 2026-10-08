@@ -137,6 +137,39 @@ prompts:
 system_models: []
 
 # ─────────────────────────────────────────────────────────────────────────────────────
+# thinking_last_turn_models — an ALLOW-LIST, same spirit as system_models above: a model this
+# list has not positively identified defaults to "keep all", never gated on a guess.
+#
+# This component APPENDS its instruction as a non-tool-result message after the whole
+# conversation — exactly the shape that, on a LAST-TURN-ONLY model, strips every earlier
+# thinking block from the backend's own cached context the moment it is sent. Per Anthropic's
+# own "Thinking block preservation by model"
+# (https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-block-preservation-by-model,
+# read 2026-10-08):
+#
+#   "Keep the last turn only: earlier Opus and Sonnet models, and all Haiku models through
+#   Claude Haiku 4.5. When you pass older thinking blocks back, the API strips them
+#   automatically."
+#
+#   "Keep all prior turns: Claude Opus 4.5 and later Opus models, Claude Sonnet 4.6 and later
+#   Sonnet models, Claude Haiku 5.5, Claude Fable 5.1, Claude Mythos 5.1, Claude Fable 5, Claude
+#   Mythos 5, and Claude Mythos Preview."
+#
+# Every Opus/Sonnet entry already in `profiles` below (4-6, 4-7, 4-8, and the bare `-5`
+# generation) is at or past its own family's keep-all cutoff, so none of them belong here —
+# this list names only the confirmed last-turn-only case, found live: claude-haiku-4-5's own
+# commission call read ~2,100-2,150 tokens short of the immediately preceding real turn, in two
+# independent sessions, both landing on exactly the SECOND real turn's own cache figures (the
+# turn before the first thinking block existed to be stripped). Measured on Sonnet 5 (keep-all)
+# in the same test, the commission's read matched the preceding turn exactly.
+#
+# ⛔ NO BROAD `claude-haiku` FALLBACK. Haiku 5.5 is keep-all; a bare substring would catch it.
+# Name the specific pre-5.5 Haiku version(s) this deployment actually runs, verified against
+# the doc page above, when promoting another one.
+thinking_last_turn_models:
+  - claude-haiku-4-5
+
+# ─────────────────────────────────────────────────────────────────────────────────────
 # Profiles — A PROVENANCE RECORD, NOT A GRANT. Each entry says what was established about
 # a model's own template or provider rules, and how. Nothing here changes the resolved
 # role: with system_models empty, every model resolves to `user`. These are kept because

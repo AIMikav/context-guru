@@ -13,6 +13,7 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 	"gopkg.in/yaml.v3"
@@ -187,7 +188,12 @@ type summarizerProfiles struct {
 	// SystemModels are match strings whose models take the instruction as role: system. EMPTY
 	// on this build: no model+path combination is currently verified. See the file header.
 	SystemModels []string `yaml:"system_models"`
-	Profiles     []struct {
+	// ThinkingLastTurnModels are match strings for models that keep only the LAST turn's
+	// thinking block — see thinkingLastTurnOnly. An ALLOW-list, not a block-list, for the same
+	// reason SystemModels is one: an unmatched model defaults to "keep all", so a model this
+	// list has never heard of is never gated on the strength of a guess.
+	ThinkingLastTurnModels []string `yaml:"thinking_last_turn_models"`
+	Profiles               []struct {
 		Match    string `yaml:"match"`
 		Verified string `yaml:"verified"`
 	} `yaml:"profiles"`
@@ -212,6 +218,37 @@ func (p *summarizerProfiles) roleFor(modelID string) (role bschemas.ChatMessageR
 		}
 	}
 	return bschemas.ChatMessageRoleUser, false
+}
+
+// thinkingLastTurnOnly reports whether modelID is one documented to keep only the LAST turn's
+// thinking block, matched the same way roleFor matches system_models: the first substring hit
+// wins, case-insensitive, over a short allow-list rather than a guessed block-list.
+//
+// Per Anthropic's own "Thinking block preservation by model"
+// (https://platform.claude.com/docs/en/build-with-claude/thinking#thinking-block-preservation-by-model,
+// read 2026-10-08): "Keep the last turn only: earlier Opus and Sonnet models, and all Haiku
+// models through Claude Haiku 4.5. When you pass older thinking blocks back, the API strips
+// them automatically" — and, from the surrounding page, that stripping happens the moment a
+// non-tool-result user message is sent, which is exactly the shape this component's own
+// appended instruction takes. "Keep all prior turns" covers Opus 4.5+, Sonnet 4.6+, Haiku 5.5,
+// and the Fable/Mythos family — none of which this list names, so an unmatched model (every
+// model this registry has not positively identified as last-turn-only) is "keep all" by
+// default, the safe direction here: declining when thinking would NOT actually be stripped
+// costs a compaction opportunity, but proceeding when it WOULD be costs a silently smaller
+// cache read than the dashboard's own numbers would suggest — the gap a live test measured on
+// claude-haiku-4-5 (reading ~2,100-2,150 tokens short of the immediately preceding real turn,
+// in two independent sessions) before this gate existed.
+func (p *summarizerProfiles) thinkingLastTurnOnly(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if id == "" {
+		return false
+	}
+	for _, m := range p.ThinkingLastTurnModels {
+		if m != "" && strings.Contains(id, strings.ToLower(strings.TrimSpace(m))) {
+			return true
+		}
+	}
+	return false
 }
 
 // prompt returns the instruction text for a role. The two differ by more than tone: the user
@@ -312,6 +349,13 @@ var (
 	// UNTRUSTED raw text before sanitizeSummary/ensureSummaryTags touch it, or a truncated reply
 	// is indistinguishable from a complete one by the time either of those has run.
 	cacheAwareSummaryTruncated int64
+	// cacheAwareThinkingWouldStrip counts a decline because appending the instruction would, on
+	// this model, strip every earlier thinking block from the backend's cached context — see
+	// thinkingWouldBeStripped and summarizerProfiles.thinkingLastTurnOnly. Not a failure: the
+	// call is never made, so nothing was paid for and lost. Zero on a deployment that runs
+	// last-turn-only models at all means either none of its traffic carries earlier thinking
+	// blocks, or this gate has nothing to catch there yet.
+	cacheAwareThinkingWouldStrip int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
@@ -322,6 +366,9 @@ func CacheAwareSummarizerPrefixAskUsed() int64 {
 	return atomic.LoadInt64(&cacheAwarePrefixAskUsed)
 }
 func CacheAwareSummarizerTruncated() int64 { return atomic.LoadInt64(&cacheAwareSummaryTruncated) }
+func CacheAwareSummarizerThinkingWouldStrip() int64 {
+	return atomic.LoadInt64(&cacheAwareThinkingWouldStrip)
+}
 
 // CacheAwareSummarizerCacheTokens returns the cumulative cache-read/cache-write tokens of every
 // commission call this component has made, across every trigger and path.
@@ -545,6 +592,34 @@ func (s *CacheAwareSummarizer) InstructionRole() string { return string(s.instru
 // built as [the whole conversation] + [instruction], and is REUSED across turns until the tail
 // grows past resummarize_tokens — without that reuse the forwarded prefix would change every
 // turn and this component would invalidate the cache it exists to protect.
+// hasThinkingBlock reports whether an assistant message carries a thinking block — plain
+// (`Reasoning`/a `reasoning.text` detail, bifrost's normalized form of Anthropic's `thinking`)
+// or encrypted (`reasoning.encrypted`, bifrost's form of `redacted_thinking`). Either shape is
+// what Anthropic's own preservation rule keys on; this component does not need to tell them
+// apart; strips/keeps the whole block together.
+func hasThinkingBlock(m bschemas.ChatMessage) bool {
+	return m.ChatAssistantMessage != nil &&
+		(m.Reasoning != nil || len(m.ReasoningDetails) > 0)
+}
+
+// thinkingWouldBeStripped reports whether appending a non-tool-result message to msgs would,
+// on a last-turn-only model, strip every thinking block before the LAST message from the
+// backend's own cached context — see summarizerProfiles.thinkingLastTurnOnly for the citation
+// and the live-measured gap this check exists to close. The last message itself is excluded:
+// appending AFTER it is exactly the turn whose thinking (if any) survives on either kind of
+// model, so it carries no risk of its own.
+func thinkingWouldBeStripped(msgs []bschemas.ChatMessage) bool {
+	if len(msgs) == 0 {
+		return false
+	}
+	for _, m := range msgs[:len(msgs)-1] {
+		if hasThinkingBlock(m) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input
 	// Attribute any spend a DETACHED summarizer call incurred since this session's last turn.
@@ -677,6 +752,19 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		return declineButReplayStale()
 	}
 	profiles := s.resolveProfiles()
+	// Declines BEFORE building anything: on a last-turn-only model, appending the instruction
+	// after an earlier thinking block strips that block from the backend's own cached context
+	// (see thinkingLastTurnOnly), so the cache this component exists to read is smaller than
+	// the dashboard's own numbers would suggest — silently, which is worse than not compacting
+	// at all. c.ModelName is the ACTUAL model this request targets, not s.modelID (the
+	// operator's pinned model for the system-role check below, a different question).
+	if profiles.thinkingLastTurnOnly(c.ModelName) && thinkingWouldBeStripped(msgs) {
+		atomic.AddInt64(&cacheAwareThinkingWouldStrip, 1)
+		rep.Gate("thinking_would_be_stripped")
+		logging.From(c.Ctx).Debug("cg.cache_aware_summarizer.thinking_would_be_stripped",
+			"session", c.Session, "model", c.ModelName)
+		return declineButReplayStale()
+	}
 	// The pinned-system guard, at the point of use. Declining costs this arm its compaction;
 	// proceeding would risk a summary that is really the model's next turn, which no metric here
 	// would reveal. Moot on the PrefixAsk path, which can never send a system-role instruction at
