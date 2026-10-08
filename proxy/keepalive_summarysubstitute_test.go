@@ -343,3 +343,121 @@ func TestKeepAliveSubstituteFiresOncePreExpiryPhaseIsLive(t *testing.T) {
 		t.Errorf("sent %d ordinary pings — the substitute should have replaced it", fs.n())
 	}
 }
+
+// ⭐ THE PIN: a summary call takes the place of exactly ONE ping. It counts toward
+// keepalive_max_pings like any other ping, it does not add an extra ping, and it does not
+// extend K — the cache strategy's own MaxPings is still what decides how long the session's
+// cache stays warm. "The preset never overrides the cache strategy."
+//
+// With MaxPings=2 and no reserve yet: ping 1 creates the session's first reserve (there is
+// nothing to compare it against yet, so it is not gated by the #415 refresh test — see
+// KeepAliveCandidateInfo.IsRefresh). Ping 2 finds that same reserve already covering every
+// message the (unchanged) candidate span has — nothing new to weigh — so it refuses
+// substitution (`checkpoint_exists`, exactly like `any`) and falls back to an ordinary ping.
+// There is no third ping: K is 2.
+func TestKeepAliveSummaryCallCountsAsExactlyOnePing(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
+	kaCandidateWithCacheState(t, "sess-1", st, model, "pre_expiry", 60)
+
+	start := clock.now()
+	recordOne(t, k, kaPolicy(), kaBody, start, upstream{base: "http://up", path: "/v1/messages"})
+
+	// Ping 1, at 281s idle: inside the default 60s pre-expiry window of the default 5-minute
+	// TTL — creates the reserve.
+	if n := k.sweep(clock.advance(281 * time.Second)); n != 1 {
+		t.Fatalf("ping 1 did not fire (%d)", n)
+	}
+	waitPings(t, k, 1)
+	if k.summarySubstituted.Load() != 1 {
+		t.Fatalf("ping 1 was not the summary substitute (summarySubstituted=%d)", k.summarySubstituted.Load())
+	}
+	if fs.n() != 0 {
+		t.Fatalf("ping 1 sent an ordinary ping too (%d) — it must be ONE ping, not two", fs.n())
+	}
+	if model.calls.Load() != 1 {
+		t.Fatalf("ping 1 made %d model calls, want 1", model.calls.Load())
+	}
+
+	// Ping 2, 280s after ping 1 restarted the clock (same arithmetic as
+	// TestMaxPingsAndPingRestartsTheClock): still inside the pre-expiry window, but the
+	// reserve from ping 1 is already current — a plain ping, not a second summary call.
+	if n := k.sweep(clock.advance(280 * time.Second)); n != 1 {
+		t.Fatalf("ping 2 did not fire (%d)", n)
+	}
+	waitPings(t, k, 2)
+	if fs.n() != 1 {
+		t.Fatalf("ping 2 sent %d ordinary pings, want 1 — the current reserve must refuse a second "+
+			"summary call", fs.n())
+	}
+	if model.calls.Load() != 1 {
+		t.Fatalf("ping 2 made another model call (%d total) — the reserve was already current", model.calls.Load())
+	}
+	if k.summarySubstituteCheckpointExists.Load() != 1 {
+		t.Error("ping 2's refusal was not counted as checkpoint_exists")
+	}
+	if k.summarySubstituted.Load() != 1 {
+		t.Errorf("summarySubstituted = %d, want 1 — only ping 1 was a substitute", k.summarySubstituted.Load())
+	}
+
+	// No ping 3: MaxPings is 2, same as the plain-ping K bound tested in
+	// TestMaxPingsAndPingRestartsTheClock. The reserve existing does not extend K.
+	if n := k.sweep(clock.advance(1000 * time.Second)); n != 0 {
+		t.Fatalf("fired a third ping (%d); MaxPings is 2 regardless of the reserve", n)
+	}
+	if got := k.pings.Load(); got != 2 {
+		t.Errorf("pings = %d, want 2 total — one summary call plus one plain ping, never a third", got)
+	}
+}
+
+// The identical setup with MaxPings=3: one summary call, then two plain pings, then nothing.
+// Confirms the pin holds for a K other than 2 — the summary call is not special-cased into its
+// own, separate budget.
+func TestKeepAliveSummaryCallCountsAsOnePingWithThreeMaxPings(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
+	kaCandidateWithCacheState(t, "sess-1", st, model, "pre_expiry", 60)
+
+	pol := kaPolicy()
+	pol.MaxPings = 3
+	start := clock.now()
+	recordOne(t, k, pol, kaBody, start, upstream{base: "http://up", path: "/v1/messages"})
+
+	if n := k.sweep(clock.advance(281 * time.Second)); n != 1 {
+		t.Fatalf("ping 1 did not fire (%d)", n)
+	}
+	waitPings(t, k, 1)
+	if k.summarySubstituted.Load() != 1 {
+		t.Fatalf("ping 1 was not the summary substitute (summarySubstituted=%d)", k.summarySubstituted.Load())
+	}
+
+	if n := k.sweep(clock.advance(280 * time.Second)); n != 1 {
+		t.Fatalf("ping 2 did not fire (%d)", n)
+	}
+	waitPings(t, k, 2)
+	if fs.n() != 1 {
+		t.Fatalf("ping 2 sent %d ordinary pings, want 1", fs.n())
+	}
+
+	if n := k.sweep(clock.advance(280 * time.Second)); n != 1 {
+		t.Fatalf("ping 3 did not fire (%d)", n)
+	}
+	waitPings(t, k, 3)
+	if fs.n() != 2 {
+		t.Fatalf("ping 3 sent %d ordinary pings total, want 2", fs.n())
+	}
+	if model.calls.Load() != 1 {
+		t.Fatalf("the model was called %d times total, want 1 — only ping 1 was ever a summary call",
+			model.calls.Load())
+	}
+
+	// No ping 4: MaxPings is 3.
+	if n := k.sweep(clock.advance(1000 * time.Second)); n != 0 {
+		t.Fatalf("fired a fourth ping (%d); MaxPings is 3", n)
+	}
+	if got := k.pings.Load(); got != 3 {
+		t.Errorf("pings = %d, want 3 total — one summary call plus two plain pings", got)
+	}
+}

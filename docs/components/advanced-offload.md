@@ -805,6 +805,10 @@ it writes the summary in the background, near the end of the cache's life, and h
 **reserve**. Nothing changes about the request sent upstream until the cache actually goes cold.
 Only then does the reserve get used.
 
+**The summarizer never changes how long the cache stays warm.** That is set by the cache
+strategy (`keepalive_max_pings`). A summary call takes the place of one ping, counts the same way
+a ping does, and never adds an extra one.
+
 #### What happens, turn by turn
 
 | | `any` | `pre_expiry` |
