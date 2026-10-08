@@ -688,21 +688,18 @@ func TestKeepAliveSubstituteRefreshesAStaleReserve(t *testing.T) {
 	}
 }
 
-// resummarize_tokens: 0 under cache_state: pre_expiry commissions a fresh summary on EVERY
-// keep-alive ping forever (checkpointCurrent's tail < resummarizeTokens is false whenever
-// resummarizeTokens <= 0, however small the tail), paying more than the ping it replaces and
-// never earning that cost back — refused at config time rather than discovered as a live spend.
-func TestCacheAwareRejectsResummarizeTokensZeroUnderPreExpiry(t *testing.T) {
-	_, err := newCacheAwareSummarizer([]byte("resummarize_tokens: 0\ntrigger:\n  cache_state: pre_expiry\n"))
-	if err == nil {
-		t.Fatal("resummarize_tokens: 0 with cache_state: pre_expiry built without error")
+// resummarize_tokens: 0 under cache_state: pre_expiry used to be refused at config time: before
+// issue #415, the keep-alive refresh decision compared the reserve's tail directly against
+// resummarize_tokens, so 0 meant "every ping sees the reserve as stale" — paying for an identical
+// summary forever. #415 replaced that comparison with a money gate in proxy's
+// fireSummarySubstitute (expected saving vs. projected cost): a tail is now merely an opportunity
+// the gate PRICES, and a zero-or-tiny tail simply never earns back a nonzero call cost, so there
+// is no longer a config-time trap to refuse — construction must succeed for both cache_state
+// values, exactly like any other resummarize_tokens value.
+func TestCacheAwareAllowsResummarizeTokensZeroUnderEitherCacheState(t *testing.T) {
+	if _, err := newCacheAwareSummarizer([]byte("resummarize_tokens: 0\ntrigger:\n  cache_state: pre_expiry\n")); err != nil {
+		t.Errorf("resummarize_tokens: 0 with cache_state: pre_expiry was rejected: %v", err)
 	}
-	if !strings.Contains(err.Error(), "resummarize_tokens") {
-		t.Errorf("error does not name the offending field: %v", err)
-	}
-
-	// The same resummarize_tokens: 0 is fine under `any` — it never asks a ping to decide
-	// staleness, so there is no commission-repeatedly-never-apply trap to guard against.
 	if _, err := newCacheAwareSummarizer([]byte("resummarize_tokens: 0\ntrigger:\n  cache_state: any\n")); err != nil {
 		t.Errorf("resummarize_tokens: 0 with cache_state: any was rejected: %v", err)
 	}

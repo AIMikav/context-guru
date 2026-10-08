@@ -49,6 +49,18 @@ type keepAliveCandidate struct {
 type KeepAliveCandidateInfo struct {
 	CacheState       string
 	PreExpirySeconds int
+	// IsRefresh is true when a Dispatch, if run, would REFRESH an existing `pre_expiry` reserve —
+	// replace it with a new one covering a larger span — rather than create the session's first
+	// one. The keeper's own money gate (issue #415: refresh only when the expected saving on the
+	// eventual cold return covers the call's own projected cost) applies ONLY to a refresh:
+	// creating the first reserve is compared against having none at all (the full-rewrite cold
+	// return this whole mechanism exists to avoid), not against a slightly smaller reserve, so it
+	// has no such test.
+	IsRefresh bool
+	// RefreshTailTokens is the token size of the material a refresh would fold in beyond what the
+	// existing reserve already covers — the number the money gate weighs against its own
+	// projected cost. Meaningful only when IsRefresh is true.
+	RefreshTailTokens int
 }
 
 var (
@@ -138,21 +150,30 @@ func ClearKeepAliveCandidate(session string) {
 	keepAliveCandMu.Unlock()
 }
 
-// checkpointCurrent reports whether an existing checkpoint still covers enough of candSpan (the
-// latest registered commission span) that the tail accumulated since it stays under
-// resummarizeTokens — tryReuse's own staleness test, specialised for a caller that only has a
-// candidate's span/coveredCount to work with, not a live request's msgs/start/end. Used only for
-// a `cache_state: pre_expiry` candidate: see KeepAliveSubstitute's own comment on why `any`
-// never asks this question.
-func checkpointCurrent(cp sumCheckpoint, candSpan []bschemas.ChatMessage, resummarizeTokens int) bool {
-	if resummarizeTokens <= 0 || cp.CoveredCount <= 0 || cp.CoveredCount > len(candSpan) {
-		return false
+// checkpointRefreshOpportunity reports whether an existing checkpoint, matched against candSpan
+// (the latest registered commission span), has any new tail material a refresh could fold in —
+// and if so, how many tokens that tail is. Used only for a `cache_state: pre_expiry` candidate:
+// see KeepAliveSubstitute's own comment on why `any` never asks this question.
+//
+// Deliberately NOT gated on resummarize_tokens — that knob keeps its original meaning for the
+// TURN-based re-summarize decision (`Offload`'s own tail check) and plays no part here since
+// issue #415: whether a refresh is worth DISPATCHING is a money question answered by
+// fireSummarySubstitute's own gate (expected saving vs. projected cost), not a token-count
+// threshold tuned for a different decision. This function answers only "is there anything new to
+// weigh at all" — ok=false (and tailTokens=0) when the tail is empty, which is the one case
+// categorically not worth pricing: zero new tokens cannot earn back any nonzero call cost.
+func checkpointRefreshOpportunity(cp sumCheckpoint, candSpan []bschemas.ChatMessage) (tailTokens int, ok bool) {
+	if cp.CoveredCount <= 0 || cp.CoveredCount > len(candSpan) {
+		return 0, true // nothing recognizable to compare against — treat as an opportunity, as before
 	}
 	if spanHash(candSpan[:cp.CoveredCount]) != cp.CoveredHash {
-		return false // prefix diverged — not the same conversation this checkpoint covers
+		return 0, true // prefix diverged — not the same conversation this checkpoint covers
 	}
 	tail := candSpan[cp.CoveredCount:]
-	return schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: tail}) < resummarizeTokens
+	if len(tail) == 0 {
+		return 0, false // truly current: nothing new since the checkpoint was written
+	}
+	return schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: tail}), true
 }
 
 // KeepAliveSubstitute reports whether a session has commission material the idle keep-alive may
@@ -170,15 +191,15 @@ func checkpointCurrent(cp sumCheckpoint, candSpan []bschemas.ChatMessage, resumm
 // info is returned alongside ok=true so the caller can additionally check cache_state against
 // its OWN timing before deciding to dispatch — see KeepAliveCandidateInfo.
 //
-// AN EXISTING CHECKPOINT REFUSES SUBSTITUTION, UNLESS IT IS A STALE `pre_expiry` RESERVE. For
-// `any` — "no combination wastes calls: with any, keep today's behaviour exactly" — any existing
-// checkpoint refuses, unconditionally, precisely as before: the next real turn splices it for
-// free, so a call here would summarize a span nobody is waiting on. For `pre_expiry`, a reserve
-// held across several pings must eventually be allowed to grow: once its own tail reaches
-// resummarize_tokens, substitution REFRESHES it (a fresh call covering the candidate's current,
-// larger span replaces the stale one) instead of sending a plain ping that holds the cache
-// warm but lets the reserve go stale forever. A CURRENT reserve still refuses, exactly like
-// `any` — there is nothing to gain from paying for a summary identical to the one already held.
+// AN EXISTING CHECKPOINT REFUSES SUBSTITUTION, UNLESS IT IS A `pre_expiry` RESERVE WITH SOMETHING
+// NEW TO FOLD IN. For `any` — "no combination wastes calls: with any, keep today's behaviour
+// exactly" — any existing checkpoint refuses, unconditionally, precisely as before: the next real
+// turn splices it for free, so a call here would summarize a span nobody is waiting on. For
+// `pre_expiry`, a reserve with an empty tail refuses the same way (there is nothing to gain from
+// paying for a summary identical to the one already held); a reserve with ANY nonempty tail is
+// offered to the caller as `info.IsRefresh` with `info.RefreshTailTokens` set, for
+// fireSummarySubstitute's own money gate (issue #415) to weigh against the call's cost before
+// actually dispatching — this function does not itself decide whether that tail is "enough".
 func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) KeepAliveSummaryResult, info KeepAliveCandidateInfo, reason KeepAliveSubstituteReason, ok bool) {
 	keepAliveCandMu.Lock()
 	cand, exists := keepAliveCand[session]
@@ -186,15 +207,23 @@ func KeepAliveSubstitute(session string) (dispatch func(timeout time.Duration) K
 	if !exists {
 		return nil, KeepAliveCandidateInfo{}, KeepAliveReasonNoCandidate, false
 	}
+	isRefresh := false
+	tailTokens := 0
 	if cp, has := loadCheckpoint(cand.ctx); has {
-		if cand.cacheState != components.CacheStatePreExpiry ||
-			checkpointCurrent(cp, cand.span, cand.s.resummarizeTokens) {
+		if cand.cacheState != components.CacheStatePreExpiry {
 			return nil, KeepAliveCandidateInfo{}, KeepAliveReasonCheckpointExists, false
 		}
-		// pre_expiry AND stale: fall through — Dispatch will commission a fresh summary that
-		// refreshes the reserve, covering the candidate's current (larger) span.
+		var opportunity bool
+		tailTokens, opportunity = checkpointRefreshOpportunity(cp, cand.span)
+		if !opportunity {
+			return nil, KeepAliveCandidateInfo{}, KeepAliveReasonCheckpointExists, false
+		}
+		// pre_expiry AND something new since the reserve: fall through, flagged as a refresh —
+		// fireSummarySubstitute decides whether that tail is actually worth paying for.
+		isRefresh = true
 	}
-	info = KeepAliveCandidateInfo{CacheState: cand.cacheState, PreExpirySeconds: cand.preExpirySeconds}
+	info = KeepAliveCandidateInfo{CacheState: cand.cacheState, PreExpirySeconds: cand.preExpirySeconds,
+		IsRefresh: isRefresh, RefreshTailTokens: tailTokens}
 	// reserved: a pre_expiry candidate is only ever offered when the keeper's OWN clock agrees
 	// this ping is inside the pre-expiry window (fireSummarySubstitute's phase check), so a
 	// summary committed from here is exactly as "not yet applied" as one committed directly from
@@ -229,4 +258,22 @@ func RegisterKeepAliveCandidateForTest(session string, st store.Store,
 	}).registerKeepAliveCandidate(
 		&components.Ctx{Session: session, Store: st, Ctx: context.Background()},
 		call, path, span, coveredCount)
+}
+
+// SeedReservedCheckpointForTest writes a `Reserved` checkpoint directly to the store, covering
+// exactly coveredSpan, for a proxy-side test to put a session into "has a pre_expiry reserve with
+// a tail of known size" without driving a real commission through Offload. Test-only, for the
+// same reason RegisterKeepAliveCandidateForTest is: a legitimate caller only ever gets a
+// checkpoint from an actual commission.
+//
+// A later RegisterKeepAliveCandidateForTest call whose span starts with these exact messages (byte
+// for byte) gives checkpointRefreshOpportunity a prefix hash it recognizes, with everything past
+// coveredSpan read as the refresh's own tail — this is the one lever a test needs to control
+// info.RefreshTailTokens without needing to see spanHash/sumCheckpoint, which stay package-private.
+func SeedReservedCheckpointForTest(session string, st store.Store, coveredSpan []bschemas.ChatMessage, summaryText string) {
+	c := &components.Ctx{Session: session, Store: st, Ctx: context.Background()}
+	saveCheckpoint(c, sumCheckpoint{
+		SummaryMsg: summaryText, CoveredCount: len(coveredSpan), CoveredHash: spanHash(coveredSpan),
+		Key: "test-key", Reserved: true,
+	})
 }

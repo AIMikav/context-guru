@@ -516,6 +516,15 @@ type keeper struct {
 	// commit), which have their own counters already (CacheAwareSummarizerErrors/Timeouts/Empty).
 	summarySubstituteInFlight        atomic.Int64
 	summarySubstituteConcurrencyFull atomic.Int64
+	// summarySubstituteRefreshPaid/RefreshNotWorthIt count the money gate's own decision (#415)
+	// for a `cache_state: pre_expiry` reserve that already exists and has new material: Paid when
+	// the expected saving on the eventual cold return (the new tail's own tokens at the model's
+	// cache-write rate) covers the refresh's own projected cost, NotWorthIt when it does not and
+	// the ping stays an ordinary one instead. Only incremented for a REFRESH (an existing reserve
+	// growing a larger one) — creating a session's first reserve has no such test and is not
+	// counted by either.
+	summarySubstituteRefreshPaid       atomic.Int64
+	summarySubstituteRefreshNotWorthIt atomic.Int64
 }
 
 // keepAliveDisabled is the operator's kill switch, read once at construction. A single
@@ -847,6 +856,29 @@ func (k *keeper) projectedSummaryUSD(model string, prefix int64) float64 {
 	return float64(prefix)*price.CacheRead + float64(summaryOutputBudgetGuess)*price.Output
 }
 
+// expectedRefreshSavingUSD is the dollar value a refresh folding tailTokens of new material into
+// a `cache_state: pre_expiry` reserve is expected to earn back: those tokens would otherwise be
+// written, at the model's cache-WRITE rate, on the cold return the reserve exists to cheapen.
+// Issue #415's own "safe lower bound": it deliberately omits any saving from later turns reading
+// the larger reserve instead of the smaller one, since how many turns follow a cold return is not
+// knowable at ping time.
+//
+// Zero when the model is not priced, for the same reason projectedPingUSD/projectedSummaryUSD are
+// — an incomplete price list must not block a feature it cannot afford to evaluate, and
+// fireSummarySubstitute's own comparison (saving < cost) already fails toward "ping normally"
+// whenever cost cannot be shown to be zero too.
+func (k *keeper) expectedRefreshSavingUSD(model string, tailTokens int) float64 {
+	p := k.h.opts.Prices
+	if p == nil || model == "" || tailTokens <= 0 {
+		return 0
+	}
+	price, ok := p.Price(context.Background(), model)
+	if !ok || price.Zero() {
+		return 0
+	}
+	return float64(tailTokens) * price.CacheWrite
+}
+
 // retire releases one session's held material now: zeroized, deadline cancelled, entry gone.
 // Idempotent and safe on a session that was never tracked, which is what lets every refusal path
 // call it unconditionally.
@@ -1136,13 +1168,34 @@ func (k *keeper) fireSummarySubstitute(j pingJob) bool {
 		return false
 	}
 	// Respect the keep-alive $ cap on a PROJECTION, before spending anything.
-	if estimate := k.projectedSummaryUSD(model, prefix); estimate > ceiling {
+	cost := k.projectedSummaryUSD(model, prefix)
+	if cost > ceiling {
 		k.summarySubstituteOverBudget.Add(1)
 		slog.Debug("context-guru: cache_aware_summarizer keep-alive substitute would exceed the "+
 			"per-ping cost cap; pinging normally instead",
 			"tenant", tenantLabel(j.tenant), "session", j.session,
-			"estimate_usd", estimate, "ceiling_usd", ceiling)
+			"estimate_usd", cost, "ceiling_usd", ceiling)
 		return false
+	}
+	// REFRESHING an existing reserve (as opposed to creating a session's first one) only earns
+	// back its own cost when the material it folds in is worth more than the call itself — see
+	// issue #415. Creating the first reserve has no such test: it is compared against "no reserve
+	// at all" (the full-rewrite cold return this whole mechanism exists to avoid), not against a
+	// slightly smaller one, so info.IsRefresh gates this block to the refresh case alone.
+	if info.IsRefresh {
+		saving := k.expectedRefreshSavingUSD(model, info.RefreshTailTokens)
+		if saving < cost {
+			k.summarySubstituteRefreshNotWorthIt.Add(1)
+			slog.Debug("context-guru: cache_aware_summarizer refresh would cost more than it saves; "+
+				"pinging normally instead",
+				"tenant", tenantLabel(j.tenant), "session", j.session,
+				"tail_tokens", info.RefreshTailTokens, "expected_saving_usd", saving, "projected_cost_usd", cost)
+			return false
+		}
+		k.summarySubstituteRefreshPaid.Add(1)
+		slog.Debug("context-guru: cache_aware_summarizer refresh pays for itself; refreshing the reserve",
+			"tenant", tenantLabel(j.tenant), "session", j.session,
+			"tail_tokens", info.RefreshTailTokens, "expected_saving_usd", saving, "projected_cost_usd", cost)
 	}
 	start := k.now()
 	res := dispatch(offload.CacheAwareSummarizerCallTimeout())
@@ -1160,11 +1213,11 @@ func (k *keeper) fireSummarySubstitute(j pingJob) bool {
 			"tenant", tenantLabel(j.tenant), "session", j.session, "reason", string(res.Reason))
 		return false
 	}
-	cost := k.recordSummarySubstitute(j, res, ms, start)
+	spent := k.recordSummarySubstitute(j, res, ms, start)
 	slog.Debug("context-guru: cache keep-alive ping (via cache_aware_summarizer)",
 		"tenant", tenantLabel(j.tenant), "session", j.session, "ping", j.ping,
 		"cache_read", res.CacheRead, "cache_write", res.CacheWrite, "output", res.Output,
-		"cost_usd", cost, "ms", ms)
+		"cost_usd", spent, "ms", ms)
 	return true
 }
 
@@ -1535,6 +1588,13 @@ type KeepAliveStats struct {
 	SummarySubstituteCheckpointExists int64 `json:"keepalive_summary_substitute_checkpoint_exists"`
 	SummarySubstituteInFlight         int64 `json:"keepalive_summary_substitute_in_flight"`
 	SummarySubstituteConcurrencyFull  int64 `json:"keepalive_summary_substitute_concurrency_full"`
+	// SummarySubstituteRefreshPaid/RefreshNotWorthIt are the money gate's own ledger (#415) for a
+	// `pre_expiry` reserve that already exists: Paid when a refresh's expected saving on the
+	// eventual cold return covered its own projected cost, NotWorthIt when it did not. Climbing
+	// NotWorthIt on a deployment with a lot of idle time between turns is expected and healthy —
+	// it is the gate doing its job, not a failure.
+	SummarySubstituteRefreshPaid       int64 `json:"keepalive_summary_substitute_refresh_paid"`
+	SummarySubstituteRefreshNotWorthIt int64 `json:"keepalive_summary_substitute_refresh_not_worth_it"`
 }
 
 // PendingPings reports how many tracked sessions still have a ping scheduled ahead of them.
@@ -1593,15 +1653,17 @@ func (k *keeper) Stats() KeepAliveStats {
 	k.mu.Unlock()
 	return KeepAliveStats{Live: live, Pings: k.pings.Load(), Skipped: k.skipped.Load(),
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
-		SpentUSD:                          math.Float64frombits(k.spentUSD.Load()),
-		SummarySubstituted:                k.summarySubstituted.Load(),
-		SummarySubstituteFailed:           k.summarySubstituteFailed.Load(),
-		SummarySubstituteOverBudget:       k.summarySubstituteOverBudget.Load(),
-		SummarySubstitutePhaseMismatch:    k.summarySubstitutePhaseMismatch.Load(),
-		SummarySubstituteNoCandidate:      k.summarySubstituteNoCandidate.Load(),
-		SummarySubstituteCheckpointExists: k.summarySubstituteCheckpointExists.Load(),
-		SummarySubstituteInFlight:         k.summarySubstituteInFlight.Load(),
-		SummarySubstituteConcurrencyFull:  k.summarySubstituteConcurrencyFull.Load(),
+		SpentUSD:                           math.Float64frombits(k.spentUSD.Load()),
+		SummarySubstituted:                 k.summarySubstituted.Load(),
+		SummarySubstituteFailed:            k.summarySubstituteFailed.Load(),
+		SummarySubstituteOverBudget:        k.summarySubstituteOverBudget.Load(),
+		SummarySubstitutePhaseMismatch:     k.summarySubstitutePhaseMismatch.Load(),
+		SummarySubstituteNoCandidate:       k.summarySubstituteNoCandidate.Load(),
+		SummarySubstituteCheckpointExists:  k.summarySubstituteCheckpointExists.Load(),
+		SummarySubstituteInFlight:          k.summarySubstituteInFlight.Load(),
+		SummarySubstituteConcurrencyFull:   k.summarySubstituteConcurrencyFull.Load(),
+		SummarySubstituteRefreshPaid:       k.summarySubstituteRefreshPaid.Load(),
+		SummarySubstituteRefreshNotWorthIt: k.summarySubstituteRefreshNotWorthIt.Load(),
 	}
 }
 

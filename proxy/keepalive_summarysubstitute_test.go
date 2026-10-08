@@ -213,6 +213,112 @@ func TestKeepAliveSubstituteRespectsPreExpiryPhaseNotJustKeeperTiming(t *testing
 	}
 }
 
+// buildRefreshCandidate seeds a `pre_expiry` reserve covering one short message, then registers
+// a keep-alive candidate whose span is that SAME message plus a tail message of tailText — the
+// one lever these money-gate tests need to control info.RefreshTailTokens without reaching into
+// offload's package-private sumCheckpoint/spanHash. tailText is taken literally rather than
+// computed from a token estimate: a real BPE tokenizer merges a repeated single character far
+// more aggressively than ordinary text, so the two tests below pass VARIED filler sized with a
+// wide margin on either side of their break-even instead of a precise token count.
+func buildRefreshCandidate(t *testing.T, session string, st store.Store, model *fakeSummaryModel, tailText string) {
+	t.Helper()
+	prefixMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
+	schema.SetMessageText(&prefixMsg, "fix the failing tests, there is a lot of context here")
+	tailMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleAssistant}
+	schema.SetMessageText(&tailMsg, tailText)
+	span := []bschemas.ChatMessage{prefixMsg, tailMsg}
+
+	offload.SeedReservedCheckpointForTest(session, st, span[:1], "<summary>explored the handler</summary>")
+
+	ask := append([]bschemas.ChatMessage(nil), span...)
+	ask = append(ask, bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser})
+	call := func(ctx context.Context) (string, error) { return model.CompleteMessages(ctx, "", ask) }
+	offload.RegisterKeepAliveCandidateForTest(session, st, call, "messages", span, 1, "pre_expiry", 60)
+	t.Cleanup(func() { offload.ClearKeepAliveCandidate(session) })
+}
+
+// tailFiller is varied, realistic-shaped filler text (not a repeated single character, which a
+// real BPE tokenizer compresses far more aggressively than ordinary prose) — n repeats of an
+// 11-word sentence, roughly 12-14 BPE tokens each under o200k_base.
+func tailFiller(n int) string {
+	return strings.Repeat("the quick brown fox jumps over the lazy dog near the fence. ", n)
+}
+
+// ⭐ ISSUE #415: a refresh below break-even must stay a plain ping, with the model never even
+// called — the money gate refuses BEFORE dispatch, not after paying for a call it then discards.
+func TestKeepAliveRefreshBelowBreakEvenPingsNormally(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	// CacheRead priced at 0 isolates the projected cost to the output-budget guess alone (a
+	// fixed $0.02 at these prices), so the break-even point is simply "does the tail's own
+	// cache-write value clear $0.02" — exactly the number issue #415's own worked examples use.
+	k.h.opts.Prices = fixedPrice{modelinfo.Price{CacheRead: 0, Output: 1e-5, CacheWrite: 5e-5}}
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>should never be reached</summary>"}
+	// Two sentences of new material, on the order of 25 real tokens: at $0.00005/token
+	// cache-write, worth roughly $0.001 — far short of the $0.02 refresh it would cost.
+	buildRefreshCandidate(t, "sess-1", st, model, tailFiller(2))
+
+	recordOne(t, k, kaPolicy(), kaBody, clock.now(), upstream{base: "http://up", path: "/v1/messages"})
+	k.sweep(clock.advance(281 * time.Second))
+	waitPings(t, k, 1)
+	if fs.n() != 1 {
+		t.Fatalf("sent %d ordinary pings, want 1 — a below-break-even refresh must fall back to a "+
+			"plain ping", fs.n())
+	}
+	if model.calls.Load() != 0 {
+		t.Errorf("the summarizer's model was called %d times — a below-break-even refresh must "+
+			"never be DISPATCHED, not merely refused after paying for it", model.calls.Load())
+	}
+	if k.summarySubstituteRefreshNotWorthIt.Load() != 1 {
+		t.Error("the below-break-even refusal was not counted")
+	}
+	if k.summarySubstituteRefreshPaid.Load() != 0 {
+		t.Error("summarySubstituteRefreshPaid was incremented despite being below break-even")
+	}
+	if k.summarySubstituted.Load() != 0 {
+		t.Error("summarySubstituted was incremented despite the refresh being refused")
+	}
+}
+
+// The identical setup, but with enough new material that the refresh pays for itself: the
+// summary call fires INSTEAD of the ping, counted as both the refresh decision and the ping.
+func TestKeepAliveRefreshAboveBreakEvenRefreshes(t *testing.T) {
+	k, fs, clock := testKeeper(t, Limits{})
+	k.h.opts.Prices = fixedPrice{modelinfo.Price{CacheRead: 0, Output: 1e-5, CacheWrite: 5e-5}}
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	model := &fakeSummaryModel{out: "<summary>explored the handler, refreshed</summary>"}
+	// 100 repeats of an 11-word sentence, on the order of 1,300 real tokens: at $0.00005/token
+	// cache-write, worth roughly $0.065 — comfortably past the same $0.02 refresh cost as the
+	// test above.
+	buildRefreshCandidate(t, "sess-1", st, model, tailFiller(100))
+
+	recordOne(t, k, kaPolicy(), kaBody, clock.now(), upstream{base: "http://up", path: "/v1/messages"})
+	k.sweep(clock.advance(281 * time.Second))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && k.summarySubstituted.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if k.summarySubstituted.Load() != 1 {
+		t.Fatalf("summarySubstituted = %d, want 1 once the refresh clears break-even",
+			k.summarySubstituted.Load())
+	}
+	if fs.n() != 0 {
+		t.Errorf("sent %d ordinary pings — an above-break-even refresh should have replaced it", fs.n())
+	}
+	if model.calls.Load() != 1 {
+		t.Errorf("the summarizer's model was called %d times, want 1", model.calls.Load())
+	}
+	if k.summarySubstituteRefreshPaid.Load() != 1 {
+		t.Error("the above-break-even refresh was not counted as paid")
+	}
+	if k.summarySubstituteRefreshNotWorthIt.Load() != 0 {
+		t.Error("summarySubstituteRefreshNotWorthIt was incremented despite clearing break-even")
+	}
+	if got := k.pings.Load(); got != 1 {
+		t.Errorf("pings = %d, want 1 — a refresh must be counted once, as THE ping for this idle span", got)
+	}
+}
+
 // The same `pre_expiry` candidate DOES substitute once the ping actually lands inside its
 // window — proving the test above is a real gate and not a permanent refusal.
 func TestKeepAliveSubstituteFiresOncePreExpiryPhaseIsLive(t *testing.T) {

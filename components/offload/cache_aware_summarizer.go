@@ -487,23 +487,15 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	if err := applyCacheAwareTriggerDefaults(raw, &cfg.Trigger); err != nil {
 		return nil, err
 	}
-	// COMMISSION-REPEATEDLY-NEVER-APPLY, REFUSED AT CONFIG TIME. Under cache_state: pre_expiry a
-	// checkpoint is held in reserve across keep-alive pings, refreshed only once its own tail
-	// reaches resummarize_tokens (see KeepAliveSubstitute's checkpointCurrent). resummarize_tokens:
-	// 0 makes EVERY ping see the reserve as stale — even with zero new messages, 0 tokens >= 0 is
-	// still true — so every single ping would pay for a fresh summary identical to the one already
-	// held, forever, instead of a plain cache-read ping. That is strictly worse than the ping it
-	// replaces and never earns its own cost back, which is exactly the failure mode worth refusing
-	// up front rather than measuring in production. `any` has no such trap: 0 there means "roll
-	// forward on every eligible TURN" (a real, if expensive, choice already supported) because `any`
-	// never asks a ping to make this decision at all.
-	if cfg.Trigger.CacheState == components.CacheStatePreExpiry && cfg.ResummarizeTokens == 0 {
-		return nil, errors.New("cache_aware_summarizer: resummarize_tokens: 0 with trigger.cache_state: " +
-			"pre_expiry would pay for a fresh summary at every keep-alive ping forever, even with " +
-			"nothing new to summarize — the reserve is never 'current' when the threshold is zero. " +
-			"Set resummarize_tokens to a positive value, or use cache_state: any if re-summarizing on " +
-			"every eligible turn is really what you want")
-	}
+	// NOTE: an earlier revision rejected `resummarize_tokens: 0` together with
+	// `cache_state: pre_expiry` here, because the keep-alive refresh decision used to compare the
+	// reserve's own tail against resummarize_tokens — making 0 a "pay for an identical summary on
+	// every single ping, forever" trap. Issue #415 replaced that token-count comparison with a
+	// money gate (expected saving vs. projected cost, in proxy's fireSummarySubstitute): any
+	// nonempty tail is now merely an OPPORTUNITY the gate prices, so a tiny or zero-token-threshold
+	// tail simply never earns back a nonzero call cost and the ping stays plain — no config-time
+	// trap left to refuse here. resummarize_tokens keeps its original, turn-based meaning
+	// unchanged (see its own re-summarize check below).
 	profiles, err := loadSummarizerProfiles(summarizerProfilesYAML)
 	if err != nil {
 		return nil, err
