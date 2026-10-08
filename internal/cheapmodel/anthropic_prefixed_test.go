@@ -245,3 +245,171 @@ func TestThinkingAdjustedMaxTokens(t *testing.T) {
 		})
 	}
 }
+
+// THE DEFECT, live on claude-sonnet-5[1m] (6/6 failures in one capture): Claude Code sends a
+// mid-conversation `role: system` reminder as the LAST message of the stored request on
+// effectively every turn. Appending the ask directly after that message is a guaranteed 400
+// ("role 'system' must precede an 'assistant' message or end the array"). An earlier version of
+// this fix inserted the ask BEFORE the system message instead, which cleared that rule but moved
+// bytes in front of the cache_control breakpoint Claude Code places on exactly that message —
+// measured live, that version turned the cache READ this method exists for into a full WRITE
+// (read=0, write=21,652). This version leaves the system message exactly where it is and appends
+// a short synthetic assistant turn ("Understood.") plus the ask after it instead — measured live,
+// read=21,644, write=0. See insertAskMessage's doc comment for the full comparison.
+func TestCompletePrefixedAppendsAfterATrailingSystemMessage(t *testing.T) {
+	var got []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[]}"}],`+
+			`"usage":{"input_tokens":40,"output_tokens":10,"cache_read_input_tokens":19595}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-sonnet-5","max_tokens":16000,` +
+		`"messages":[` +
+		`{"role":"user","content":"first turn"},` +
+		`{"role":"assistant","content":"reply"},` +
+		`{"role":"user","content":"second turn"},` +
+		`{"role":"system","content":"<system-reminder>be careful</system-reminder>"}` +
+		`]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-sonnet-5"}
+	reply, _, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge")
+	if err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	if reply != `{"verdicts":[]}` {
+		t.Fatalf("reply = %q", reply)
+	}
+
+	msgs := gjson.GetBytes(got, "messages").Array()
+	if len(msgs) != 6 {
+		t.Fatalf("got %d messages, want 6 (4 original + the synthetic turn + the ask): %s",
+			len(msgs), got)
+	}
+	// EVERY ORIGINAL MESSAGE IS BYTE-IDENTICAL AND UNMOVED — this is what keeps the cache: nothing
+	// before (or at) the system message's own position may change by even a byte.
+	want := []struct{ role, content string }{
+		{"user", "first turn"}, {"assistant", "reply"}, {"user", "second turn"},
+		{"system", "<system-reminder>be careful</system-reminder>"},
+		{"assistant", "Understood."},
+		{"user", "judge"},
+	}
+	for i, w := range want {
+		if msgs[i].Get("role").String() != w.role || msgs[i].Get("content").String() != w.content {
+			t.Errorf("messages[%d] = %s, want role=%q content=%q", i, msgs[i].Raw, w.role, w.content)
+		}
+	}
+	// THE ASK IS ALWAYS LAST, which is what keeps this route's own prefill rule satisfied.
+	if last := msgs[len(msgs)-1]; last.Get("role").String() != "user" || last.Get("content").String() != "judge" {
+		t.Fatalf("the ask is not the final message: %s", got)
+	}
+}
+
+// MULTIPLE TRAILING SYSTEM MESSAGES all stay exactly where they are; the synthetic turn and the
+// ask land after the whole run, not between any of them.
+func TestCompletePrefixedAppendsAfterMultipleTrailingSystemMessages(t *testing.T) {
+	var got []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[]}"}],"usage":{}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-sonnet-5","max_tokens":16000,` +
+		`"messages":[` +
+		`{"role":"user","content":"turn one"},` +
+		`{"role":"system","content":"reminder one"},` +
+		`{"role":"system","content":"reminder two"}` +
+		`]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-sonnet-5"}
+	if _, _, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge"); err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	msgs := gjson.GetBytes(got, "messages").Array()
+	if len(msgs) != 5 {
+		t.Fatalf("got %d messages, want 5: %s", len(msgs), got)
+	}
+	if msgs[1].Get("content").String() != "reminder one" || msgs[2].Get("content").String() != "reminder two" {
+		t.Fatalf("the trailing system run was reordered: %s", got)
+	}
+	if msgs[3].Get("role").String() != "assistant" || msgs[3].Get("content").String() != "Understood." {
+		t.Fatalf("the synthetic turn did not land right after the system run: %s", got)
+	}
+	if msgs[4].Get("role").String() != "user" || msgs[4].Get("content").String() != "judge" {
+		t.Fatalf("the ask did not land last: %s", got)
+	}
+}
+
+// THE ORDINARY CASE, with no trailing system message, is unaffected: the ask still lands at the
+// absolute end, exactly as CompletePrefixed always behaved before this fix.
+func TestCompletePrefixedAppendsAtTheEndWithNoTrailingSystemMessage(t *testing.T) {
+	var got []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"{\"verdicts\":[]}"}],"usage":{}}`)
+	}))
+	defer up.Close()
+
+	prefixBody := []byte(`{"model":"claude-sonnet-5","max_tokens":16000,` +
+		`"messages":[{"role":"user","content":"carry on"}]}`)
+	cli := Anthropic{BaseURL: up.URL, Model: "claude-sonnet-5"}
+	if _, _, err := cli.CompletePrefixed(context.Background(), prefixBody, "judge"); err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	msgs := gjson.GetBytes(got, "messages").Array()
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2: %s", len(msgs), got)
+	}
+	if msgs[0].Get("content").String() != "carry on" || msgs[1].Get("content").String() != "judge" {
+		t.Fatalf("the ordinary append-at-the-end shape changed: %s", got)
+	}
+}
+
+// insertAskMessage unit-level: pins the insertion point directly, independent of the HTTP
+// plumbing above.
+func TestInsertAskMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantRole []string
+	}{
+		{"no trailing system: ask appended alone", `{"messages":[{"role":"user","content":"a"}]}`,
+			[]string{"user", "user"}},
+		{"one trailing system: synthetic turn then ask, both after it",
+			`{"messages":[{"role":"user","content":"a"},{"role":"system","content":"r"}]}`,
+			[]string{"user", "system", "assistant", "user"}},
+		{"two trailing system: the whole run is untouched, synthetic turn and ask follow it",
+			`{"messages":[{"role":"user","content":"a"},` +
+				`{"role":"system","content":"r1"},{"role":"system","content":"r2"}]}`,
+			[]string{"user", "system", "system", "assistant", "user"}},
+		{"empty messages", `{"messages":[]}`, []string{"user"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := insertAskMessage([]byte(tc.body), "ask")
+			if err != nil {
+				t.Fatalf("insertAskMessage: %v", err)
+			}
+			msgs := gjson.GetBytes(out, "messages").Array()
+			if len(msgs) != len(tc.wantRole) {
+				t.Fatalf("got %d messages, want %d: %s", len(msgs), len(tc.wantRole), out)
+			}
+			for i, role := range tc.wantRole {
+				if got := msgs[i].Get("role").String(); got != role {
+					t.Errorf("messages[%d].role = %q, want %q (%s)", i, got, role, out)
+				}
+			}
+		})
+	}
+}
