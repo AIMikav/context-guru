@@ -590,6 +590,7 @@ func (k *keeper) Stop() {
 	for key, e := range k.live {
 		e.clear()
 		delete(k.live, key)
+		offload.ClearKeepAliveCandidate(e.session)
 	}
 	k.bytes = 0
 	k.turns = map[string]int{}
@@ -892,6 +893,12 @@ func (k *keeper) retire(key string) {
 	k.bytes -= int64(len(e.body))
 	e.clear()
 	delete(k.live, key)
+	// The keep-alive substitute registry (cache_aware_summarizer.go's own, session-keyed map)
+	// is not part of this struct and nothing else ever cleared it on this exit — a session that
+	// retired here could still hold a candidate forever, which is how that registry used to fill
+	// permanently after 2,048 sessions ever passed through. Every exit from k.live must drop it
+	// too; see offload.ClearKeepAliveCandidate's own doc comment.
+	offload.ClearKeepAliveCandidate(e.session)
 }
 
 // forget releases everything held for one tenant, for the paths that end an account's authority
@@ -922,6 +929,7 @@ func (k *keeper) forget(tenantID string) {
 		e.clear()
 		delete(k.live, key)
 		delete(k.turns, key)
+		offload.ClearKeepAliveCandidate(e.session)
 	}
 	// Per-session overrides go too. This is the path a Settings save takes, so unticking the
 	// account-wide box must not leave armed sessions pinging on the strength of an
@@ -947,6 +955,7 @@ func (k *keeper) evictLocked() {
 		k.bytes -= int64(len(e.body))
 		e.clear()
 		delete(k.live, worstKey)
+		offload.ClearKeepAliveCandidate(e.session)
 		k.skipped.Add(1)
 	}
 }
@@ -1068,15 +1077,33 @@ func (k *keeper) fire(j pingJob) {
 		k.skipped.Add(1)
 		return
 	}
-	defer release()
 
 	// Let cache_aware_summarizer stand in for this ping when it has material registered for the
 	// session: same cache-read refresh, plus a compaction instead of one output token. Never
 	// double-pinged — on success this returns, and the ordinary ping below never runs for this
 	// due cycle; on any kind of "no" it falls through to the ordinary ping, fail open.
+	//
+	// RELEASED BEFORE THE CALL, not deferred to the end of fire(): the substitute's own call can
+	// run for up to cacheAwareTimeout (300 s), against an ordinary ping's single round trip of a
+	// second or two. AcquireSpare's job is only to confirm the tenant currently has slack to
+	// spare one more concurrent request; holding the slot for the whole substitute call would
+	// starve the tenant's real traffic of that headroom for minutes instead of a moment, on every
+	// due cycle this fires for. The substitute call needs no slot of its own to stay bounded — it
+	// already shares cache_aware_summarizer's own, separate concurrency gate (summarySlots in
+	// cache_aware_async.go), sized for exactly this kind of call.
+	release()
 	if k.fireSummarySubstitute(j) {
 		return
 	}
+
+	// Falling through to an ordinary ping needs its own slot — the one above was already
+	// released and only ever covered the eligibility check, not this request.
+	release, err = k.h.limiter.AcquireSpare(j.tenant, keepAliveReserveFrac)
+	if err != nil {
+		k.skipped.Add(1)
+		return
+	}
+	defer release()
 
 	body, ok := pingBody(j.raw, j.up.path)
 	if !ok {
@@ -1245,7 +1272,8 @@ func (k *keeper) recordSummarySubstitute(j pingJob, res offload.KeepAliveSummary
 		price, priced = p.Price(context.Background(), model)
 	}
 	u := Usage{FreshInput: int64(res.FreshInput), CacheRead: int64(res.CacheRead),
-		CacheWrite: int64(res.CacheWrite), Output: int64(res.Output)}
+		CacheWrite: int64(res.CacheWrite), Output: int64(res.Output),
+		CacheWrite1h: int64(res.CacheWrite1h)}
 	// Same clock, same gate, same reason as record1: a substitute call reads the SAME cached
 	// prefix a ping would (it is built from the byte-identical forwarded body — see
 	// offload.registerKeepAliveCandidate), so it refreshes the SAME liveness clock
@@ -1255,7 +1283,9 @@ func (k *keeper) recordSummarySubstitute(j pingJob, res offload.KeepAliveSummary
 	}
 	var cost float64
 	if priced && !price.Zero() && (u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
-		cost = price.CostWithCacheWrite1h(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output, 0)
+		// u.CacheWrite1h, not 0: see record1's own call to CostWithCacheWrite1h for why the
+		// 1h-tier subset has to be passed through rather than folded into the 5-minute rate.
+		cost = price.CostWithCacheWrite1h(u.FreshInput, u.CacheRead, u.CacheWrite, u.Output, u.CacheWrite1h)
 	}
 	k.mu.Lock()
 	e.spent += cost

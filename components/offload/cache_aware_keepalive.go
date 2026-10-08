@@ -107,12 +107,40 @@ const (
 // maxKeepAliveCandidates bounds the registry the same way the keeper's own kaEntry map is
 // bounded (proxy/keepalive.go's maxKeepAliveSessions): a session count, not a request-rate
 // knob, so a generous but finite ceiling costs nothing in the ordinary case and fails safe in
-// the pathological one — the oldest registration is simply overwritten by Go's own map
-// semantics on `register` once the caller stops inserting new keys past the point memory
-// pressure would matter in practice, which is why this bound is advisory rather than enforced
-// with eviction: unlike the keeper's entries, a stale candidate holds no credential and no
-// provider body, only a copy of this session's own already-forwarded conversation.
+// the pathological one.
+//
+// ENFORCED BY REFUSAL, NOT EVICTION: at the ceiling, a NEW session's registration is refused
+// outright and the oldest ones are kept — the opposite of what an earlier version of this
+// comment claimed ("the oldest registration is simply overwritten"). That was never true: Go's
+// map semantics do not evict anything on insert, and the code below has always `return`ed
+// before writing a new key once at capacity. The practical effect used to be a registry that
+// could fill once and then never register another session until the proxy restarted, because
+// nothing ever removed an ENDED session's entry — proxy's keeper (keeper.retire, keeper.forget,
+// keeper.evictLocked) now does, by calling ClearKeepAliveCandidate wherever it stops tracking a
+// session, and pruneStaleKeepAliveCandidatesLocked below catches whatever that misses (a host
+// embedding this package without that keeper, or a session the keeper itself never tracked).
 const maxKeepAliveCandidates = 2048
+
+// maxKeepAliveCandidateAge bounds how long a registration may sit unconsumed before it is swept
+// as abandoned, regardless of whether anything ever called ClearKeepAliveCandidate for it. Set
+// well above the longest gap this repo's own mechanisms expect between a session's turns (the
+// `1-hour-head` cache strategy is the longest-lived one it ships) so a session merely slow to
+// return is never swept out from under it.
+const maxKeepAliveCandidateAge = 2 * time.Hour
+
+// pruneStaleKeepAliveCandidatesLocked drops every candidate older than maxKeepAliveCandidateAge.
+// Called with keepAliveCandMu already held, from registerKeepAliveCandidate, so the registry
+// self-heals even on a deployment that never retires a session the way proxy's keeper does.
+// Proxy's own exits (keeper.retire, keeper.forget, keeper.evictLocked) clear a candidate
+// immediately via ClearKeepAliveCandidate and so never depend on this running; this is the
+// fallback for everything that does not go through the keeper at all.
+func pruneStaleKeepAliveCandidatesLocked(now time.Time) {
+	for session, cand := range keepAliveCand {
+		if now.Sub(cand.registeredAt) > maxKeepAliveCandidateAge {
+			delete(keepAliveCand, session)
+		}
+	}
+}
 
 // registerKeepAliveCandidate stores this turn's commission material as the keep-alive
 // substitute, replacing any earlier registration for the session (always safe to replace: the
@@ -141,12 +169,19 @@ func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, cal
 		registeredAt:     time.Now(),
 	}
 	keepAliveCandMu.Lock()
-	if _, exists := keepAliveCand[c.Session]; !exists && len(keepAliveCand) >= maxKeepAliveCandidates {
-		// Fail toward NOT remembering a new session rather than growing without bound — the
-		// consequence is only that this session's idle pings stay bare pings, not that anything
-		// already relying on a registration loses it.
-		keepAliveCandMu.Unlock()
-		return
+	if _, exists := keepAliveCand[c.Session]; !exists {
+		if len(keepAliveCand) >= maxKeepAliveCandidates {
+			// Try to make room from entries nothing ever cleared before refusing outright — see
+			// pruneStaleKeepAliveCandidatesLocked.
+			pruneStaleKeepAliveCandidatesLocked(cand.registeredAt)
+		}
+		if len(keepAliveCand) >= maxKeepAliveCandidates {
+			// Fail toward NOT remembering a new session rather than growing without bound — the
+			// consequence is only that this session's idle pings stay bare pings, not that
+			// anything already relying on a registration loses it.
+			keepAliveCandMu.Unlock()
+			return
+		}
 	}
 	keepAliveCand[c.Session] = cand
 	keepAliveCandMu.Unlock()
