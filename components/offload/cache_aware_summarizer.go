@@ -237,7 +237,9 @@ func (p *summarizerProfiles) roleFor(modelID string) (role bschemas.ChatMessageR
 // costs a compaction opportunity, but proceeding when it WOULD be costs a silently smaller
 // cache read than the dashboard's own numbers would suggest — the gap a live test measured on
 // claude-haiku-4-5 (reading ~2,100-2,150 tokens short of the immediately preceding real turn,
-// in two independent sessions) before this gate existed.
+// in two independent sessions) before this gate existed. The registry (see
+// summarizer_model_profiles.yaml's thinking_last_turn_models) also names Claude 3.7 Sonnet,
+// bare Opus 4 and Opus 4.1, and bare Sonnet 4 and Sonnet 4.5, per the same doc page's cutoffs.
 func (p *summarizerProfiles) thinkingLastTurnOnly(modelID string) bool {
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	if id == "" {

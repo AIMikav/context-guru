@@ -849,3 +849,50 @@ func TestCacheAwareProceedsOnALastTurnOnlyModelWithNoThinkingBlocks(t *testing.T
 		t.Errorf("want 1 model call, got %d", model.calls)
 	}
 }
+
+// TestThinkingLastTurnOnlyMatchesTheDocumentedModelsAndNoOthers exercises the embedded
+// thinking_last_turn_models list directly, against both wire forms a real request uses (the
+// dated id and the undated alias) for every family member the doc page names, and against the
+// keep-all models whose family prefix a careless bare-generation match string would also catch
+// (claude-opus-4-5/4-6, claude-sonnet-4-6, claude-opus-5, claude-sonnet-5, claude-haiku-5-5).
+func TestThinkingLastTurnOnlyMatchesTheDocumentedModelsAndNoOthers(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	profiles := s.resolveProfiles()
+
+	lastTurnOnly := []string{
+		"claude-haiku-4-5-20251001",
+		"claude-haiku-4-5",
+		"claude-opus-4-20250514",
+		"claude-opus-4-0",
+		"claude-opus-4-1-20250805",
+		"claude-opus-4-1",
+		"claude-sonnet-4-20250514",
+		"claude-sonnet-4-0",
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-5",
+		"claude-3-7-sonnet-20250219",
+		"claude-3-7-sonnet-latest",
+	}
+	for _, id := range lastTurnOnly {
+		if !profiles.thinkingLastTurnOnly(id) {
+			t.Errorf("thinkingLastTurnOnly(%q) = false, want true (documented last-turn-only)", id)
+		}
+	}
+
+	keepAll := []string{
+		"claude-opus-4-5-20251101",
+		"claude-opus-4-5",
+		"claude-opus-4-6-20260201",
+		"claude-opus-4-6",
+		"claude-opus-5",
+		"claude-sonnet-4-6-20260201",
+		"claude-sonnet-4-6",
+		"claude-sonnet-5",
+		"claude-haiku-5-5",
+	}
+	for _, id := range keepAll {
+		if profiles.thinkingLastTurnOnly(id) {
+			t.Errorf("thinkingLastTurnOnly(%q) = true, want false (documented keep-all)", id)
+		}
+	}
+}
