@@ -39,6 +39,12 @@ type keepAliveCandidate struct {
 	// KeepAliveCandidateInfo.
 	cacheState       string
 	preExpirySeconds int
+	// registeredAt is when THIS candidate was written, so ClearStaleKeepAliveCandidate can tell
+	// "a candidate left over from an EARLIER request" from "the one THIS request's own pipeline
+	// run just registered" without needing to know the session's resolved key before running the
+	// pipeline — see that function's own comment for why that distinction has to be timestamp-based
+	// rather than ordering-based.
+	registeredAt time.Time
 }
 
 // KeepAliveCandidateInfo is what a registered candidate asked for, surfaced so the keeper can
@@ -118,11 +124,21 @@ func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, cal
 		return
 	}
 	cand := &keepAliveCandidate{
-		s: s, ctx: &components.Ctx{Session: c.Session, Store: c.Store, Ctx: c.Ctx}, call: call, path: path,
+		s: s,
+		// context.WithoutCancel: this candidate is read later, between requests, after the
+		// REGISTERING request has long since completed — and completing cancels its own
+		// context, which net/http does unconditionally once the handler returns. A keep-alive
+		// ping that then tried to call through the raw c.Ctx would get "context canceled" on
+		// every single dispatch, which is indistinguishable at a glance from the call itself
+		// failing — startAsyncSummary's own detached goroutine already needs the identical
+		// detachment for the identical reason (see its own baseCtx).
+		ctx:  &components.Ctx{Session: c.Session, Store: c.Store, Ctx: context.WithoutCancel(c.Ctx)},
+		call: call, path: path,
 		span:             append([]bschemas.ChatMessage(nil), span...),
 		coveredCount:     coveredCount,
 		cacheState:       s.trigger.CacheState,
 		preExpirySeconds: s.trigger.PreExpirySeconds,
+		registeredAt:     time.Now(),
 	}
 	keepAliveCandMu.Lock()
 	if _, exists := keepAliveCand[c.Session]; !exists && len(keepAliveCand) >= maxKeepAliveCandidates {
@@ -136,17 +152,51 @@ func (s *CacheAwareSummarizer) registerKeepAliveCandidate(c *components.Ctx, cal
 	keepAliveCandMu.Unlock()
 }
 
-// ClearKeepAliveCandidate drops a session's registered substitute material. The proxy calls this
-// when a real request arrives for the session (the same moment keeper.arrive retires the kaEntry
-// a ping would have used) — a candidate built from an EARLIER turn's conversation must not be
-// dispatched once a newer turn has superseded it, or the summary would cover a stale span while
-// the real pipeline moves on from a different one.
+// ClearKeepAliveCandidate drops a session's registered substitute material unconditionally.
+// Test-only: a real caller on the request path must use ClearStaleKeepAliveCandidate instead —
+// see that function's own comment for why an unconditional clear on every real request made
+// keep-alive substitution impossible in practice (every request cleared the very candidate its
+// own pipeline run had just registered, a few lines earlier in the same call).
 func ClearKeepAliveCandidate(session string) {
 	if session == "" {
 		return
 	}
 	keepAliveCandMu.Lock()
 	delete(keepAliveCand, session)
+	keepAliveCandMu.Unlock()
+}
+
+// ClearStaleKeepAliveCandidate drops session's registered substitute material ONLY IF it was
+// registered before requestStartedAt — i.e. by an EARLIER request's pipeline run, not by this
+// one. The proxy calls this once a real request's own pipeline has run (so cache_aware_summarizer
+// has already had its chance to register this turn's material) and tr.Session is known, passing
+// the wall-clock instant it captured BEFORE running the pipeline.
+//
+// WHY TIMESTAMP-BASED, NOT CALL-ORDER-BASED. The proxy cannot call this BEFORE the pipeline runs:
+// the pipeline is what resolves tr.Session (session.Scoped, off the request's own tenant/header/
+// body), so the key this function would need to clear by is not known yet at that point. Calling
+// it AFTER the pipeline with an unconditional delete (the bug this function replaces) deletes
+// whatever the pipeline's own run just wrote, a few lines earlier in the exact same request —
+// cache_aware_summarizer's registration and the "drop a superseded one" cleanup were racing each
+// other within a single, synchronous call stack, and the cleanup always won. A timestamp
+// comparison needs no key resolved in advance: requestStartedAt is captured the instant this
+// request began, trivially available before the pipeline runs, and a candidate's own
+// registeredAt field (set the moment registerKeepAliveCandidate writes it) answers "was this
+// written by code that ran before or after that instant" without the caller ever needing to name
+// the session before now.
+//
+// A registration from a CONCURRENT request for the same session (two requests on one session
+// racing each other) can register after requestStartedAt was captured but before this call runs
+// — that candidate's registeredAt is then >= requestStartedAt and survives, which is correct: it
+// is not stale, it is simply newer than the request now doing the clearing.
+func ClearStaleKeepAliveCandidate(session string, requestStartedAt time.Time) {
+	if session == "" {
+		return
+	}
+	keepAliveCandMu.Lock()
+	if cand, exists := keepAliveCand[session]; exists && cand.registeredAt.Before(requestStartedAt) {
+		delete(keepAliveCand, session)
+	}
 	keepAliveCandMu.Unlock()
 }
 

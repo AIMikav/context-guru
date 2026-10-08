@@ -409,8 +409,8 @@ func TestCacheAwareRegistersAKeepAliveCandidateEvenWhenCacheStateDeclines(t *tes
 	}
 }
 
-// A real request's arrival must clear a stale candidate — ClearKeepAliveCandidate is what the
-// proxy calls at that moment (see proxy.go's keeper.arrive call site).
+// ClearKeepAliveCandidate (the unconditional form) drops a registration outright — used by
+// tests for teardown, never by the real request path (see the two tests below for that).
 func TestClearKeepAliveCandidateDropsAStaleRegistration(t *testing.T) {
 	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\ninstruction_role: user\n"+
 		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
@@ -426,6 +426,61 @@ func TestClearKeepAliveCandidateDropsAStaleRegistration(t *testing.T) {
 	ClearKeepAliveCandidate(ctx.Session)
 	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
 		t.Error("ClearKeepAliveCandidate did not drop the registration")
+	}
+}
+
+// ⭐ THE REAL REQUEST PATH'S OWN CLEAR: ClearStaleKeepAliveCandidate — what proxy.go actually
+// calls, with a timestamp captured BEFORE the pipeline ran — must NOT drop the candidate THIS
+// SAME call just registered. An unconditional clear placed after the pipeline (the bug this
+// function replaces) deleted that candidate in the same request that wrote it, which is why
+// keep-alive substitution could never fire in practice: every real request cleared its own
+// registration a few lines after making it.
+func TestClearStaleKeepAliveCandidateKeepsThisRequestsOwnRegistration(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	s.modelClient = &capturingModel{out: "<summary>ok</summary>"}
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	ctx := caGatedCtx("ca-ka-clear-fresh", st, "warm", 0, false, 0)
+
+	// Mirrors proxy.go's own call order: capture the instant BEFORE the pipeline runs, run the
+	// pipeline (which registers the candidate), THEN clear using that captured instant.
+	requestStartedAt := time.Now()
+	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), caTranscript(3)...)}
+	var rep components.Report
+	s.Offload(req, &rep, ctx)
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
+		t.Fatal("precondition: no candidate was registered")
+	}
+	ClearStaleKeepAliveCandidate(ctx.Session, requestStartedAt)
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
+		t.Error("ClearStaleKeepAliveCandidate dropped the candidate THIS request's own pipeline " +
+			"run just registered — this is the bug that made keep-alive substitution impossible " +
+			"on every real request")
+	}
+}
+
+// The other half: a candidate registered by an EARLIER request (registeredAt before this
+// request's own requestStartedAt) must still be dropped — a superseded span must not survive
+// into a keep-alive ping once a newer turn has moved the conversation on.
+func TestClearStaleKeepAliveCandidateDropsAnEarlierRequestsRegistration(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 1\nmin_tokens: 10\ninstruction_role: user\n"+
+		"trigger:\n  min_request_frac: 0\n  cache_state: pre_expiry\n")
+	s.modelClient = &capturingModel{out: "<summary>ok</summary>"}
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	ctx := caGatedCtx("ca-ka-clear-stale", st, "warm", 0, false, 0)
+
+	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), caTranscript(3)...)}
+	var rep components.Report
+	s.Offload(req, &rep, ctx) // an EARLIER request's pipeline run
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); !ok {
+		t.Fatal("precondition: no candidate was registered")
+	}
+
+	// A LATER request's own requestStartedAt, captured strictly after the registration above.
+	requestStartedAt := time.Now()
+	ClearStaleKeepAliveCandidate(ctx.Session, requestStartedAt)
+	if _, _, _, ok := KeepAliveSubstitute(ctx.Session); ok {
+		t.Error("ClearStaleKeepAliveCandidate kept a candidate registered by an earlier request")
 	}
 }
 

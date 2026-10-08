@@ -1150,6 +1150,13 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				}
 			}
 			var added time.Duration
+			// Captured BEFORE the pipeline runs — see ClearStaleKeepAliveCandidate's own comment
+			// on why this request's "did I register fresh keep-alive material" test has to be a
+			// timestamp comparison rather than clearing by call order: tr.Session (the key a
+			// clear-by-session-id would need) is not resolved until the pipeline inside applyMode
+			// runs, so an unconditional clear placed after it deletes the very candidate this
+			// request's own run just wrote.
+			pipelineStartedAt := time.Now()
 			body, added, tr = h.applyMode(&reqInfo{
 				// cp.llmCtx: context-guru's OWN compaction-model spend under this context
 				// is charged to this request's row, and to no other tenant's.
@@ -1180,11 +1187,12 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			// refreshed are inputs to a dollar figure, not just a label.
 			kaPings, kaRefreshed, kaStrategy := h.keeper.arrive(tn.ID, tr.Session)
 			cp.noteKeepAlive(kaPings, kaRefreshed, kaStrategy)
-			// Drop any cache_aware_summarizer keep-alive substitute registered off an earlier
-			// turn's conversation: this request is about to run the pipeline again, and the span
-			// a stale registration names has been superseded whether or not THIS turn re-registers
-			// one. See offload.ClearKeepAliveCandidate.
-			offload.ClearKeepAliveCandidate(tr.Session)
+			// Drop any cache_aware_summarizer keep-alive substitute registered off an EARLIER
+			// turn's conversation — but never the one this request's own pipeline run (above)
+			// may just have written: an unconditional clear here used to delete that candidate
+			// in the same call it was created, which is why keep-alive substitution could never
+			// actually fire. See ClearStaleKeepAliveCandidate's own comment.
+			offload.ClearStaleKeepAliveCandidate(tr.Session, pipelineStartedAt)
 			h.setLastSession(tr.Session)
 			if h.agg != nil && !bypassed {
 				h.agg.RecordAddedLatency(addedMs)
