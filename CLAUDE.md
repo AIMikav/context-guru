@@ -34,8 +34,4 @@ reference — port its *logic*, re-implement its transport in Go.
 
 ## Layout
 
-`components` (Component/Reformat/Offload + Pipeline + registry) · `components/{reformat,offload,dsl,all}`
-· `apply` (wire body ⇄ pipeline, byte-lossless splice) · `schema` (bifrost-schema helpers) ·
-`expand` (marker + expand tool loop) · `store` · `session` · `metrics` · `config` ·
-`proxy` · `adapters/bifrost` · `cmd/context-guru-proxy` · `internal/{tokens,treesitter,buildinfo}`
-· `deploy` · `docs`. See [docs/design.md](docs/design.md).
+See [docs/design.md](docs/design.md) for package layout.
