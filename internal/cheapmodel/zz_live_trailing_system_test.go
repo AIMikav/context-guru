@@ -149,23 +149,29 @@ func TestLiveCompletePrefixedWithTrailingSystemMessage(t *testing.T) {
 	}
 }
 
-// Live proof, SAME SHAPE, with extended (manual) thinking enabled -- the mode Claude Code uses on
-// haiku per PR #406. This is the open question in insertAskMessage's doc comment: Anthropic's own
-// docs say "the final assistant turn of a thinking-enabled request" must begin with a thinking
-// block in this mode, and the synthetic assistant turn this fix appends carries none. Whether
-// "final assistant turn" means literally the last assistant message regardless of what follows
-// it (this one), or only one an active tool-use loop is continuing through (this one is not --
-// it's followed by a fresh user message), is NOT settled by reading the docs alone. This test is
-// the live settlement: if it 400s with a thinking-related message, the open question resolves
-// against this fix for thinking.type: "enabled" sessions and a different approach is needed
-// there; if it succeeds, the question resolves in this fix's favor.
+// Live proof, SAME SHAPE, with extended (manual) thinking enabled -- the mode Claude Code uses
+// per PR #406. This is the open question in insertAskMessage's doc comment: Anthropic's own docs
+// say "the final assistant turn of a thinking-enabled request" must begin with a thinking block
+// in this mode, and the synthetic assistant turn this fix appends carries none. Whether "final
+// assistant turn" means literally the last assistant message regardless of what follows it (this
+// one), or only one an active tool-use loop is continuing through (this one is not -- it's
+// followed by a fresh user message), is NOT settled by reading the docs alone. This test is the
+// live settlement: if it 400s with a thinking-related message, the open question resolves against
+// this fix for thinking.type: "enabled" sessions and a different approach is needed there; if it
+// succeeds, the question resolves in this fix's favor.
+//
+// Defaults to Sonnet, NOT Haiku, despite #406's own Haiku example: Haiku 4.5 rejects any
+// role:"system" message outright ("role 'system' is not supported on this model"), so no Haiku
+// traffic can carry the trailing-system shape this test exists to exercise, with or without
+// thinking. The two concerns are independent -- which model shape triggers this bug, and which
+// model Claude Code runs extended thinking on -- and Sonnet happens to answer both here.
 func TestLiveCompletePrefixedWithTrailingSystemMessageAndThinkingEnabled(t *testing.T) {
 	if os.Getenv("CG_LIVE") == "" {
 		t.Skip("set CG_LIVE=1 CG_BASE=... CG_TOKEN=... CG_MODEL=... to run")
 	}
 	model := os.Getenv("CG_MODEL")
 	if model == "" {
-		model = "claude-haiku-4-5"
+		model = "claude-sonnet-5[1m]"
 	}
 	cli := Anthropic{BaseURL: os.Getenv("CG_BASE"), APIKey: os.Getenv("CG_TOKEN"), Model: model, AuthScheme: "bearer"}
 	// budget_tokens well under max_tokens, satisfying the Messages API's own minimum (1,024) and
